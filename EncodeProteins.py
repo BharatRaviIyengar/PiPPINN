@@ -16,7 +16,13 @@ gpu = torch.cuda.is_available()
 
 def chunk_list(lst, k):
 	"""Split a list into k chunks."""
-	return [lst[i:i + k] for i in range(0, len(lst), k)]
+	list_size = len(lst)
+	if k > list_size:
+		print("Number of chunks should be smaller than the list size. Setting chunk size = 1")
+		chunk_size = 1
+	else:
+		chunk_size = int(list_size/k)
+	return [lst[i:i + chunk_size] for i in range(0, list_size, chunk_size)]
 
 def load_model_without_regression(model_location):
 	"""Load from local path. Ignore regression weights"""
@@ -81,16 +87,6 @@ def getreps_for_longseq(longseqlist):
 		all_reps.append(fullrep)
 		all_seqids.append(seqid)
 	return all_seqids, all_reps
-
-def run_inference(shortseqs,longseqs, len_emb_short, len_emb_long,outfile):
-	"""Run inference and save results."""
-	short_seqids, short_seqreps = getreps(shortseqs)
-	long_seqids, long_seqreps = getreps_for_longseq(longseqs)
-	all_seqids = short_seqids + long_seqids
-	all_seqreps = torch.cat([short_seqreps, long_seqreps], dim=0) 
-	len_embs = torch.cat([len_emb_short, len_emb_long], dim=0)
-	all_seqreps = torch.cat(all_seqreps, len_embs, dim=1)
-	torch.save({"seqids": all_seqids, "representations": all_seqreps},outfile)
 
 def concatenate_pt_files(file_list, output_file):
 	"""Concatenate multiple .pt files into a single .pt file."""
@@ -188,7 +184,7 @@ if __name__ == "__main__":
 	if args.outfile is None:
 		args.outfile = f"{Path(args.infile).with_suffix('')}_embeddings_{args.model}.pt"
 
-	chunk_size = 1022
+	token_chunk_size = 1022
 
 	shortseqs = []
 	longseqs = []
@@ -214,13 +210,13 @@ if __name__ == "__main__":
 			sequence = cols[1].rstrip()
 			seqid = cols[0]
 			lenseq = len(sequence)
-			if lenseq>chunk_size:
-				nchunks = lenseq - chunk_size + 1
+			if lenseq>token_chunk_size:
+				nchunks = lenseq - token_chunk_size + 1
 				subseqlist = [(f"{seqid}_{i}", sequence[j:j+chunk_size]) for i,j in enumerate(range(0, nchunks , args.window))]
 
 				last_start = nchunks + (nchunks % args.window)
 				if lenseq - last_start > 0:
-					subseqlist.append((f"{seqid}_{len(subseqlist)}", sequence[-chunk_size:]))
+					subseqlist.append((f"{seqid}_{len(subseqlist)}", sequence[-token_chunk_size:]))
 				longseqs.append((seqid,subseqlist))
 				len_longseqs.append(lenseq)
 			else:
@@ -242,19 +238,27 @@ if __name__ == "__main__":
 	len_embedding_long = prot_len_log_scaled[nseqs_by_type[0]:]
 
 	with torch.inference_mode():
-		if args.output_batches > 1:
-			shortseqs_chunk, longseqs_chunk, len_emb_short_chunk, len_emb_long_chunk = [
-				chunk_list(lst, args.output_batches) for lst in (shortseqs, longseqs, len_embedding_short, len_embedding_long)
-			]
+		shortseqs_chunk, longseqs_chunk, len_emb_short_chunk, len_emb_long_chunk = [
+			chunk_list(lst, args.output_batches) for lst in (shortseqs, longseqs, len_embedding_short, len_embedding_long)
+		]
 
-			tempfiles = [f"tmp_{k}{args.outfile}" for k in range(args.output_batches)]
+		tempfiles = []
+		if shortseqs:
+			for index, batch in enumerate(shortseqs_chunk):
+				seqids, seqreps = getreps(batch)
+				seqreps = torch.cat([seqreps, len_emb_short_chunk[index]])
+				filename = f"{Path(args.outfile).with_suffix('')}_shortseqs_chunk_{index+1}.pt"
+				torch.save({"seqids": seqids, "representations": seqreps},filename)
+				tempfiles.append(filename)
+		if longseqs:
+			for index, batch in enumerate(longseqs_chunk):
+				seqids, seqreps = getreps_for_longseq(batch)
+				seqreps = torch.cat([seqreps, len_emb_long_chunk[index]])
+				filename = f"{Path(args.outfile).with_suffix('')}_longseqs_chunk_{index+1}.pt"
+				torch.save({"seqids": seqids, "representations": seqreps},filename)
+				tempfiles.append(filename)
 
-			for k in range(args.output_batches):
-				run_inference(shortseqs_chunk[k], longseqs_chunk[k], len_emb_short_chunk[k], len_emb_long_chunk[k], tempfiles[k])
-				print(f"Processed batch {k} and to temporary file {tempfiles[k]}")
-			concatenate_pt_files(tempfiles, args.outfile)
-		else:
-			run_inference(shortseqs, longseqs, len_shortseqs, len_longseqs, args.outfile)
+		concatenate_pt_files(tempfiles, args.outfile)
 			
 	print("Embedded all sequences sucessfully")
 

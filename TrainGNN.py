@@ -70,113 +70,96 @@ def node_to_edge_map(edge_index):
 		node_to_edges[v].append(i) # undirected graph
 	return node_to_edges
 
-def split_data(graph, train_to_val_ratio = 7, node_centrality=None, max_attempts = 30, pure_val_edge_fraction = 0.3):
-	# Not generating test set #
-	# Define test set separatly #
-	val_fraction = 1/(1 + train_to_val_ratio)
-	train_fraction = 1 - val_fraction
-	all_nodes = torch.arange(graph.num_nodes)
-	val_mask = torch.zeros_like(all_nodes, dtype=torch.bool)
-	
+def subgraph_with_relabel(original_graph, edge_mask):
+	num_nodes = original_graph.x.size(0)
+	selected_edges = original_graph.edge_index[:, edge_mask] 
+	selected_nodes = torch.unique(selected_edges)
+	mapping = -torch.ones(num_nodes, dtype=torch.long)  # default to -1
+	mapping[selected_nodes] = torch.arange(selected_nodes.size(0))
 
+	# 2. Remap edge indices using vectorized lookup
+	remapped_edge_index = mapping[selected_edges]
+	outgraph =  Data(
+		x = original_graph.x[selected_nodes],
+		edge_index = remapped_edge_index,
+		edge_attr = original_graph.edge_attr[edge_mask],
+		old_node_ids = selected_nodes
+	)
+	return outgraph
+
+def bisect_data(graph, second_edge_fraction=0.3, node_centrality=None, max_attempts=50, second_edge_fraction_pure=0.09):
+	"""
+	Split a graph into two subgraphs based on edge centrality and node sampling.
+
+	Args:
+		graph (torch_geometric.data.Data): Input graph.
+		second_edge_fraction (float): Fraction of edges to include in the second graph.
+		node_centrality (torch.Tensor): Node centrality scores (optional).
+		max_attempts (int): Maximum attempts to match edge counts.
+		second_edge_fraction_pure (float): Fraction of pure edges in the second graph.
+
+	Returns:
+		first_graph (torch_geometric.data.Data): First subgraph.
+		second_graph (torch_geometric.data.Data): Second subgraph.
+	"""
 	src, dst = graph.edge_index
 	num_nodes = graph.x.size(0)
-	num_edges = graph.edge_index.size(1) 
+	num_edges = graph.edge_index.size(1)
 
 	# Compute centrality if not provided
 	if node_centrality is None:
 		node_centrality = degree(torch.cat([src, dst], dim=0), num_nodes=num_nodes)
-	
-	average_centrality = node_centrality.mean(0)
-	n_edges_val = int(val_fraction * num_edges)
-	edge_val_upperlimit = int(n_edges_val * 1.05)
 
-	approx_nodes_val = n_edges_val/average_centrality
+	average_centrality = node_centrality.mean()
+	n_edges_second = int(second_edge_fraction * num_edges)
+	max_edges_second = int(n_edges_second * 1.05)
+	n_desired_pure_second_edges = int(num_edges * second_edge_fraction_pure)
+	max_desired_pure_second_edges = int(n_desired_pure_second_edges * 1.05)
+	approx_nodes_second = int(n_edges_second / average_centrality)
+
+	# Preallocate masks
+	node_mask = torch.empty(num_nodes, dtype=torch.bool, device=src.device)
+	mask_src = torch.empty_like(src, dtype=torch.bool)
+	mask_dst = torch.empty_like(dst, dtype=torch.bool)
+	mask_second_pure = torch.empty_like(src, dtype=torch.bool)
+	mask_second = torch.empty_like(src, dtype=torch.bool)
 
 	for _ in range(max_attempts):
-		node_idx_val = torch.randperm(num_nodes)[:approx_nodes_val]
-		mask_val_pure = torch.isin(src, node_idx_val) & torch.isin(dst, node_idx_val)
-		mask_val_any = (torch.isin(src, node_idx_val) | torch.isin(dst, node_idx_val))
-		mask_val_xor = mask_val_any & ~mask_val_pure
-		semi_val_edges = graph.edge_index[:, mask_val_xor]
-		pure_val_edges = graph.edge_index[:, mask_val_pure]
-		total_val_edges = graph.edge_index[:, mask_val_any]
-		num_any_val = mask_val_any.sum().item()
-		num_pure_val = mask_val_pure.sum().item()
-		desired_pure_val = int(num_any_val*pure_val_edge_fraction)
-		desired_pure_val_upperbound = int(desired_pure_val * 1.05)
-		
-		if desired_pure_val <= num_pure_val <= desired_pure_val_upperbound and n_edges_val <= num_any_val <= edge_val_upperlimit:
+		# Reset node_mask
+		node_mask.fill_(False)
+
+		# Sample nodes and set mask
+		node_idx_second = torch.randperm(num_nodes, device=src.device)[:approx_nodes_second]
+		node_mask[node_idx_second] = True
+
+		# Compute edge masks
+		torch.index_select(node_mask, 0, src, out=mask_src)
+		torch.index_select(node_mask, 0, dst, out=mask_dst)
+
+		# mask_second_pure = mask_src & mask_dst
+		torch.logical_and(mask_src, mask_dst, out=mask_second_pure)
+		# mask_second = mask_src | mask_dst
+		torch.logical_or(mask_src, mask_dst, out=mask_second)
+
+		# Count edges
+		num_any_second_edges = mask_second.sum().item()
+		num_pure_second_edges = mask_second_pure.sum().item()
+
+		# Check constraints
+		if (n_desired_pure_second_edges <= num_pure_second_edges <= max_desired_pure_second_edges and
+			n_edges_second <= num_any_second_edges <= max_edges_second):
 			break
 	else:
-		print("Warning: could not match edge count for validation set closely.")
-	# val_mask[val_nodes] = True
-	# train_nodes = all_nodes[~val_mask]
+		print(f"Warning: Could not match edge count for second set closely.\n"
+			f"Desired: Any={n_edges_second}, Pure={n_desired_pure_second_edges}; "
+			f"Actual: Any={num_any_second_edges}, Pure={num_pure_second_edges}")
 
-	# Calculate split indices
-	node_idx_train = 
+	mask_first = ~mask_second
 
-	
-	
-	log_node_centrality = torch.log10(node_centrality)
-	bins = torch.tensor(range(0,6),dtype=torch.float32)
-	# Or a more natural binning #
-	# min = log_node_centrality.min(0)
-	# max = log_node_centrality.max(0)
-	# nbins = 10
-	# interval = (max-min)/nbins
-	# bins = torch.arange(range(min,max,interval))
-	log_nc_bin_index = torch.bucketize(log_node_centrality, bins, right=True)
+	first_graph = subgraph_with_relabel(graph, mask_first)
+	second_graph = subgraph_with_relabel(graph, mask_second)
 
-
-	# Compute edge centrality based on node centrality
-	edge_centrality = node_centrality[src] + node_centrality[dst]
-	
-	# Sort edges by centrality
-	sorted_index = torch.argsort(edge_centrality)
-	sorted_edges = graph.edge_index[:, sorted_index]
-	sorted_edgewt = graph.edge_attr[sorted_index]
-
-	# Split edges into train, validation, and test sets
-	train_edges = sorted_edges[:, :indices_train]
-	val_edges = sorted_edges[:, indices_train:indices_val]
-	test_edges = sorted_edges[:, indices_val:]
-
-	# Split edge weights into train, validation, and test sets
-	train_edgewt = sorted_edgewt[:indices_train]
-	val_edgewt = sorted_edgewt[indices_train:indices_val]
-	test_edgewt = sorted_edgewt[indices_val:]
-
-	# Get the unique nodes involved in each set of edges
-	train_nodes = torch.unique(torch.flatten(train_edges))
-	val_nodes = torch.unique(torch.flatten(val_edges))
-	test_nodes = torch.unique(torch.flatten(test_edges))
-
-	# Extract node embeddings for the respective sets
-	train_node_embed = graph.x[train_nodes]
-	val_node_embed = graph.x[val_nodes]
-	test_node_embed = graph.x[test_nodes]
-
-	# Create separate Data objects for train, validation, and test sets
-	train_graph = Data(
-		x=train_node_embed,
-		edge_index=train_edges,
-		edge_attr=train_edgewt
-	)
-
-	val_graph = Data(
-		x=val_node_embed,
-		edge_index=val_edges,
-		edge_attr=val_edgewt
-	)
-
-	test_graph = Data(
-		x=test_node_embed,
-		edge_index=test_edges,
-		edge_attr=test_edgewt
-	)
-
-	return train_graph, val_graph, test_graph
+	return first_graph, second_graph
 
 
 def key_edges(node1, node2, total_nodes):
