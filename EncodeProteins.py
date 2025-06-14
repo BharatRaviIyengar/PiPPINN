@@ -209,7 +209,7 @@ if __name__ == "__main__":
 	model.eval()
 	
 	with open(args.input,"r") as f:
-		for line in f():
+		for line in f:
 			cols = line.split("\t")
 			sequence = cols[1].rstrip()
 			seqid = cols[0]
@@ -224,7 +224,7 @@ if __name__ == "__main__":
 				longseqs.append((seqid,subseqlist))
 				len_longseqs.append(lenseq)
 			else:
-				shortseqs.append(seqid,sequence)
+				shortseqs.append((seqid,sequence))
 				len_shortseqs.append(lenseq)
 
 	print("Sequences loaded\n")
