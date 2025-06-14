@@ -212,7 +212,7 @@ if __name__ == "__main__":
 			lenseq = len(sequence)
 			if lenseq>token_chunk_size:
 				nchunks = lenseq - token_chunk_size + 1
-				subseqlist = [(f"{seqid}_{i}", sequence[j:j+chunk_size]) for i,j in enumerate(range(0, nchunks , args.window))]
+				subseqlist = [(f"{seqid}_{i}", sequence[j:j+token_chunk_size]) for i,j in enumerate(range(0, nchunks , args.window))]
 
 				last_start = nchunks + (nchunks % args.window)
 				if lenseq - last_start > 0:
@@ -246,16 +246,18 @@ if __name__ == "__main__":
 		if shortseqs:
 			for index, batch in enumerate(shortseqs_chunk):
 				seqids, seqreps = getreps(batch)
-				seqreps = torch.cat([seqreps, len_emb_short_chunk[index]])
+				seqreps_ext = torch.cat([torch.stack(seqreps), len_emb_short_chunk[index]], dim=1)
 				filename = f"{Path(args.outfile).with_suffix('')}_shortseqs_chunk_{index+1}.pt"
-				torch.save({"seqids": seqids, "representations": seqreps},filename)
+				print(f"Processed {filename}")
+				torch.save({"seqids": seqids, "representations": seqreps_ext},filename)
 				tempfiles.append(filename)
 		if longseqs:
 			for index, batch in enumerate(longseqs_chunk):
 				seqids, seqreps = getreps_for_longseq(batch)
-				seqreps = torch.cat([seqreps, len_emb_long_chunk[index]])
+				seqreps_ext = torch.cat([torch.stack(seqreps), len_emb_long_chunk[index]], dim=1)
 				filename = f"{Path(args.outfile).with_suffix('')}_longseqs_chunk_{index+1}.pt"
-				torch.save({"seqids": seqids, "representations": seqreps},filename)
+				print(f"Processed {filename}")
+				torch.save({"seqids": seqids, "representations": seqreps_ext},filename)
 				tempfiles.append(filename)
 
 		concatenate_pt_files(tempfiles, args.outfile)
