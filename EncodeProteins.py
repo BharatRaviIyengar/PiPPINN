@@ -17,9 +17,9 @@ gpu = torch.cuda.is_available()
 def chunk_list(lst, k):
 	"""Split a list into k chunks."""
 	list_size = len(lst)
-	if k > list_size:
-		print("Number of chunks should be smaller than the list size. Setting chunk size = 1")
-		chunk_size = 1
+	if k > 0.5*list_size:
+		print("Number of chunks should be at most half the list size. Setting number of chunks to 1")
+		return [lst]
 	else:
 		chunk_size = int(list_size/k)
 	return [lst[i:i + chunk_size] for i in range(0, list_size, chunk_size)]
@@ -94,24 +94,29 @@ def concatenate_pt_files(file_list, output_file):
 	all_representations = []
 
 	try:
-		for pt_file in file_list:
-			data = torch.load(pt_file)
-			all_seqids.extend(data["seqids"])
-			all_representations.append(data["representations"])
+		if len(file_list) == 1:
+			os.rename(file_list[0],output_file)
+			print("Only 1 temporary file was found, renamed it to the final output filename")
+			return
+		else:
+			for pt_file in file_list:
+				data = torch.load(pt_file, weights_only = False)
+				all_seqids.extend(data["seqids"])
+				all_representations.append(data["representations"])
 
-		# Concatenate all representations
-		concatenated_representations = torch.cat(all_representations, dim=0)
+			# Concatenate all representations
+			concatenated_representations = torch.cat(all_representations, dim=0)
 
-		# Save the concatenated result
-		torch.save({"seqids": all_seqids, "representations": concatenated_representations}, output_file)
-		print(f"Concatenated .pt files saved to {output_file}")
+			# Save the concatenated result
+			torch.save({"seqids": all_seqids, "representations": concatenated_representations}, output_file)
+			print(f"Concatenated .pt files saved to {output_file}")
 
 		# Remove temporary files after successful concatenation
 		for pt_file in file_list:
 			os.remove(pt_file)
 
 	except Exception as e:
-		print(f"Error during concatenation: {e}")
+		print(f"Error during concatenation or renaming: {e}")
 		print("Temporary files were not deleted to avoid data loss.")
 		raise
 
@@ -225,18 +230,15 @@ if __name__ == "__main__":
 
 	print("Sequences loaded\n")
 
-	len_allseqs = len_shortseqs + len_longseqs
+	
+	nseqs_by_type = [len(x) for x in (shortseqs,longseqs)]
 
-	nseqs_by_type = [len(x) for x in (len_shortseqs,len_longseqs)]
+	prot_len_embedding = torch.log10(torch.tensor(len_shortseqs + len_longseqs, dtype=torch.float32)).unsqueeze(1) - 2.7 # Keeping 500 as the middle point log10(500)≈ 2.699 
+	
 
-	prot_len_log = torch.log(torch.tensor(len_allseqs))
-	len_min = torch.min(prot_len_log)
-
-	prot_len_log_scaled = (2*(prot_len_log - len_min) / (torch.max(prot_len_log) - len_min) - 1).unsqueeze(1)
-
-	len_embedding_short = prot_len_log_scaled[:nseqs_by_type[0]]
-	len_embedding_long = prot_len_log_scaled[nseqs_by_type[0]:]
-
+	len_embedding_short = prot_len_embedding[:nseqs_by_type[0]]
+	len_embedding_long = prot_len_embedding[nseqs_by_type[0]:]
+	
 	with torch.inference_mode():
 		shortseqs_chunk, longseqs_chunk, len_emb_short_chunk, len_emb_long_chunk = [
 			chunk_list(lst, args.output_batches) for lst in (shortseqs, longseqs, len_embedding_short, len_embedding_long)

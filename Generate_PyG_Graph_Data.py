@@ -60,8 +60,8 @@ if __name__ == "__main__":
 		raise ValueError("Node embeddings should be a 2D tensor.")
 
 	node_data = torch.load(args.node_embeddings)
-	node_names = node_data['all_seqids']
-	node_embeddings = node_data['all_representations']
+	node_names = node_data['seqids']
+	node_embeddings = node_data['representations']
 	node_embed_dimension = node_embeddings.size(1)
 	node_name_to_index = {name: i for i, name in enumerate(node_names)} 
 

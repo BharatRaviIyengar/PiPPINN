@@ -10,7 +10,9 @@ from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.utils import subgraph, degree
 from torch_scatter import scatter_max
+from glob import glob
 
+gpu_yes = torch.cuda.is_available()
 
 class Pool_SAGEConv(nn.Module):
 	def __init__(self, in_channels, out_channels):
@@ -60,6 +62,55 @@ class GraphSAGE(nn.Module):
 		edge_predictor = self.edge_pred(edge_embeddings)
 		
 		return edge_weights, edge_predictor
+	
+class EdgeCentralitySampler(torch.utils.data.IterableDataset):
+	def __init__(self, full_data, centrality, batch_size):
+		super().__init__()
+		self.full_data = full_data  # full_data should be a PyG Data object
+		self.centrality = centrality  # centrality scores (tensor) for nodes
+		self.batch_size = batch_size
+		self.edge_probs = self.compute_edge_probs()
+	
+	def compute_edge_probs(self):
+		src, dst = self.full_data.edge_index
+		edge_centrality = self.centrality[src] + self.centrality[dst]
+		return edge_centrality
+	
+	def __iter__(self):
+		while True:
+			# Sample batch_size edges according to edge_centrality
+			sampled_edges = torch.multinomial(self.edge_probs, self.batch_size, replacement=False)
+			batch_edge_index = self.full_data.edge_index[:, sampled_edges]
+			
+			nodes_in_batch = batch_edge_index.flatten().unique()
+			
+			# Subgraph will relabel nodes automatically
+			sub_edge_index, edge_mask = subgraph(
+				nodes_in_batch,
+				self.full_data.edge_index,
+				relabel_nodes=True,
+				return_edge_mask=True
+			)
+			
+			# Subset node features
+			sub_x = self.full_data.x[nodes_in_batch,:]
+			
+			# Subset edge attributes if available
+			if hasattr(self.full_data, 'edge_attr') and self.full_data.edge_attr is not None:
+				sub_edge_attr = self.full_data.edge_attr[edge_mask]
+			else:
+				sub_edge_attr = None
+
+			# Return a proper Data object
+			batch = Data(
+				x=sub_x,
+				edge_index=sub_edge_index,
+				edge_attr=sub_edge_attr
+			)
+			batch.n_id = nodes_in_batch  # Save original node ids for mapping if needed later
+
+			yield batch
+
 
 def node_to_edge_map(edge_index):
 	node_to_edges = defaultdict(list)
@@ -80,7 +131,7 @@ def subgraph_with_relabel(original_graph, edge_mask):
 	# 2. Remap edge indices using vectorized lookup
 	remapped_edge_index = mapping[selected_edges]
 	outgraph =  Data(
-		x = original_graph.x[selected_nodes],
+		x = original_graph.x[selected_nodes,:],
 		edge_index = remapped_edge_index,
 		edge_attr = original_graph.edge_attr[edge_mask],
 		old_node_ids = selected_nodes
@@ -167,47 +218,55 @@ def key_edges(node1, node2, total_nodes):
 	return src_ * total_nodes + dst_
 
 # Generate negative edges 
-def generate_negative_edges(positive_graph, negative_positive_ratio = 2, device=None):
+def generate_negative_edges(positive_graph, negative_positive_ratio=2, device=None):
+	"""
+	Generate negative edges for a graph.
+
+	Args:
+		positive_graph (torch_geometric.data.Data): Input graph with positive edges.
+		negative_positive_ratio (int): Ratio of negative edges to positive edges.
+		device (torch.device): Device to perform computations on.
+
+	Returns:
+		torch.Tensor: Negative edges (2 x num_negative_edges).
+	"""
 	if device is None:
 		device = positive_graph.device
+
 	num_nodes = positive_graph.x.size(0)
-	num_negative_edges = positive_graph.edge_index.size(1) * negative_positive_ratio
+	num_positive_edges = positive_graph.edge_index.size(1)
+	num_negative_edges = num_positive_edges * negative_positive_ratio
+
 	# Compute positive edge keys
 	edge_keys = key_edges(positive_graph.edge_index[0], positive_graph.edge_index[1], num_nodes)
 
-	# Big oversample (to make sure we have enough negatives)
-	batch_size = int(num_negative_edges * 1.5)  # Oversample by 50%
-	
-	# Sample a big batch at once
-	src = torch.randint(0, num_nodes, (batch_size,), device=device)
-	dst = torch.randint(0, num_nodes, (batch_size,), device=device)
-	
-	# Compute keys for sampled edges
-	sample_keys = key_edges(src, dst, num_nodes)
-	
-	# Filter: remove edges that already exist
-	mask = ~torch.isin(sample_keys, edge_keys)
-	
-	# Keep only the valid negative edges
-	valid_src = src[mask]
-	valid_dst = dst[mask]
-	
-	# Make sure we have enough negatives
-	if valid_src.size(0) < num_negative_edges:
-		# If not enough, sample again recursively (rare)
-		more_negatives = generate_negative_edges(
-			num_negative_edges - valid_src.size(0), num_nodes, edge_index, device)
-		
-		# Combine old and new negatives
-		valid_edges = torch.cat([
-			torch.stack([valid_src, valid_dst], dim=0),
-			more_negatives
-		], dim=1)
-	else:
-		# Otherwise just slice
-		valid_edges = torch.stack([valid_src[:num_negative_edges], valid_dst[:num_negative_edges]], dim=0)
+	# Initialize negative edges
+	valid_src = torch.empty(0, device=device, dtype=torch.long)
+	valid_dst = torch.empty(0, device=device, dtype=torch.long)
 
-	return valid_edges
+	# Loop until enough negative edges are generated
+	while valid_src.size(0) < num_negative_edges:
+		# Oversample to ensure enough valid negatives
+		batch_size = int((num_negative_edges - valid_src.size(0)) * 1.5)  # Oversample by 50%
+		src = torch.randint(0, num_nodes, (batch_size,), device=device)
+		dst = torch.randint(0, num_nodes, (batch_size,), device=device)
+
+		# Compute keys for sampled edges
+		sample_keys = key_edges(src, dst, num_nodes)
+
+		# Filter: remove edges that already exist
+		mask = ~torch.isin(sample_keys, edge_keys)
+
+		# Append valid negative edges
+		valid_src = torch.cat([valid_src, src[mask]])
+		valid_dst = torch.cat([valid_dst, dst[mask]])
+
+	# Slice to the required number of negative edges
+	valid_src = valid_src[:num_negative_edges]
+	valid_dst = valid_dst[:num_negative_edges]
+
+	# Return negative edges
+	return torch.stack([valid_src, valid_dst], dim=0)
 
 def ratio_type(string):
 	vals = list(map(float, string.split(',')))
@@ -230,6 +289,29 @@ def mask_batch_edges(batch, orig_edge_list):
 	mask = torch.all(torch.isin(orig_edge_list, batch.n_id), dim=0)
 	return mask #, batch_edge
 
+bce_loss = nn.BCEWithLogitsLoss()
+mse_loss = nn.MSELoss()
+
+def train_and_evaluate(
+		train_graph,
+		val_graph,
+		optimizer,
+		learning_rate,
+		hidden_channels,
+		dropout,
+		message_edge_fraction,
+		max_epochs=50,
+		patience=5,
+		device='cuda' if gpu_yes else 'cpu'
+):
+	model = GraphSAGE(
+		in_channels = train_graph.x.size(1),
+		hidden_channels = num_hidden_channels,
+		out_channels = 2
+	).to(device)
+
+	
+
 if __name__ == "__main__":
 
 	parser = ap.ArgumentParser(description="GraphSAGE model for edge detection")
@@ -249,10 +331,10 @@ if __name__ == "__main__":
 		help="Number of CPU threads to use",
 		default=1
 	)
-	parser.add_argument("--split","--sr",
-		type=ratio_type,
-		default=[0.85, 0.1],
-		help= "Train/validation data split ratio as two numbers separated by comma, e.g., 0.8, 0.2"
+	parser.add_argument("--train_fraction",
+		type=float,
+		default= 0.8,
+		help= "Train fraction of data to train (rest for validation)"
 	)
 	parser.add_argument("--epochs", "-e",
 		type=int,
@@ -281,7 +363,7 @@ if __name__ == "__main__":
 	)
 	parser.add_argument("--hidden-channels", "--hc",
 		type=float, help="Fraction of number of input channels to use as the number of hidden channels",
-		default=0.05
+		default=0.1
 	)
 
 	args = parser.parse_args()
@@ -291,8 +373,6 @@ if __name__ == "__main__":
 		parser.print_help() # Print the help message
 		sys.exit(1)
 
-	# Load the graph data
-	ingraph = torch.load(args.input)
 
 	# Torch settings
 	torch.set_num_threads(args.threads)
@@ -301,90 +381,141 @@ if __name__ == "__main__":
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	print(f"Using device: {device}")
 
-	# Create the model
-	num_hidden_channels = int(ingraph.num_features * args.hidden_channels)
-	model = GraphSAGE(
-		in_channels = ingraph.num_features,
-		hidden_channels = num_hidden_channels,
-		out_channels = 2
-	).to(device)
+	# Load input graphs
+	input_graphs_filenames = []
+	for pattern in args.input.split(","):
+		input_graphs_filenames.extend(glob(pattern.strip()))
+	
+	ingraphs = []
+	for files in input_graphs_filenames:
+		try:
+			ingraphs.append(torch.load(files, weights_only=False))
+		except Exception as e:
+			print(f"Error loading file {files}: {e}")
+			continue
 
-	# Define the loss functions
+	data_for_training = []
+	for graph in ingraphs:
+		try:
+			graph.node_degree
+		except NameError:
+			graph.node_degree = degree(torch.cat([graph.edge_index[0],graph.edge_index[1]], dim=0), num_nodes = graph.x.size(0))
+		# Split graph into training and validation sets
+		train, val = bisect_data(graph, second_edge_fraction=1-args.train_fraction)
 
-	bce_loss = nn.BCEWithLogitsLoss()
-	mse_loss = nn.MSELoss()
+		# Generate negative edges
+		negative_edges = generate_negative_edges(graph, negative_positive_ratio=2)
 
-	optimizer = torch.optim.Adam(
-		model.parameters(),
-		lr=args.learning_rate,
-		weight_decay=args.weight_decay
-	)
+		# Create minibatch sampler
+		sampler = EdgeCentralitySampler(train.edge_index, graph.node_degree, batch_size=8192)  # 8192 positive edges
+		batch_loader = torch.utils.data.DataLoader(sampler, batch_size=None)
 
-	# Split data into training and validation set
-	train_graph, val_graph, test_graph = split_data(ingraph)
+		# Store data in a structured format
+		data_for_training.append({
+			"train_graph": train,
+			"val_graph": val,
+			"negative_edges": negative_edges,
+			"batch_loader": batch_loader
+		})
 
-	negative_edgeset = generate_negative_edges(ingraph,2)
-
-	# Create data batches #
-	sampler = EdgeCentralitySampler(train_graph.edge_index, centrality, batch_size=8192)  # 8192 positive edges
-	batch_loader = torch.utils.data.DataLoader(sampler, batch_size=None)
+		## Create data loader for negative edges
+	
 
 	# Begin training
 	start_time = time()
-	model.train()
 	total_loss = 0.0
 
+	# Define hyperparameter	setup
+
 	for _ in args.epochs:
-		for minibatch in batch_loader:
-			# Mask edges randomly for positive edges
-			positive_message_edges, _ = mask_edges_random(0.7, minibatch.edge_index, centrality=None)
+		for data in data_for_training:
+			batch_loader = data["batch_loader"]
+			for minibatch in batch_loader:
+				# Mask edges randomly for positive edges
+				positive_message_edges, _ = mask_edges_random(0.7, minibatch.edge_index, centrality=None)
 
-			# Generate negative edges (ensure they don't overlap with existing edges)
-			negative_edges = generate_negative_edges(minibatch, device=None)
+				# Generate negative edges (ensure they don't overlap with existing edges)
+				negative_edges = generate_negative_edges(minibatch, device=None)
 
-			# Mask edges randomly for negative edges
-			negative_message_edges, _ = mask_edges_random(0.7, minibatch.edge_index, centrality=None)
+				# Mask edges randomly for negative edges
+				negative_message_edges, _ = mask_edges_random(0.7, minibatch.edge_index, centrality=None)
 
-			# Concatenate positive and negative edges
-			minibatch.edge_index = torch.cat([minibatch.edge_index, negative_edges], dim=-1)  # Now 16,384 edges
-			minibatch.edge_attr = torch.cat([minibatch.edge_attr, torch.zeros(negative_edges.size(0))], dim=-1)  # Zero edge weights for negative edges
+				# Concatenate positive and negative edges
+				minibatch.edge_index = torch.cat([minibatch.edge_index, negative_edges], dim=-1)  # Now 16,384 edges
+				minibatch.edge_attr = torch.cat([minibatch.edge_attr, torch.zeros(negative_edges.size(0))], dim=-1)  # Zero edge weights for negative edges
 
-			# Concatenate positive and negative message edges
-			all_message_edges = torch.cat([positive_message_edges, negative_message_edges], dim=-1)
+				# Concatenate positive and negative message edges
+				all_message_edges = torch.cat([positive_message_edges, negative_message_edges], dim=-1)
 
-			# Sample neighbors for the minibatch
-			nbr_sample_batches = NeighborLoader(
-				minibatch,
-				num_neighbors=[30, 20],
-				batch_size=64,
-			)
-			
-			for batch in nbr_sample_batches:
-				# Mask the message edges for the batch
-				mask_message_edges = mask_batch_edges(batch, all_message_edges)
-				mask_negative_edges = mask_batch_edges(batch, negative_edges)
-				
-				# Forward pass through the model (separate positive and negative edges)
-				edge_probability, edge_weight_pred = model(
-					batch.x, 
-					batch.edge_index[mask_message_edges], 
-					batch.edge_index[~mask_message_edges]
+				# Sample neighbors for the minibatch
+				nbr_sample_batches = NeighborLoader(
+					minibatch,
+					num_neighbors=[30, 20],
+					batch_size=64,
 				)
 				
-				# Create labels for the edges
-				labels = torch.ones(edge_probability.size(0))  # Positive edges have label 1
-				labels[mask_negative_edges] = 0  # Negative edges have label 0
-				
-				# Compute BCE and MSE losses
-				loss = bce_loss(edge_probability, labels) + mse_loss(edge_weight_pred, batch.edge_attr[~mask_message_edges])
-				
-				# Accumulate the total loss
-				total_loss += loss.item()
+				for batch in nbr_sample_batches:
+					# Mask the message edges for the batch
+					mask_message_edges = mask_batch_edges(batch, all_message_edges)
+					mask_negative_edges = mask_batch_edges(batch, negative_edges)
+					
+					# Forward pass through the model (separate positive and negative edges)
+					edge_probability, edge_weight_pred = model(
+						batch.x, 
+						batch.edge_index[mask_message_edges], 
+						batch.edge_index[~mask_message_edges]
+					)
+					
+					# Create labels for the edges
+					labels = torch.ones(edge_probability.size(0))  # Positive edges have label 1
+					labels[mask_negative_edges] = 0  # Negative edges have label 0
+					
+					# Compute BCE and MSE losses
+					loss = bce_loss(edge_probability, labels) + mse_loss(edge_weight_pred, batch.edge_attr[~mask_message_edges])
+					
+					# Accumulate the total loss
+					total_loss += loss.item()
 
-			# Zero the gradients, perform backpropagation, and optimize
-			optimizer.zero_grad()
-			total_loss.backward()
-			optimizer.step()
+				# Zero the gradients, perform backpropagation, and optimize
+				optimizer.zero_grad()
+				total_loss.backward()
+				optimizer.step()
+			
+			# Validation #
+			model.eval()
+			with torch.inference_mode():
+				val_message_edges, _ = mask_edges_random(0.7, val_graph.edge_index, centrality=None)
+				val_negative_edges = generate_negative_edges(val_graph, device=None)
+				val_message_edges = torch.cat([val_message_edges, val_negative_edges], dim=-1)
+
+				# Sample neighbors for the validation set
+				nbr_sample_batches_val = NeighborLoader(
+					val_graph,
+					num_neighbors=[30, 20],
+					batch_size=64,
+				)
+
+				val_loss = 0.0
+				for batch in nbr_sample_batches_val:
+					mask_val_message_edges = mask_batch_edges(batch, val_message_edges)
+					
+					# Forward pass through the model
+					edge_probability, edge_weight_pred = model(
+						batch.x, 
+						batch.edge_index[mask_val_message_edges], 
+						batch.edge_index[~mask_val_message_edges]
+					)
+					
+					# Create labels for the edges
+					labels = torch.ones(edge_probability.size(0))
+					labels[mask_val_message_edges] = 0
+					# Compute BCE and MSE losses
+					val_loss += bce_loss(edge_probability, labels) + mse_loss(edge_weight_pred, batch.edge_attr[~mask_val_message_edges])
+				val_loss /= len(nbr_sample_batches_val)
+				print(f"Epoch {_+1}/{args.epochs}, Training Loss: {total_loss:.4f}, Validation Loss: {val_loss:.4f}")
+			total_loss = 0.0  # Reset total loss for the next epoch
+			model.train()
+
 
 	
 	elapsed_time = time() - start_time
