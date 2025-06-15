@@ -15,6 +15,24 @@ from glob import glob
 gpu_yes = torch.cuda.is_available()
 
 class Pool_SAGEConv(nn.Module):
+	"""
+	Implements a pooling-based GraphSAGE convolution layer for aggregating neighbor information.
+
+	Args:
+		in_channels (int): Number of input features per node.
+		out_channels (int): Number of output features per node.
+
+	Methods:
+		forward(x, edge_index, edge_weight):
+			Performs the forward pass of the convolution layer.
+			Args:
+				x (torch.Tensor): Node features.
+				edge_index (torch.Tensor): Edge indices.
+				edge_weight (torch.Tensor): Edge weights.
+			Returns:
+				torch.Tensor: Output node features after aggregation.
+	"""
+
 	def __init__(self, in_channels, out_channels):
 		super().__init__()
 		
@@ -42,6 +60,25 @@ class Pool_SAGEConv(nn.Module):
 		return F.relu(out)
 
 class GraphSAGE(nn.Module):
+	"""
+	Defines the GraphSAGE model with edge prediction and edge weight prediction capabilities.
+
+	Args:
+		in_channels (int): Number of input features per node.
+		hidden_channels (int): Number of hidden features per node.
+
+	Methods:
+		forward(x, message_edges, supervision_edges, message_edgewt):
+			Performs the forward pass of the GraphSAGE model.
+			Args:
+				x (torch.Tensor): Node features.
+				message_edges (torch.Tensor): Edges used for message passing.
+				supervision_edges (torch.Tensor): Edges used for supervision.
+				message_edgewt (torch.Tensor): Edge weights for message passing.
+			Returns:
+				torch.Tensor: Predicted edge weights and edge existence probabilities.
+	"""
+
 	def __init__(self, in_channels, hidden_channels):
 		super().__init__()
 		self.conv1 = Pool_SAGEConv(in_channels, hidden_channels)
@@ -63,21 +100,36 @@ class GraphSAGE(nn.Module):
 		
 		return edge_weights, edge_predictor
 	
-class EdgeCentralitySampler(torch.utils.data.IterableDataset):
-	def __init__(self, full_data, centrality, batch_size):
+class EdgeSampler(torch.utils.data.IterableDataset):
+
+	"""
+	Samples minibatches of edges based on centrality for positive edges and random sampling for negative edges.
+
+	Args:
+		full_data (torch_geometric.data.Data): Input graph data.
+		batch_size (int): Number of edges to sample per minibatch.
+		centrality (torch.Tensor, optional): Centrality scores for nodes. Defaults to None.
+
+	Methods:
+		__iter__():
+			Generates minibatches of edges and their corresponding subgraphs.
+			Returns:
+				torch_geometric.data.Data: Minibatch data object containing node features, edge indices, and edge attributes.
+	"""
+	def __init__(self, full_data, batch_size, num_batches = None, centrality = None):
 		super().__init__()
 		self.full_data = full_data  # full_data should be a PyG Data object
-		self.centrality = centrality  # centrality scores (tensor) for nodes
+		if centrality is None:
+			self.edge_probs = torch.ones(full_data.edge_index.size(0))
+		else:
+			src, dst = self.full_data.edge_index
+			self.edge_probs = centrality[src] + centrality[dst]
 		self.batch_size = batch_size
-		self.edge_probs = self.compute_edge_probs()
-	
-	def compute_edge_probs(self):
-		src, dst = self.full_data.edge_index
-		edge_centrality = self.centrality[src] + self.centrality[dst]
-		return edge_centrality
-	
+
 	def __iter__(self):
-		while True:
+		n = 0
+		while self.num_batches is None or n < self.num_batches:
+			n += 1
 			# Sample batch_size edges according to edge_centrality
 			sampled_edges = torch.multinomial(self.edge_probs, self.batch_size, replacement=False)
 			batch_edge_index = self.full_data.edge_index[:, sampled_edges]
@@ -175,6 +227,9 @@ def bisect_data(graph, second_edge_fraction=0.3, node_centrality=None, max_attem
 	mask_second_pure = torch.empty_like(src, dtype=torch.bool)
 	mask_second = torch.empty_like(src, dtype=torch.bool)
 
+	num_pure_second_edges = 0
+	num_any_second_edges = 0
+
 	for _ in range(max_attempts):
 		# Reset node_mask
 		node_mask.fill_(False)
@@ -267,14 +322,6 @@ def generate_negative_edges(positive_graph, negative_positive_ratio=2, device=No
 
 	# Return negative edges
 	return torch.stack([valid_src, valid_dst], dim=0)
-
-def ratio_type(string):
-	vals = list(map(float, string.split(',')))
-	if len(vals) != 2:
-		raise ap.ArgumentTypeError("Expected two numbers separated by a comma (e.g., 0.8,0.2)")
-	if abs(sum(vals) - 1.0) > 1e-6:
-		raise ap.ArgumentTypeError(f"Train/val ratios must sum to 1, got {sum(vals)}")
-	return vals
 
 def mask_edges_random(probability_mask, edge_list, centrality=None):
 	if centrality is None or centrality.max() == centrality.min():
@@ -399,26 +446,30 @@ if __name__ == "__main__":
 		try:
 			graph.node_degree
 		except NameError:
-			graph.node_degree = degree(torch.cat([graph.edge_index[0],graph.edge_index[1]], dim=0), num_nodes = graph.x.size(0))
+			graph.node_degree = degree(torch.cat([graph.edge_index[0], graph.edge_index[1]], dim=0), num_nodes=graph.x.size(0))
+
 		# Split graph into training and validation sets
-		train, val = bisect_data(graph, second_edge_fraction=1-args.train_fraction)
+		train, val = bisect_data(graph, second_edge_fraction=1 - args.train_fraction)
 
 		# Generate negative edges
-		negative_edges = generate_negative_edges(graph, negative_positive_ratio=2)
+		negative_edges = generate_negative_edges(graph, negative_positive_ratio=2) # should be a Data type same as positive edges TODO #
 
-		# Create minibatch sampler
-		sampler = EdgeCentralitySampler(train.edge_index, graph.node_degree, batch_size=8192)  # 8192 positive edges
-		batch_loader = torch.utils.data.DataLoader(sampler, batch_size=None)
+		# Create minibatch sampler for positive edges
+		positive_sampler = EdgeSampler(train, batch_size=8192, centrality=train.node_degree)  # Positive edges based on centrality
+		positive_batch_loader = torch.utils.data.DataLoader(positive_sampler, batch_size=None)
+
+		# Create minibatch sampler for negative edges
+		negative_sampler = EdgeSampler(train, batch_size=8192, centrality=None)  # Negative edges sampled randomly
+		negative_batch_loader = torch.utils.data.DataLoader(negative_sampler, batch_size=None)
 
 		# Store data in a structured format
 		data_for_training.append({
 			"train_graph": train,
 			"val_graph": val,
 			"negative_edges": negative_edges,
-			"batch_loader": batch_loader
+			"positive_batch_loader": positive_batch_loader,
+			"negative_batch_loader": negative_batch_loader
 		})
-
-		## Create data loader for negative edges
 	
 
 	# Begin training
@@ -429,18 +480,16 @@ if __name__ == "__main__":
 
 	for _ in args.epochs:
 		for data in data_for_training:
-			batch_loader = data["batch_loader"]
-			for minibatch in batch_loader:
+			positive_batch_loader = data["positive_batch_loader"]
+			negative_batch_loader = data["positive_batch_loader"]
+			for positive_batch, negative_batch in zip(positive_batch_loader, negative_batch_loader):
 				# Mask edges randomly for positive edges
-				positive_message_edges, _ = mask_edges_random(0.7, minibatch.edge_index, centrality=None)
-
-				# Generate negative edges (ensure they don't overlap with existing edges)
-				negative_edges = generate_negative_edges(minibatch, device=None)
+				positive_message_edges, _ = mask_edges_random(0.7, positive_batch.edge_index, centrality=None)
 
 				# Mask edges randomly for negative edges
-				negative_message_edges, _ = mask_edges_random(0.7, minibatch.edge_index, centrality=None)
+				negative_message_edges, _ = mask_edges_random(0.7, negative_batch.edge_index, centrality=None)
 
-				# Concatenate positive and negative edges
+				# Concatenate positive and negative edges TODO fix this
 				minibatch.edge_index = torch.cat([minibatch.edge_index, negative_edges], dim=-1)  # Now 16,384 edges
 				minibatch.edge_attr = torch.cat([minibatch.edge_attr, torch.zeros(negative_edges.size(0))], dim=-1)  # Zero edge weights for negative edges
 
