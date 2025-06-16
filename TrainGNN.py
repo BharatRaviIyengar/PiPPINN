@@ -101,41 +101,79 @@ class GraphSAGE(nn.Module):
 		return edge_weights, edge_predictor
 	
 class EdgeSampler(torch.utils.data.IterableDataset):
-
 	"""
-	Samples minibatches of edges based on centrality for positive edges and random sampling for negative edges.
+	Samples minibatches of edges based on centrality or uniform probability
 
 	Args:
-		full_data (torch_geometric.data.Data): Input graph data.
-		batch_size (int): Number of edges to sample per minibatch.
+		edges (torch.Tensor): Edge index tensor (2 x num_edges).
+		node_embeddings (torch.Tensor, optional): Node feature embeddings. Defaults to None.
+		edge_attr (torch.Tensor, optional): Edge attributes. Defaults to None.
+		batch_size (int, optional): Number of edges to sample per minibatch. Defaults to 1000.
+		num_batches (int, optional): Number of batches to create. Defaults to None.
 		centrality (torch.Tensor, optional): Centrality scores for nodes. Defaults to None.
 
 	Methods:
 		__iter__():
 			Generates minibatches of edges and their corresponding subgraphs.
 			Returns:
-				torch_geometric.data.Data: Minibatch data object containing node features, edge indices, and edge attributes.
+				torch_geometric.data.Data or torch.Tensor: Minibatch data object or edge index tensor.
 	"""
-	def __init__(self, full_data, batch_size, num_batches = None, centrality = None):
+	def __init__(self, edges, node_embeddings=None, edge_attr=None, batch_size = 1000, num_batches = None, centrality = None, centrality_fraction = None):
 		super().__init__()
-		self.full_data = full_data  # full_data should be a PyG Data object
-		if centrality is None:
-			self.edge_probs = torch.ones(full_data.edge_index.size(0))
-		else:
-			src, dst = self.full_data.edge_index
-			self.edge_probs = centrality[src] + centrality[dst]
+		self.edges = edges  # full_data should be a PyG Data object
+		self.num_batches = num_batches
+		self.edge_attr = edge_attr
+		self.node_embeddings = node_embeddings
 		self.batch_size = batch_size
+		self.centrality_fraction = centrality_fraction
 
-	def __iter__(self):
-		n = 0
-		while self.num_batches is None or n < self.num_batches:
-			n += 1
-			# Sample batch_size edges according to edge_centrality
-			sampled_edges = torch.multinomial(self.edge_probs, self.batch_size, replacement=False)
-			batch_edge_index = self.full_data.edge_index[:, sampled_edges]
-			
-			nodes_in_batch = batch_edge_index.flatten().unique()
-			
+		# Compute edge probabilities for sampling
+		if centrality is None:
+			self.edge_probs = torch.ones(edges.size(0))
+		else:
+			src, dst = self.edges
+			self.edge_probs = centrality[src] + centrality[dst]
+
+		# Define sampling method
+		if self.centrality_fraction is None or self.centrality_fraction == 1 or centrality is None:
+			self.sampling_fn = self.sample_edges_basic
+		else:
+			self.sampling_fn = self.sample_edges_strata
+
+		# Determine the output batch creation method
+		self.create_output_batch = self.return_edges_only if self.node_embeddings is None else self.return_PyG_Data
+
+	def sample_edges_basic(self):
+			return torch.multinomial(self.edge_probs, self.batch_size, replacement=False)
+
+	def sample_edges_strata(self):
+		num_edges = self.edges.size(1)
+		mask = torch.ones(num_edges, dtype=torch.bool)
+
+		centrality_batch_size = int(self.batch_size * self.centrality_fraction) # type: ignore
+		uniform_batch_size = self.batch_size - centrality_batch_size
+
+		# Centrality-based sampling
+		centrality_sampled = torch.multinomial(self.edge_probs, centrality_batch_size, replacement=False)
+		mask[centrality_sampled] = False
+
+		# Uniform sampling from the rest
+		uniform_pool = torch.where(mask)[0]
+		uniform_probs = torch.ones(uniform_pool.size(0))
+		uniform_sampled = uniform_pool[torch.multinomial(uniform_probs, uniform_batch_size, replacement=False)]
+
+		return torch.cat([centrality_sampled, uniform_sampled])
+	
+	def return_edges_only(self):
+		"""Sample edges based on edge probabilities."""
+		sampled_edge_idx = self.sampling_fn()
+		return self.edges[:, sampled_edge_idx]
+	
+	def return_PyG_Data(self):
+			"""Create a PyG Data object for the sampled edges."""
+			batch_edges = self.sample_edges_only()
+			nodes_in_batch = batch_edges.flatten().unique()
+
 			# Subgraph will relabel nodes automatically
 			sub_edge_index, edge_mask = subgraph(
 				nodes_in_batch,
@@ -143,24 +181,27 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 				relabel_nodes=True,
 				return_edge_mask=True
 			)
-			
 			# Subset node features
-			sub_x = self.full_data.x[nodes_in_batch,:]
+			sub_x = self.node_embeddings[nodes_in_batch,:] # type: ignore
 			
-			# Subset edge attributes if available
-			if hasattr(self.full_data, 'edge_attr') and self.full_data.edge_attr is not None:
-				sub_edge_attr = self.full_data.edge_attr[edge_mask]
-			else:
-				sub_edge_attr = None
-
-			# Return a proper Data object
+			# Create a PyG Data object
 			batch = Data(
 				x=sub_x,
 				edge_index=sub_edge_index,
-				edge_attr=sub_edge_attr
+				n_id = nodes_in_batch
 			)
-			batch.n_id = nodes_in_batch  # Save original node ids for mapping if needed later
 
+			# Subset edge attributes if available
+			if self.edge_attr is not None:
+				batch.edge_attr=self.edge_attr[edge_mask]
+
+			return batch
+	
+	def __iter__(self):
+		n = 0
+		while self.num_batches is None or n < self.num_batches:
+			n += 1
+			batch = self.create_output_batch()
 			yield batch
 
 
@@ -182,7 +223,7 @@ def subgraph_with_relabel(original_graph, edge_mask):
 
 	# 2. Remap edge indices using vectorized lookup
 	remapped_edge_index = mapping[selected_edges]
-	outgraph =  Data(
+	outgraph = Data(
 		x = original_graph.x[selected_nodes,:],
 		edge_index = remapped_edge_index,
 		edge_attr = original_graph.edge_attr[edge_mask],
@@ -453,6 +494,8 @@ if __name__ == "__main__":
 
 		# Generate negative edges
 		negative_edges = generate_negative_edges(graph, negative_positive_ratio=2) # should be a Data type same as positive edges TODO #
+
+		data_sizes = [x.size(0) for x in (train.edge_index,negative_edges)]
 
 		# Create minibatch sampler for positive edges
 		positive_sampler = EdgeSampler(train, batch_size=8192, centrality=train.node_degree)  # Positive edges based on centrality
