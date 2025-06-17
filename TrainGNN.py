@@ -126,10 +126,12 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.node_embeddings = node_embeddings
 		self.batch_size = batch_size
 		self.centrality_fraction = centrality_fraction
-
+		self.sampled_edges = set()
+		self.total_edges = edges.size(1)
+		self.all_edge_idx = set(range(self.total_edges))
 		# Compute edge probabilities for sampling
 		if centrality is None:
-			self.edge_probs = torch.ones(edges.size(0))
+			self.edge_probs = torch.ones(edges.size(1))
 		else:
 			src, dst = self.edges
 			self.edge_probs = centrality[src] + centrality[dst]
@@ -147,8 +149,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			return torch.multinomial(self.edge_probs, self.batch_size, replacement=False)
 
 	def sample_edges_strata(self):
-		num_edges = self.edges.size(1)
-		mask = torch.ones(num_edges, dtype=torch.bool)
+		mask = torch.ones(self.total_edges, dtype=torch.bool)
 
 		centrality_batch_size = int(self.batch_size * self.centrality_fraction) # type: ignore
 		uniform_batch_size = self.batch_size - centrality_batch_size
@@ -167,11 +168,15 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 	def return_edges_only(self):
 		"""Sample edges based on edge probabilities."""
 		sampled_edge_idx = self.sampling_fn()
-		return self.edges[:, sampled_edge_idx]
+		batch_edges = self.edges[sampled_edge_idx,:]
+
+		# Add sampled edges to set
+		self.sampled_edges.add(sampled_edge_idx)
+		return batch_edges
 	
 	def return_PyG_Data(self):
 			"""Create a PyG Data object for the sampled edges."""
-			batch_edges = self.sample_edges_only()
+			batch_edges = self.return_edges_only()
 			nodes_in_batch = batch_edges.flatten().unique()
 
 			# Subgraph will relabel nodes automatically
@@ -199,7 +204,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 	
 	def __iter__(self):
 		n = 0
-		while self.num_batches is None or n < self.num_batches:
+		while (self.num_batches is None or n < self.num_batches) and len(self.sampled_edges) < self.total_edges:
 			n += 1
 			batch = self.create_output_batch()
 			yield batch
