@@ -209,19 +209,9 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			batch = self.create_output_batch()
 			yield batch
 
-
-def node_to_edge_map(edge_index):
-	node_to_edges = defaultdict(list)
-	src, dst = edge_index
-	for i in range(edge_index.size(1)):
-		u, v = src[i].item(), dst[i].item()
-		node_to_edges[u].append(i)
-		node_to_edges[v].append(i) # undirected graph
-	return node_to_edges
-
 def subgraph_with_relabel(original_graph, edge_mask):
 	num_nodes = original_graph.x.size(0)
-	selected_edges = original_graph.edge_index[:, edge_mask] 
+	selected_edges = original_graph.edge_index[:,edge_mask] 
 	selected_nodes = torch.unique(selected_edges)
 	mapping = -torch.ones(num_nodes, dtype=torch.long)  # default to -1
 	mapping[selected_nodes] = torch.arange(selected_nodes.size(0))
@@ -313,6 +303,14 @@ def bisect_data(graph, second_edge_fraction=0.3, node_centrality=None, max_attem
 
 	return first_graph, second_graph
 
+def node_to_edge_map(edge_index):
+	node_to_edges = defaultdict(list)
+	src, dst = edge_index
+	for i in range(edge_index.size(1)):
+		u, v = src[i].item(), dst[i].item()
+		node_to_edges[u].append(i)
+		node_to_edges[v].append(i) # undirected graph
+	return node_to_edges
 
 def key_edges(node1, node2, total_nodes):
 	src_, dst_ = torch.min(node1, node2), torch.max(node1, node2)
@@ -375,6 +373,7 @@ def mask_edges_random(probability_mask, edge_list, centrality=None):
 	else:
 		normalized_scores = (centrality - centrality.min()) / (centrality.max() - centrality.min())
 	bernoulli_mask = torch.bernoulli(normalized_scores * probability_mask).bool()
+	normalized_scores = torch.ones(edge_list.size(1))
 	masked_edges = edge_list[:, bernoulli_mask]
 	return bernoulli_mask, masked_edges
 
@@ -538,11 +537,11 @@ if __name__ == "__main__":
 				negative_message_edges, _ = mask_edges_random(0.7, negative_batch.edge_index, centrality=None)
 
 				# Concatenate positive and negative edges TODO fix this
-				minibatch.edge_index = torch.cat([minibatch.edge_index, negative_edges], dim=-1)  # Now 16,384 edges
-				minibatch.edge_attr = torch.cat([minibatch.edge_attr, torch.zeros(negative_edges.size(0))], dim=-1)  # Zero edge weights for negative edges
+				minibatch.edge_index = torch.cat([minibatch.edge_index, negative_edges], dim=1)  # Now 16,384 edges
+				minibatch.edge_attr = torch.cat([minibatch.edge_attr, torch.zeros(negative_edges.size(0))], dim=1)  # Zero edge weights for negative edges
 
 				# Concatenate positive and negative message edges
-				all_message_edges = torch.cat([positive_message_edges, negative_message_edges], dim=-1)
+				all_message_edges = torch.cat([positive_message_edges, negative_message_edges], dim=1)
 
 				# Sample neighbors for the minibatch
 				nbr_sample_batches = NeighborLoader(
