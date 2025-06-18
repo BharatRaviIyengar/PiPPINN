@@ -303,14 +303,30 @@ def bisect_data(graph, second_edge_fraction=0.3, node_centrality=None, max_attem
 
 	return first_graph, second_graph
 
-def node_to_edge_map(edge_index):
-	node_to_edges = defaultdict(list)
-	src, dst = edge_index
-	for i in range(edge_index.size(1)):
-		u, v = src[i].item(), dst[i].item()
-		node_to_edges[u].append(i)
-		node_to_edges[v].append(i) # undirected graph
-	return node_to_edges
+
+def map_nodes_to_edges(edge_index: torch.Tensor, num_nodes: int):
+	"""
+	edge_index: Tensor of shape (2, num_edges)
+	num_nodes: total number of nodes
+	Returns: sparse COO tensor of shape (num_nodes, num_edges)
+	         where entry (i, j) is True if node i is part of edge j
+	"""
+	num_edges = edge_index.size(1)
+
+	# Each edge has two nodes: edge_index[0] and edge_index[1]
+	node_indices = torch.cat([edge_index[0], edge_index[1]])
+	edge_indices = torch.arange(num_edges).repeat(2) 
+	values = torch.ones(2 * num_edges, dtype=torch.bool)
+
+	# Build sparse matrix
+	node_to_edge = torch.sparse_coo_tensor(
+		torch.stack([node_indices, edge_indices]),  # shape: (2, 2 * num_edges)
+		values,
+		size=(num_nodes, num_edges)
+	)
+
+	return node_to_edge.coalesce()
+
 
 def key_edges(node1, node2, total_nodes):
 	src_, dst_ = torch.min(node1, node2), torch.max(node1, node2)
@@ -376,10 +392,6 @@ def mask_edges_random(probability_mask, edge_list, centrality=None): # TODO: can
 	normalized_scores = torch.ones(edge_list.size(1))
 	masked_edges = edge_list[:, bernoulli_mask]
 	return bernoulli_mask, masked_edges
-
-def mask_batch_edges(batch, orig_edge_list): # TODO: use hash based mapping
-	mask = torch.all(torch.isin(orig_edge_list, batch.n_id), dim=0)
-	return mask #, batch_edge
 
 bce_loss = nn.BCEWithLogitsLoss()
 mse_loss = nn.MSELoss()
@@ -529,12 +541,13 @@ if __name__ == "__main__":
 		for data in data_for_training:
 			positive_batch_loader = data["positive_batch_loader"]
 			negative_batch_loader = data["positive_batch_loader"]
-			for positive_batch, negative_batch in zip(positive_batch_loader, negative_batch_loader):
+
+			for minibatch, negative_edges in zip(positive_batch_loader, negative_batch_loader):
 				# Mask edges randomly for positive edges
-				positive_message_edges, _ = mask_edges_random(0.7, positive_batch.edge_index, centrality=None)
+				positive_message_edges, _ = mask_edges_random(0.7, minibatch.edge_index, centrality=None)
 
 				# Mask edges randomly for negative edges
-				negative_message_edges, _ = mask_edges_random(0.7, negative_batch.edge_index, centrality=None)
+				negative_message_edges, _ = mask_edges_random(0.7, negative_edges, centrality=None)
 
 				# Concatenate positive and negative edges TODO fix this
 				minibatch.edge_index = torch.cat([minibatch.edge_index, negative_edges], dim=1)  # Now 16,384 edges
@@ -542,6 +555,11 @@ if __name__ == "__main__":
 
 				# Concatenate positive and negative message edges
 				all_message_edges = torch.cat([positive_message_edges, negative_message_edges], dim=1)
+
+				# Create a mapping from minibatch to neighbor sampler batch
+
+				max_node_id = minibatch.edge_index.max().item()
+				in_batch_mask = torch.zeros(max_node_id + 1, dtype=torch.bool)
 
 				# Sample neighbors for the minibatch
 				nbr_sample_batches = NeighborLoader(
@@ -551,9 +569,10 @@ if __name__ == "__main__":
 				)
 				
 				for batch in nbr_sample_batches:
+
 					# Mask the message edges for the batch
-					mask_message_edges = mask_batch_edges(batch, all_message_edges)
-					mask_negative_edges = mask_batch_edges(batch, negative_edges)
+					mask_message_edges = all_message_edges[batch.e_id]
+					mask_negative_edges = negative_edges[batch.e_id]
 					
 					# Forward pass through the model (separate positive and negative edges)
 					edge_probability, edge_weight_pred = model(
@@ -571,6 +590,9 @@ if __name__ == "__main__":
 					
 					# Accumulate the total loss
 					total_loss += loss.item()
+
+					# Reset minibatch to neighbor sampler map
+					in_batch_mask.fill_(False)
 
 				# Zero the gradients, perform backpropagation, and optimize
 				optimizer.zero_grad()
