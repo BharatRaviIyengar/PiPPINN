@@ -354,7 +354,7 @@ def generate_negative_edges(positive_graph, negative_positive_ratio=2, device=No
 		sample_keys = key_edges(src, dst, num_nodes)
 
 		# Filter: remove edges that already exist
-		mask = ~torch.isin(sample_keys, edge_keys)
+		mask = ~torch.isin(sample_keys, edge_keys) # TODO: use hash-based lookup for efficiency
 
 		# Append valid negative edges
 		valid_src = torch.cat([valid_src, src[mask]])
@@ -367,7 +367,7 @@ def generate_negative_edges(positive_graph, negative_positive_ratio=2, device=No
 	# Return negative edges
 	return torch.stack([valid_src, valid_dst], dim=0)
 
-def mask_edges_random(probability_mask, edge_list, centrality=None):
+def mask_edges_random(probability_mask, edge_list, centrality=None): # TODO: can remove unnecessary creation of normalized_scores
 	if centrality is None or centrality.max() == centrality.min():
 		normalized_scores = torch.ones(edge_list.size(1))
 	else:
@@ -377,7 +377,7 @@ def mask_edges_random(probability_mask, edge_list, centrality=None):
 	masked_edges = edge_list[:, bernoulli_mask]
 	return bernoulli_mask, masked_edges
 
-def mask_batch_edges(batch, orig_edge_list):
+def mask_batch_edges(batch, orig_edge_list): # TODO: use hash based mapping
 	mask = torch.all(torch.isin(orig_edge_list, batch.n_id), dim=0)
 	return mask #, batch_edge
 
