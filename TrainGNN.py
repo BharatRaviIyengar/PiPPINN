@@ -5,13 +5,12 @@ import sys
 from time import time, strftime, gmtime
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.nn.functional import relu, sigmod
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
-from torch_geometric.utils import subgraph, degree, map_index
+from torch_geometric.utils import degree, map_index
 from torch_scatter import scatter_max
 from glob import glob
-from itertools import islice
 from warnings import warn
 
 gpu_yes = torch.cuda.is_available()
@@ -49,7 +48,7 @@ class Pool_SAGEConv(nn.Module):
 		
 		# Pool and activate neighbor messages
 		pooled = self.pool(x[src] * edge_weight.unsqueeze(-1))
-		pooled = F.relu(pooled)
+		pooled = relu(pooled)
 		
 		# Aggregate neighbor messages via max
 		aggregate, _ = scatter_max(pooled, dst, dim=0, dim_size=x.size(0))
@@ -59,7 +58,7 @@ class Pool_SAGEConv(nn.Module):
 		
 		# Final transformation
 		out = self.final_lin(h)
-		return F.relu(out)
+		return relu(out)
 
 class GraphSAGE(nn.Module):
 	"""
@@ -90,7 +89,7 @@ class GraphSAGE(nn.Module):
 		self.edge_pred = nn.Linear(hidden_channels * 2, 1)
 		self.edge_weight_pred = nn.Linear(hidden_channels * 2, 1)
 	
-	def forward(self, x, message_edges=None, prediction_edges=None, message_edgewt=None):
+	def forward(self, x, message_edges, prediction_edges, message_edgewt=None):
 		"""
 		Forward pass of the GraphSAGE model.
 
@@ -106,7 +105,7 @@ class GraphSAGE(nn.Module):
 
 		# Training mode: Perform message passing
 		x = self.conv1(x, message_edges, message_edgewt)
-		x = F.relu(x)
+		x = relu(x)
 		x = self.conv2(x, message_edges, message_edgewt)
 
 		# Supervision edges for training
@@ -474,7 +473,7 @@ def mask_edges_random(probability_of_masking, edge_list, normalized_centrality=N
 	Args:
 		probability_of_masking (float): Probability of masking edges.
 		edge_list (torch.Tensor): Edge index tensor of shape (2, num_edges).
-		normalized_centrality (torch.Tensor, optional): Normalized centrality scores for edges (scaled in the min-max range). Defaults to None.
+		normalized_centrality (torch.Tensor, optional): Normalized centrality scores for edges (scaled in the [0,1] range). Defaults to None.
 		device (torch.device, optional): Device to perform computations on. Defaults to None.
 
 	Returns:
@@ -485,12 +484,10 @@ def mask_edges_random(probability_of_masking, edge_list, normalized_centrality=N
 	if device is None:
 		device = edge_list.device
 	edge_list = edge_list.to(device)
-	if centrality is not None:
-		centrality = centrality.to(device)
 
 	# Normalize centrality scores if provided
 	if normalized_centrality is not None:
-		final_probabilities = normalized_centrality * probability_of_masking
+		final_probabilities = normalized_centrality.to(device) * probability_of_masking
 	else:
 		final_probabilities = torch.ones(edge_list.size(1), device=device) * probability_of_masking
 
@@ -671,24 +668,33 @@ if __name__ == "__main__":
 		train, val = bisect_data(graph, second_edge_fraction=1 - args.train_fraction)
 
 		# Generate negative edges
-		negative_graph = generate_negative_edges(graph, negative_positive_ratio=2) # should be a Data type same as positive edges TODO #
+		negative_edges_for_training = generate_negative_edges(train, negative_positive_ratio=2)
 
-		# Create minibatch sampler for positive edges TODO: fix negative batch
-		positive_sampler = EdgeSampler(train.edge_index,train.x,train.edge_attr, batch_size=8192, centrality=train.node_degree)  # Positive edges based on centrality
-		positive_batch_loader = torch.utils.data.DataLoader(positive_sampler, batch_size=None)
+		negative_edges_for_validation = generate_negative_edges(val, negative_positive_ratio=2)
 
-		# Create minibatch sampler for negative edges
-		negative_sampler = EdgeSampler(negative_graph, batch_size=8192, centrality=None)  # Negative edges sampled randomly
-		negative_batch_loader = torch.utils.data.DataLoader(negative_sampler, batch_size=None)
+		val.edge_index = torch.cat([val.edge_index, negative_edges_for_validation], dim=1)
 
+		val.edge_attr = torch.cat([val.edge_attr, torch.zeros(negative_edges_for_validation.size(1), dtype=torch.float32, device=val.edge_index.device)], dim=0)
+
+
+		# Create minibatch sampler for training set
+		data_sampler = EdgeSampler(
+			positive_edges=train.edge_index,
+			node_embeddings=train.x,
+			edge_attr=train.edge_attr,
+			batch_size=32768,
+			num_batches=None,
+			centrality=train.node_degree,
+			centrality_fraction=0.7,
+			negative_edges=negative_edges_for_training,
+			negative_batch_size=65536
+			)
+		minibatch_loader = torch.utils.data.DataLoader(data_sampler, batch_size=None)
 
 		# Store data in a structured format
 		data_for_training.append({
-			"train_graph": train,
-			"val_graph": val,
-			"negative_edges": negative_graph,
-			"positive_batch_loader": positive_batch_loader,
-			"negative_batch_loader": negative_batch_loader
+			"train_batch_loader": minibatch_loader,
+			"val_graph": val
 		})
 	
 	# Initialize model and optimizer
@@ -698,48 +704,53 @@ if __name__ == "__main__":
 	).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-	model.train()
-
 	# Begin training
 	start_time = time()
-	total_loss = 0.0
 
-	# Define hyperparameter	setup
+	# Early stopping parameters
+	patience = 10  # Number of epochs to wait for improvement
+	best_val_loss = float('inf')  # Initialize best validation loss
+	epochs_without_improvement = 0  # Counter for epochs without improvement
 
-	for _ in args.epochs:
+	for epoch in range(args.epochs):
+		total_train_loss = 0.0  # Reset total training loss for the epoch
+		total_val_loss = 0.0  # Reset total validation loss for the epoch
+
+		
 		for data in data_for_training:
-			# Training #
-			positive_iter = iter(data["positive_batch_loader"])
-			negative_iter = iter(data["negative_batch_loader"])
-			while True:
-				try:
-					# Fetch the next batch from positive and negative iterators
-					positive_batch = next(positive_iter)
-					negative_batch = next(negative_iter)
+			# Training
+			for batch in data["train_batch_loader"]:
+				total_train_loss += process_data(batch, model=model, device=device, is_training=True)
 
-					# Run training block
-					total_loss = train_batch(positive_batch, negative_batch, model, optimizer)
-					
-				except StopIteration:
-					break
-			
-			# Validation #
-			model.eval()
-			val_loss = validate_batch()
-			total_loss = 0.0  # Reset total loss for the next epoch
-			model.train()
+			# Validation
+			total_val_loss += process_data(data["val_graph"], model=model, device=device)
 
+		# Log losses
+		print(f"Epoch {epoch + 1}/{args.epochs}, Training Loss: {total_train_loss:.4f}, Validation Loss: {total_val_loss:.4f}")
 
-	
+		# Early stopping logic
+		if total_val_loss < best_val_loss:
+			best_val_loss = total_val_loss
+			epochs_without_improvement = 0
+			# Save the best model
+			torch.save(model.state_dict(), "best_model.pt")
+		else:
+			epochs_without_improvement += 1
+			if epochs_without_improvement >= patience:
+				print(f"Early stopping triggered after {epoch + 1} epochs.")
+				break
+
 	elapsed_time = time() - start_time
 
-	# Save the model
+	# Load the best model after training
+	model.load_state_dict(torch.load("best_model.pt"))
+
+	# Save the final model and metadata
 	if args.output is None:
 		args.output = f"{Path(args.input).with_suffix('')}_GNN_trained.pt"
 		print(f"Output file not specified. Using {args.output} as output file.")
 	torch.save(model.state_dict(), args.output)
 
-	# Save model metadata
 	metadata_file = args.output.replace('.pt', '_metadata.txt')
 	with open(metadata_file, 'w') as f:
 		f.write(f"Input file: {args.input}\n")
@@ -749,6 +760,6 @@ if __name__ == "__main__":
 		f.write(f"Learning rate: {args.learning_rate}\n")
 		f.write(f"Weight decay: {args.weight_decay}\n")
 		f.write(f"Dropout rate: {args.dropout}\n")
-		f.write(f"Input channels: {ingraph.num_features}\n")
-		f.write(f"Hidden channels: {num_hidden_channels}\n")
-		f.write(f"Training time:{strftime("%Hh%Mm%Ss", gmtime(elapsed_time))}")
+		f.write(f"Training time: {strftime('%Hh%Mm%Ss', gmtime(elapsed_time))}\n")
+
+		# TODO Optuna hyperparameter search
