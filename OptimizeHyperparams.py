@@ -13,13 +13,8 @@ if __name__ == "__main__":
 
 	parser.add_argument("--input", "-i",
 		type=str, required=True,
-		help="Path to the input graph data file (.pt)",
-		metavar="<path/file>"
-	)
-	parser.add_argument("--output", "-o",
-		type=str, default=None,
-		help="Path to the trained GNN (.pt)",
-		metavar="<path/file>"
+		help="Path to the input graph data files (.pt)",
+		metavar="file-pattern, comma-separated for multiple files"
 	)
 	parser.add_argument("--threads", "-t",
 		type=int,
@@ -28,7 +23,7 @@ if __name__ == "__main__":
 	)
 	parser.add_argument("--val_fraction",
 		type=float,
-		default= 0.8,
+		default= 0.2,
 		help= "Fraction of data for validation (rest for training)"
 	)
 	parser.add_argument("--epochs", "-e",

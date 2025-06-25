@@ -1,7 +1,6 @@
 import argparse as ap
 from pathlib import Path
 import sys
-from time import time
 import torch
 import json
 import TrainUtils as utils
