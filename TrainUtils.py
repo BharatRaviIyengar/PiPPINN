@@ -1,19 +1,12 @@
-import argparse as ap
-from pathlib import Path
-from collections import defaultdict
-import sys
-from time import time, strftime, gmtime
 import torch
 import torch.nn as nn
-from torch.nn.functional import relu, sigmod
+from torch.nn.functional import relu
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.utils import degree, map_index
 from torch_scatter import scatter_max
-from glob import glob
 from warnings import warn
-
-gpu_yes = torch.cuda.is_available()
+from glob import glob
 
 class Pool_SAGEConv(nn.Module):
 	"""
@@ -314,6 +307,10 @@ def subgraph_with_relabel(original_graph, edge_mask):
 		n_id=selected_nodes,
 		e_id=torch.where(edge_mask)[0]  # Edge indices in the new graph
 	)
+	try:
+		outgraph.node_degree = original_graph.node_degree[selected_nodes, :]
+	except NameError:
+		warn("Node degrees not present in original graph.")
 	return outgraph
 
 def bisect_data(graph, second_edge_fraction=0.3, node_centrality=None, max_attempts=50, second_edge_fraction_pure=0.09):
@@ -507,7 +504,7 @@ bce_loss = nn.BCEWithLogitsLoss()
 mse_loss = nn.MSELoss()
 
 
-def process_data(data, model, device, is_training=False):
+def process_data(data, model, optimizer, device, is_training=False):
 	"""
 	Process a single batch of data for training or validation.
 
@@ -579,78 +576,14 @@ def process_data(data, model, device, is_training=False):
 
 	return total_loss
 
-if __name__ == "__main__":
 
-	parser = ap.ArgumentParser(description="GraphSAGE model for edge detection")
-
-	parser.add_argument("--input", "-i",
-		type=str, required=True,
-		help="Path to the input graph data file (.pt)",
-		metavar="<path/file>"
-	)
-	parser.add_argument("--output", "-o",
-		type=str, default=None,
-		help="Path to the trained GNN (.pt)",
-		metavar="<path/file>"
-	)
-	parser.add_argument("--threads", "-t",
-		type=int,
-		help="Number of CPU threads to use",
-		default=1
-	)
-	parser.add_argument("--train_fraction",
-		type=float,
-		default= 0.8,
-		help= "Train fraction of data to train (rest for validation)"
-	)
-	parser.add_argument("--epochs", "-e",
-		type=int,
-		help="Number of training epochs",
-		default=50
-	)
-	parser.add_argument("--batch-size", "-b",
-		type=int,
-		help="Minibatch size for training",
-		default=0
-	)
-	parser.add_argument("--learning-rate", "--lr",
-		type=float,
-		help="Learning rate for the optimizer",
-		default=0.001
-	)
-	parser.add_argument("--weight-decay", "--wd",
-		type=float,
-		help="Weight decay for the optimizer",
-		default=1e-4
-	)
-	parser.add_argument("--dropout", "-d",
-		type=float,
-		help="Dropout rate for the model",
-		default=0.5
-	)
-	parser.add_argument("--hidden-channels", "--hc",
-		type=float, help="Fraction of number of input channels to use as the number of hidden channels",
-		default=0.1
-	)
-
-	args = parser.parse_args()
-
-	if len(sys.argv) == 1:
-		print("Error: essential arguments not provided.")
-		parser.print_help() # Print the help message
-		sys.exit(1)
-
-
-	# Torch settings
-	torch.set_num_threads(args.threads)
-	torch.set_num_interop_threads(args.threads)
-
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	print(f"Using device: {device}")
-
-	# Load input graphs
+def load_data(infile_patterns, val_fraction, batch_size, save_graphs_to=None):
+	negative_batch_size = 2 * batch_size
 	input_graphs_filenames = []
-	for pattern in args.input.split(","):
+	data_to_save = dict() if save_graphs_to is not None else None
+
+	# Split input patterns and load graphs
+	for pattern in infile_patterns.split(","):
 		input_graphs_filenames.extend(glob(pattern.strip()))
 	
 	ingraphs = []
@@ -661,109 +594,70 @@ if __name__ == "__main__":
 			print(f"Error loading file {files}: {e}")
 			continue
 
-	data_for_training = []
 	for graph in ingraphs:
+		# Compute node degrees if not already present
 		try:
 			graph.node_degree
-		except NameError:
+		except AttributeError:
 			graph.node_degree = degree(torch.cat([graph.edge_index[0], graph.edge_index[1]], dim=0), num_nodes=graph.x.size(0))
 
 		# Split graph into training and validation sets
-		train, val = bisect_data(graph, second_edge_fraction=1 - args.train_fraction)
+		train, val = bisect_data(graph, second_edge_fraction=val_fraction)
 
 		# Generate negative edges
 		negative_edges_for_training = generate_negative_edges(train, negative_positive_ratio=2)
-
 		negative_edges_for_validation = generate_negative_edges(val, negative_positive_ratio=2)
 
-		val.edge_index = torch.cat([val.edge_index, negative_edges_for_validation], dim=1)
+		# Save graphs if required
+		if save_graphs_to is not None:
+			data_to_save["graph"] = {
+				"Train": train,
+				"Train_Neg": negative_edges_for_training,
+				"Val": val,
+				"Val_Neg": negative_edges_for_validation,
+				"batch_size": batch_size,
+				"negative_batch_size": negative_batch_size
+			}
 
-		val.edge_attr = torch.cat([val.edge_attr, torch.zeros(negative_edges_for_validation.size(1), dtype=torch.float32, device=val.edge_index.device)], dim=0)
+		# Save processed graphs to file
+		if save_graphs_to is not None:
+			torch.save(data_to_save, save_graphs_to)
+			print(f"Graphs saved to {save_graphs_to}")
 
+		node_feature_dimension = train.x.size(1)
 
-		# Create minibatch sampler for training set
-		data_sampler = EdgeSampler(
-			positive_edges=train.edge_index,
-			node_embeddings=train.x,
-			edge_attr=train.edge_attr,
-			batch_size=32768,
-			num_batches=None,
-			centrality=train.node_degree,
-			centrality_fraction=0.7,
-			negative_edges=negative_edges_for_training,
-			negative_batch_size=65536
-			)
-		minibatch_loader = torch.utils.data.DataLoader(data_sampler, batch_size=None)
-
-		# Store data in a structured format
-		data_for_training.append({
-			"train_batch_loader": minibatch_loader,
-			"val_graph": val
-		})
+	return data_to_save, node_feature_dimension
 	
-	# Initialize model and optimizer
-	model = GraphSAGE(
-		in_channels = data_for_training[0]["train_graph"].x.size(1),
-		hidden_channels = args.hidden_channels
-	).to(device)
-	optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-	# Begin training
-	start_time = time()
+def generate_batch(data, centrality_fraction=0.6):
+	"""Generate a batch of data for training and validation."""
 
-	# Early stopping parameters
-	patience = 10  # Number of epochs to wait for improvement
-	best_val_loss = float('inf')  # Initialize best validation loss
-	epochs_without_improvement = 0  # Counter for epochs without improvement
+	# Create minibatch sampler for training set
+	data_sampler = EdgeSampler(
+		positive_edges=data["Train"].edge_index,
+		node_embeddings=data["Train"].x,
+		edge_attr=data["Train"].edge_attr,
+		batch_size=data["batch_size"],
+		num_batches=None,
+		centrality=data["Train"].node_degree,
+		centrality_fraction=centrality_fraction,
+		negative_edges=data["negative_edges_for_training"],
+		negative_batch_size=data["negative_batch_size"]
+	)
+	minibatch_loader = torch.utils.data.DataLoader(data_sampler, batch_size=None)
 
-	for epoch in range(args.epochs):
-		total_train_loss = 0.0  # Reset total training loss for the epoch
-		total_val_loss = 0.0  # Reset total validation loss for the epoch
+	# Prepare validation graph
+	val = data["Val"].clone()
+	val.edge_index = torch.cat([val.edge_index, data["negative_edges_for_validation"]], dim=1)
+	if val.edge_attr is not None:
+		val.edge_attr = torch.cat(
+			[val.edge_attr, torch.zeros(data["negative_edges_for_validation"].size(1), dtype=torch.float32, device=val.edge_index.device)],
+			dim=0
+		)
 
-		
-		for data in data_for_training:
-			# Training
-			for batch in data["train_batch_loader"]:
-				total_train_loss += process_data(batch, model=model, device=device, is_training=True)
+	data_for_training = {
+		"train_batch_loader": minibatch_loader,
+		"val_graph": val
+	}
 
-			# Validation
-			total_val_loss += process_data(data["val_graph"], model=model, device=device)
-
-		# Log losses
-		print(f"Epoch {epoch + 1}/{args.epochs}, Training Loss: {total_train_loss:.4f}, Validation Loss: {total_val_loss:.4f}")
-
-		# Early stopping logic
-		if total_val_loss < best_val_loss:
-			best_val_loss = total_val_loss
-			epochs_without_improvement = 0
-			# Save the best model
-			torch.save(model.state_dict(), "best_model.pt")
-		else:
-			epochs_without_improvement += 1
-			if epochs_without_improvement >= patience:
-				print(f"Early stopping triggered after {epoch + 1} epochs.")
-				break
-
-	elapsed_time = time() - start_time
-
-	# Load the best model after training
-	model.load_state_dict(torch.load("best_model.pt"))
-
-	# Save the final model and metadata
-	if args.output is None:
-		args.output = f"{Path(args.input).with_suffix('')}_GNN_trained.pt"
-		print(f"Output file not specified. Using {args.output} as output file.")
-	torch.save(model.state_dict(), args.output)
-
-	metadata_file = args.output.replace('.pt', '_metadata.txt')
-	with open(metadata_file, 'w') as f:
-		f.write(f"Input file: {args.input}\n")
-		f.write(f"Output file: {args.output}\n")
-		f.write(f"Epochs: {args.epochs}\n")
-		f.write(f"Batch size: {args.batch_size}\n")
-		f.write(f"Learning rate: {args.learning_rate}\n")
-		f.write(f"Weight decay: {args.weight_decay}\n")
-		f.write(f"Dropout rate: {args.dropout}\n")
-		f.write(f"Training time: {strftime('%Hh%Mm%Ss', gmtime(elapsed_time))}\n")
-
-		# TODO Optuna hyperparameter search
+	return data_for_training
