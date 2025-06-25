@@ -42,12 +42,16 @@ class Pool_SAGEConv(nn.Module):
 
 		# Final linear layer after aggregation
 		self.final_lin = nn.Linear(in_channels * 2, out_channels)
+
+		# Learnable parameter that controls how much the edge weight influences message aggregation
+		self.edge_weight_message_coefficient = nn.Parameter(torch.tensor(0.5))
 	
 	def forward(self, x, edge_index, edge_weight):
 		src, dst = edge_index
-		
+		edge_features = torch.cat([x[src], x[dst]], dim=-1) * (1 + self.z * edge_weight.unsqueeze(-1))
+
 		# Pool and activate neighbor messages
-		pooled = self.pool(x[src] * edge_weight.unsqueeze(-1))
+		pooled = self.pool(edge_features)
 		pooled = relu(pooled)
 		
 		# Aggregate neighbor messages via max

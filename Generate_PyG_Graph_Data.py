@@ -13,7 +13,7 @@ if __name__ == "__main__":
 	)
 
 	parser.add_argument(
-		"--node-embeddings", "-n", 
+		"--node_embeddings", "-n", 
 		type=str, 
 		help="Node embeddings file (pytorch file)", 
 		metavar="<path/filename>",
@@ -53,15 +53,14 @@ if __name__ == "__main__":
 		print(f"{arg}: {value}")
 
 	# Load node embeddings
-	node_embeddings = torch.load(args.node_embeddings)
+	
+	node_data = torch.load(args.node_embeddings, weights_only=False)
+	node_names = node_data['seqids']
+	node_embeddings = node_data['representations']
 	if not isinstance(node_embeddings, torch.Tensor):
 		raise ValueError("Node embeddings should be a PyTorch tensor.") 
 	if node_embeddings.dim() != 2:
 		raise ValueError("Node embeddings should be a 2D tensor.")
-
-	node_data = torch.load(args.node_embeddings)
-	node_names = node_data['seqids']
-	node_embeddings = node_data['representations']
 	node_embed_dimension = node_embeddings.size(1)
 	node_name_to_index = {name: i for i, name in enumerate(node_names)} 
 
@@ -70,35 +69,36 @@ if __name__ == "__main__":
 	target_nodes = []
 	edge_weights = []
 
-	with open(args.edges, 'r') as f:
-		for line in f:
-			line = line.strip()
-			if not line or line.startswith('#'):
-				continue
-			parts = line.split('\t')
-			if len(parts) < 2:
-				raise ValueError(f"Invalid edge format: {line}")
-			if len(parts) > 2:
-				try:
-					edge_weight = float(parts[2])
-				except ValueError:
-					raise ValueError(f"Invalid edge weight: {parts[2]}")
-			else:
-				edge_weight = 1.0
-			if parts[0] not in node_name_to_index or parts[1] not in node_name_to_index:
-				raise ValueError(f"Node names {parts[0]} or {parts[2]} not found in node embeddings.")
-			source_nodes.append(parts[0])
-			target_nodes.append(parts[1])
-			edge_weights.append(edge_weight)
+with open(args.edges, 'r') as f:
+	for line in f:
+		line = line.strip()
+		if not line or line.startswith('#'):
+			continue
+		parts = line.split('\t')
+		if len(parts) < 2:
+			raise ValueError(f"Invalid edge format: {line}")
+		if len(parts) > 2:
+			try:
+				edge_weight = float(parts[2])/1000
+			except ValueError:
+				raise ValueError(f"Invalid edge weight: {parts[2]}")
+		else:
+			edge_weight = 1.0
+		if parts[0] not in node_name_to_index or parts[1] not in node_name_to_index:
+			raise ValueError(f"Node names {parts[0]} or {parts[2]} not found in node embeddings.")
+		source_nodes.append(parts[0])
+		target_nodes.append(parts[1])
+		edge_weights.append(edge_weight)
 
 	# Convert to PyTorch tensors
-	edge_index = torch.tensor([source_nodes, target_nodes], dtype=torch.long)
+	source_indices = [node_name_to_index[name] for name in source_nodes]
+	target_indices = [node_name_to_index[name] for name in target_nodes]
+	edge_index = torch.tensor([source_indices, target_indices], dtype=torch.long)
 	edge_attr = torch.tensor(edge_weights, dtype=torch.float32).unsqueeze(1)
 	node_degree = degree(torch.cat([edge_index[0],edge_index[1]], dim=0), num_nodes = node_embeddings.size(0))
 
 	if args.expand_embedding_with_degree:
-		log_degree = torch.log(node_degree + 1e-6)
-		log_degree = (2*(log_degree) / (torch.max(log_degree)) - 1).unsqueeze(1)
+		log_degree = torch.log10(node_degree + 1e-6).unsqueeze(1)
 		node_embeddings = torch.cat([node_embeddings, log_degree], dim=1)
 	
 	# Create a PyTorch Geometric Data object
@@ -114,6 +114,8 @@ if __name__ == "__main__":
 	print(f"Graph data saved to {args.output}")
 
 	# Save node labels
-	node_list_file = args.ouput.replace('_Pyg.pt','node_list.json')
+	node_list_file = args.output.replace('_PyG.pt','_node_list.json')
 	with open(node_list_file, 'w') as f:
 		json.dump(node_name_to_index, f)
+
+	print(f"Node labels saved to {node_list_file}")
