@@ -6,6 +6,7 @@ import torch
 from torch_geometric.utils import degree
 import optuna, json
 import TrainUtils as utils
+from glob import glob
 
 if __name__ == "__main__":
 
@@ -29,7 +30,7 @@ if __name__ == "__main__":
 	parser.add_argument("--epochs", "-e",
 		type=int,
 		help="Number of training epochs",
-		default=50
+		default=100
 	)
 	parser.add_argument("--batch-size", "-b",
 		type=int,
@@ -66,7 +67,18 @@ if __name__ == "__main__":
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	print(f"Using device: {device}")
 
-	dataset, node_feature_dimension = utils.load_data(args.input, args.val_fraction, args.batch_size, save_graphs_to=args.save_input_data)
+	input_graphs_filenames = []
+	# Split input patterns and load graphs
+	for pattern in args.input.split(","):
+		input_graphs_filenames.extend(glob(pattern.strip()))
+
+	dataset, node_feature_dimension = utils.load_data(
+		input_graphs_filenames=input_graphs_filenames, 
+		val_fraction=args.val_fraction, 
+		batch_size=args.batch_size, 
+		save_graphs_to=args.save_input_data,
+		device=device
+		)
 	hidden_channel_values = (node_feature_dimension * torch.tensor([0.1, 0.2, 0.4, 0.8, 1, 1.5, 2])).int().tolist()
 
 	def objective(trial):
@@ -78,7 +90,7 @@ if __name__ == "__main__":
 		patience = trial.suggest_int("patience", 5, 20)
 		centrality_fraction = trial.suggest_uniform("centrality_fraction", 0.2, 0.8)
 
-		data_for_training = [utils.generate_batch(data, centrality_fraction) for data in dataset]
+		data_for_training = [utils.generate_batch(data, centrality_fraction,device=device) for data in dataset]
 
 		# Initialize model and optimizer
 		model = utils.GraphSAGE(

@@ -3,10 +3,10 @@ import torch.nn as nn
 from torch.nn.functional import relu
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
-from torch_geometric.utils import degree, map_index
+from torch_geometric.utils import degree
+from torch_geometric.utils.map import map_index
 from torch_scatter import scatter_max
 from warnings import warn
-from glob import glob
 
 class Pool_SAGEConv(nn.Module):
 	"""
@@ -308,7 +308,7 @@ def subgraph_with_relabel(original_graph, edge_mask):
 		e_id=torch.where(edge_mask)[0]  # Edge indices in the new graph
 	)
 	try:
-		outgraph.node_degree = original_graph.node_degree[selected_nodes, :]
+		outgraph.node_degree = original_graph.node_degree[selected_nodes]
 	except NameError:
 		warn("Node degrees not present in original graph.")
 	return outgraph
@@ -335,7 +335,7 @@ def bisect_data(graph, second_edge_fraction=0.3, node_centrality=None, max_attem
 
 	# Compute centrality if not provided
 	if node_centrality is None:
-		node_centrality = degree(torch.cat([graph.edge_index[0], graph.edge_index[1]]), num_nodes=num_nodes, device=device)
+		node_centrality = degree(torch.cat([graph.edge_index[0], graph.edge_index[1]]), num_nodes=num_nodes).to(device)
 
 	# Precompute constants
 	average_centrality = node_centrality.mean()
@@ -410,14 +410,14 @@ def generate_negative_edges(positive_graph, negative_positive_ratio=2, device=No
 		torch.Tensor: Negative edges (2 x num_negative_edges).
 	"""
 	if device is None:
-		device = positive_graph.device
+		device = positive_graph.edge_index.device 
 
 	num_nodes = positive_graph.x.size(0)
 	num_positive_edges = positive_graph.edge_index.size(1)
 	num_negative_edges = num_positive_edges * negative_positive_ratio
 
 	# Compute positive edge keys
-	edge_keys = key_edges(positive_graph.edge_index[0], positive_graph.edge_index[1], num_nodes)
+	edge_keys = key_edges(positive_graph.edge_index[0], positive_graph.edge_index[1], num_nodes).to(device)
 
 	# Initialize negative edges
 	valid_src = torch.empty(0, device=device, dtype=torch.long)
@@ -577,15 +577,9 @@ def process_data(data, model, optimizer, device, is_training=False):
 	return total_loss
 
 
-def load_data(infile_patterns, val_fraction, batch_size, save_graphs_to=None):
+def load_data(input_graphs_filenames, val_fraction, batch_size, save_graphs_to=None, device=None):
 	negative_batch_size = 2 * batch_size
-	input_graphs_filenames = []
 	data_to_save = dict() if save_graphs_to is not None else None
-
-	# Split input patterns and load graphs
-	for pattern in infile_patterns.split(","):
-		input_graphs_filenames.extend(glob(pattern.strip()))
-	
 	ingraphs = []
 	for files in input_graphs_filenames:
 		try:
@@ -593,8 +587,8 @@ def load_data(infile_patterns, val_fraction, batch_size, save_graphs_to=None):
 		except Exception as e:
 			print(f"Error loading file {files}: {e}")
 			continue
-
-	for graph in ingraphs:
+	data_to_save = []
+	for fileidx, graph in enumerate(ingraphs):
 		# Compute node degrees if not already present
 		try:
 			graph.node_degree
@@ -605,19 +599,20 @@ def load_data(infile_patterns, val_fraction, batch_size, save_graphs_to=None):
 		train, val = bisect_data(graph, second_edge_fraction=val_fraction)
 
 		# Generate negative edges
-		negative_edges_for_training = generate_negative_edges(train, negative_positive_ratio=2)
-		negative_edges_for_validation = generate_negative_edges(val, negative_positive_ratio=2)
+		negative_edges_for_training = generate_negative_edges(train, negative_positive_ratio=2, device=device)
+		negative_edges_for_validation = generate_negative_edges(val, negative_positive_ratio=2, device=device)
 
 		# Save graphs if required
 		if save_graphs_to is not None:
-			data_to_save["graph"] = {
+			data_to_save.append({
+				"Data_name" : input_graphs_filenames[fileidx],
 				"Train": train,
 				"Train_Neg": negative_edges_for_training,
 				"Val": val,
 				"Val_Neg": negative_edges_for_validation,
 				"batch_size": batch_size,
 				"negative_batch_size": negative_batch_size
-			}
+			})
 
 		# Save processed graphs to file
 		if save_graphs_to is not None:
@@ -629,7 +624,7 @@ def load_data(infile_patterns, val_fraction, batch_size, save_graphs_to=None):
 	return data_to_save, node_feature_dimension
 	
 
-def generate_batch(data, centrality_fraction=0.6):
+def generate_batch(data, centrality_fraction=0.6, device = None):
 	"""Generate a batch of data for training and validation."""
 
 	# Create minibatch sampler for training set
@@ -641,17 +636,17 @@ def generate_batch(data, centrality_fraction=0.6):
 		num_batches=None,
 		centrality=data["Train"].node_degree,
 		centrality_fraction=centrality_fraction,
-		negative_edges=data["negative_edges_for_training"],
+		negative_edges=data["Train_Neg"],
 		negative_batch_size=data["negative_batch_size"]
 	)
 	minibatch_loader = torch.utils.data.DataLoader(data_sampler, batch_size=None)
 
 	# Prepare validation graph
-	val = data["Val"].clone()
-	val.edge_index = torch.cat([val.edge_index, data["negative_edges_for_validation"]], dim=1)
+	val = data["Val"].clone().to(device)
+	val.edge_index = torch.cat([val.edge_index, data["Val_Neg"]], dim=1)
 	if val.edge_attr is not None:
 		val.edge_attr = torch.cat(
-			[val.edge_attr, torch.zeros(data["negative_edges_for_validation"].size(1), dtype=torch.float32, device=val.edge_index.device)],
+			[val.edge_attr, torch.zeros(data["Val_Neg"].size(1), dtype=torch.float32, device=val.edge_index.device)],
 			dim=0
 		)
 
