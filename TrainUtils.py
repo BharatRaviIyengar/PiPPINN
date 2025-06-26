@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
-from torch.nn.functional import relu
+from torch.nn.functional import relu as ReLU
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.utils import degree
 from torch_geometric.utils.map import map_index
 from torch_scatter import scatter_max
 from warnings import warn
+from pathlib import Path
 
 class Pool_SAGEConv(nn.Module):
 	"""
@@ -27,7 +28,7 @@ class Pool_SAGEConv(nn.Module):
 				torch.Tensor: Output node features after aggregation.
 	"""
 
-	def __init__(self, in_channels, out_channels):
+	def __init__(self, in_channels, out_channels, message_passing=True):
 		super().__init__()
 		
 		# Linear fully connected pooling
@@ -38,14 +39,16 @@ class Pool_SAGEConv(nn.Module):
 
 		# Learnable parameter that controls how much the edge weight influences message aggregation
 		self.edge_weight_message_coefficient = nn.Parameter(torch.tensor(0.5))
-	
-	def forward(self, x, edge_index, edge_weight):
+		
+		self.forward = self.forward_with_message_pooling if message_passing else self.forward_without_message_pooling
+			
+	def forward_with_message_pooling(self, x, edge_index, edge_weight):
 		src, dst = edge_index
-		edge_features = torch.cat([x[src], x[dst]], dim=-1) * (1 + self.z * edge_weight.unsqueeze(-1))
+		edge_features = torch.cat([x[src], x[dst]], dim=-1) * (1 + self.edge_weight_message_coefficient * edge_weight.unsqueeze(-1))
 
 		# Pool and activate neighbor messages
 		pooled = self.pool(edge_features)
-		pooled = relu(pooled)
+		pooled = ReLU(pooled)
 		
 		# Aggregate neighbor messages via max
 		aggregate, _ = scatter_max(pooled, dst, dim=0, dim_size=x.size(0))
@@ -54,61 +57,80 @@ class Pool_SAGEConv(nn.Module):
 		h = torch.cat([x, aggregate], dim=-1)
 		
 		# Final transformation
-		out = self.final_lin(h)
-		return relu(out)
+		return ReLU(self.final_lin(h))
+		
+		
+	def forward_without_message_pooling(self, x, edge_index, edge_weight):
+		h = torch.cat([x, torch.zeros_like(x)], dim=-1)
+		# Final transformation
+		return ReLU(self.final_lin(h))
+
 
 class GraphSAGE(nn.Module):
 	"""
-	Defines the GraphSAGE model with edge prediction and edge weight prediction capabilities.
-
-	Args:
-		in_channels (int): Number of input features per node.
-		hidden_channels (int): Number of hidden features per node.
-
-	Methods:
-		forward(x, message_edges, supervision_edges, message_edgewt):
-			Performs the forward pass of the GraphSAGE model.
-			Args:
-				x (torch.Tensor): Node features.
-				message_edges (torch.Tensor): Edges used for message passing.
-				supervision_edges (torch.Tensor): Edges used for supervision.
-				message_edgewt (torch.Tensor): Edge weights for message passing.
-			Returns:
-				torch.Tensor: Predicted edge weights and edge existence probabilities.
+	Defines the GraphSAGE model with multiple forward logics for different use cases.
 	"""
 
-	def __init__(self, in_channels, hidden_channels):
+	def __init__(self, in_channels, hidden_channels, dropout=0.0, mode="message_passing"):
+		"""
+		Args:
+			in_channels (int): Number of input features per node.
+			hidden_channels (int): Number of hidden features per node.
+			dropout (float): Dropout rate.
+			mode (str): Mode of operation. Options are:
+						- "message_passing": Use message edges for training/inference.
+						- "no_message_passing": Skip message passing, use node embeddings only.
+		"""
 		super().__init__()
-		self.conv1 = Pool_SAGEConv(in_channels, hidden_channels)
-		self.conv2 = Pool_SAGEConv(hidden_channels, hidden_channels)
+		
+		self.dropout = nn.Dropout(p=dropout)
+		self.in_channels = in_channels
+		self.hidden_channels = hidden_channels
 
 		# Edge prediction head
-		self.edge_pred = nn.Linear(hidden_channels * 2, 1)
-		self.edge_weight_pred = nn.Linear(hidden_channels * 2, 1)
-	
-	def forward(self, x, message_edges, prediction_edges, message_edgewt=None):
+		self.edge_pred = nn.Linear(self.hidden_channels * 2, 1)
+		self.edge_weight_pred = nn.Linear(self.hidden_channels * 2, 1)
+
+		# Initialize the convolution layers based on the mode
+		self.set_mode(mode)
+
+	def set_mode(self, mode):
 		"""
-		Forward pass of the GraphSAGE model.
+		Dynamically set the forward logic based on the mode.
 
 		Args:
-			x (torch.Tensor): Node features.
-			message_edges (torch.Tensor, optional): Edges used for message passing.
-			prediction_edges (torch.Tensor, optional): Edges used for supervision during training and for evaluation during inference.
-			message_edgewt (torch.Tensor, optional): Edge weights for message passing.
-
-		Returns:
-			torch.Tensor: Predicted edge weights and edge existence probabilities.
+			mode (str): The mode to set. Options are:
+						- "message_passing": Use message passing.
+						- "no_message_passing": Skip message passing.
 		"""
+		if mode == "message_passing":
+			self.conv1 = Pool_SAGEConv(self.in_channels, self.hidden_channels)
+			self.conv2 = Pool_SAGEConv(self.hidden_channels, self.hidden_channels)
+		elif mode == "no_message_passing":
+			self.conv1 = Pool_SAGEConv(self.in_channels, self.hidden_channels, message_passing=False)
+			self.conv2 = Pool_SAGEConv(self.hidden_channels, self.hidden_channels, message_passing=False)
+		else:
+			raise ValueError(f"Invalid mode: {mode}")
+		
+		self.mode = mode
 
-		# Training mode: Perform message passing
+	def forward(self, x, prediction_edges, message_edges, message_edgewt=None):
+		"""
+		Forward logic with message passing.
+		"""
+		if message_edgewt is None:
+			message_edgewt = torch.ones(message_edges.size(1), device=message_edges.device)
+
+		# Perform message passing
 		x = self.conv1(x, message_edges, message_edgewt)
-		x = relu(x)
+		x = self.dropout(x)
+
 		x = self.conv2(x, message_edges, message_edgewt)
+		x = self.dropout(x)
 
-		# Supervision edges for training
+		# Predict edges
 		edge_embeddings = torch.cat([x[prediction_edges[0]], x[prediction_edges[1]]], dim=-1)
-
-		edge_weights = self.edge_weight_pred(edge_embeddings)
+		edge_weights = ReLU(self.edge_weight_pred(edge_embeddings))
 		edge_predictor = self.edge_pred(edge_embeddings)
 		return edge_weights, edge_predictor
 	
@@ -148,7 +170,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 		# Ensure node indices and edge_attributes are compatible with edge list
 		if node_embeddings is not None:
-			if self.total_positive_nodes >= node_embeddings.size(0):
+			if self.total_positive_nodes > node_embeddings.size(0):
 				self.node_embeddings = None
 				warn("Node embeddings incompatible with edge list. Proceeding without them.")
 
@@ -167,7 +189,10 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			self.negative_edges = negative_edges.to(self.device)
 			self.num_negative_edges = negative_edges.size(1)
 			if negative_batch_size is None:
-				self.negative_batch_size = self.batch_size * 2  # Default to twice the positive batch size
+				self.negative_batch_size = self.batch_size * 2
+			else:
+				self.negative_batch_size = negative_batch_size
+
 			self.create_output_batch = self.create_output_batch_positive_and_negative
 			self.max_nodes = max(self.negative_edges.max().item() + 1, self.total_positive_nodes)
 		else:
@@ -239,9 +264,14 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		# Sample positive edges
 		sampled_edge_idx = self.sampling_fn()
 		positive_batch = self.positive_edges[:, sampled_edge_idx]
-
+		
+		negative_batch_idx = torch.multinomial(
+			torch.ones(self.num_negative_edges, device=self.device),
+			self.negative_batch_size,
+			replacement=False
+			).to(self.device)
 		# Sample negative edges
-		negative_batch = self.negative_edges[:, torch.multinomial(self.num_negative_edges, self.negative_batch_size, replacement=False)]
+		negative_batch = self.negative_edges[:, negative_batch_idx]
 
 		# Combine positive and negative edges
 		batch_edges = torch.cat([positive_batch, negative_batch], dim=1)
@@ -553,8 +583,9 @@ def process_data(data, model, optimizer, device, is_training=False):
 		# Forward pass through the model
 		edge_probability, edge_weight_pred = model(
 			batch.x,
-			message_edges=batch.edge_index[mask_message_edges],
-			prediction_edges=batch.edge_index[~mask_message_edges]
+			message_edges=batch.edge_index[:,mask_message_edges],
+			prediction_edges=batch.edge_index[:,~mask_message_edges],
+			message_edgewt = batch.edge_attr[mask_message_edges] if batch.edge_attr is not None else None
 		)
 
 		# Create labels for the edges
@@ -605,7 +636,7 @@ def load_data(input_graphs_filenames, val_fraction, batch_size, save_graphs_to=N
 		# Save graphs if required
 		if save_graphs_to is not None:
 			data_to_save.append({
-				"Data_name" : input_graphs_filenames[fileidx],
+				"Data_name" : Path(input_graphs_filenames[fileidx]).stem,
 				"Train": train,
 				"Train_Neg": negative_edges_for_training,
 				"Val": val,

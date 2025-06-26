@@ -94,7 +94,7 @@ with open(args.edges, 'r') as f:
 	source_indices = [node_name_to_index[name] for name in source_nodes]
 	target_indices = [node_name_to_index[name] for name in target_nodes]
 	edge_index = torch.tensor([source_indices, target_indices], dtype=torch.long)
-	edge_attr = torch.tensor(edge_weights, dtype=torch.float32).unsqueeze(1)
+	edge_attr = torch.tensor(edge_weights, dtype=torch.float32)
 	node_degree = degree(torch.cat([edge_index[0],edge_index[1]], dim=0), num_nodes = node_embeddings.size(0))
 
 	if args.expand_embedding_with_degree:

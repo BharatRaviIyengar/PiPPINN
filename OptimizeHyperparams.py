@@ -3,10 +3,10 @@ from pathlib import Path
 import sys
 from time import time
 import torch
-from torch_geometric.utils import degree
 import optuna, json
 import TrainUtils as utils
 from glob import glob
+
 
 if __name__ == "__main__":
 
@@ -29,8 +29,8 @@ if __name__ == "__main__":
 	)
 	parser.add_argument("--epochs", "-e",
 		type=int,
-		help="Number of training epochs",
-		default=100
+		help="Maximum number of training epochs",
+		default=200
 	)
 	parser.add_argument("--batch-size", "-b",
 		type=int,
@@ -47,6 +47,11 @@ if __name__ == "__main__":
 		help="Save split data and negative edges to file (.pt)",
 		default=None
 	)
+
+	SEED = 48149
+	torch.manual_seed(SEED)
+	torch.cuda.manual_seed(SEED)
+	torch.cuda.manual_seed_all(SEED)
 
 	args = parser.parse_args()
 
@@ -83,12 +88,12 @@ if __name__ == "__main__":
 
 	def objective(trial):
 		# Suggest hyperparameters
-		learning_rate = trial.suggest_loguniform("learning_rate", 1e-5, 1e-2)
-		weight_decay = trial.suggest_loguniform("weight_decay", 1e-6, 1e-3)
-		dropout = trial.suggest_uniform("dropout", 0.05, 0.5)
+		learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
+		weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True)
+		dropout = trial.suggest_float("dropout", 0.05, 0.5)
 		hidden_channels = trial.suggest_categorical("hidden_channels", hidden_channel_values)
 		patience = trial.suggest_int("patience", 5, 20)
-		centrality_fraction = trial.suggest_uniform("centrality_fraction", 0.2, 0.8)
+		centrality_fraction = trial.suggest_float("centrality_fraction", 0.2, 0.8)
 
 		data_for_training = [utils.generate_batch(data, centrality_fraction,device=device) for data in dataset]
 

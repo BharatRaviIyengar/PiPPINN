@@ -27,17 +27,132 @@ This project is designed for in silico evolution of proteins towards structure a
 - **PyTorch and PyTorch Geometric** powered.
 
 ## Installation
+### **Installation Guide for PPI-GNN**
 
-Clone the repository and install the required dependencies:
+This guide provides step-by-step instructions to set up the environment and install all necessary dependencies for the **PPI-GNN** project.
 
+---
+
+### **1. Prerequisites**
+Before proceeding, ensure the following are installed on your system:
+- **Python**: Version 3.8 or higher (tested with Python 3.9).
+- **CUDA**: If you plan to use a GPU, ensure CUDA is installed and properly configured. Check your CUDA version with:
+  ```bash
+  nvcc --version
+  ```
+- **pip**: Ensure you have the latest version of `pip`:
+  ```bash
+  python -m pip install --upgrade pip
+  ```
+
+---
+
+### **2. Clone the Repository**
+Clone the repository to your local machine:
 ```bash
-git clone https://github.com/BharatRaviIyengar/PPI-GNN.git
+git clone https://github.com/your-repo/PPI-GNN.git
 cd PPI-GNN
-
-# Install Python dependencies (modify as needed)
-pip install torch torch-geometric esm torch-scatter
 ```
 
+---
+
+### **3. Create a Virtual Environment**
+It is recommended to use a virtual environment to manage dependencies:
+```bash
+python -m venv venv
+source venv/bin/activate  # On Linux/Mac
+venv\Scripts\activate     # On Windows
+```
+
+---
+
+### **4. Install Dependencies**
+Install the required Python packages using `pip`.
+
+#### **4.1 Install PyTorch**
+Install PyTorch with the appropriate CUDA version. Visit the [PyTorch installation page](https://pytorch.org/get-started/locally/) for the latest instructions.
+
+For example:
+- **For CUDA 12.4**:
+  ```bash
+  pip install torch --index-url https://download.pytorch.org/whl/cu124
+  ```
+- **For CPU-only**:
+  ```bash
+  pip install torch --index-url https://download.pytorch.org/whl/cpu
+  ```
+
+#### **4.2 Install PyTorch Geometric and Dependencies**
+Install PyTorch Geometric and its dependencies. Use the appropriate command based on your PyTorch and CUDA versions.
+
+For example, if using PyTorch 2.5.1 with CUDA 12.4:
+```bash
+pip install torch-scatter torch-sparse torch-cluster torch-spline-conv pyg-lib torch-geometric -f https://data.pyg.org/whl/torch-2.5.1+cu124.html
+```
+
+#### **4.3 Install Additional Dependencies**
+Install the remaining dependencies listed in the repository:
+```bash
+pip install -r requirements.txt
+```
+
+If a `requirements.txt` file is not present, create one with the following content based on the imports in the repository:
+
+```text
+argparse
+fair-esm
+torch
+torch-geometric
+torch-scatter
+torch-sparse
+torch-cluster
+torch-spline-conv
+pyg-lib
+optuna
+```
+
+---
+
+### **5. Verify Installation**
+Run the following commands to verify that all dependencies are installed correctly:
+```bash
+python -c "import torch; print('PyTorch version:', torch.__version__)"
+python -c "import torch_geometric; print('PyTorch Geometric version:', torch_geometric.__version__)"
+python -c "import torch_sparse; print('torch-sparse installed successfully!')"
+```
+
+---
+
+### **6. Run the Project**
+Once all dependencies are installed, you can run the project scripts. For example:
+```bash
+python OptimizeHyperparams.py --input <path-to-data> --output <output-path>
+python Retrain.py --input_data <path-to-data> --parameters <path-to-best-params>
+```
+
+---
+
+### **7. Troubleshooting**
+- **Missing Dependencies**:
+  If you encounter missing dependencies, ensure you have installed all required libraries using the commands above.
+- **Version Mismatch**:
+  Ensure that the versions of PyTorch, CUDA, and PyTorch Geometric are compatible. Refer to the [PyTorch Geometric installation guide](https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html) for compatibility details.
+- **CUDA Issues**:
+  If CUDA is not detected, ensure that your GPU drivers and CUDA toolkit are properly installed.
+
+
+---
+
+### **9. Deactivate the Virtual Environment**
+When you're done, deactivate the virtual environment:
+```bash
+deactivate
+```
+
+---
+
+### **Conclusion**
+You are now ready to use the **PPI-GNN** project. If you encounter any issues, feel free to reach out or consult the documentation.
 ## Pipeline
 
 ### 1. Protein Encoding
