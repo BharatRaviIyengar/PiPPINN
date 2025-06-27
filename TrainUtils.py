@@ -597,7 +597,7 @@ def process_data(data, model, optimizer, device, is_training=False):
 		labels = mask_positive_edges[~mask_message_edges].float().unsqueeze(-1)
 
 		# Compute BCE and MSE losses
-		loss = bce_loss(edge_probability, labels) + mse_loss(edge_weight_pred, batch.edge_attr[~mask_message_edges])
+		loss = bce_loss(edge_probability, labels) + mse_loss(edge_weight_pred, batch.edge_attr[~mask_message_edges].unsqueeze(-1))
 
 		# Accumulate the total loss (for logging)
 		total_loss += loss.item()
