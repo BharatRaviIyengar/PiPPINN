@@ -44,14 +44,28 @@ class Pool_SAGEConv(nn.Module):
 			
 	def forward_with_message_pooling(self, x, edge_index, edge_weight):
 		src, dst = edge_index
-		edge_features = torch.cat([x[src], x[dst]], dim=-1) * (1 + self.edge_weight_message_coefficient * edge_weight.unsqueeze(-1))
+
+		own_indices = torch.arange(x.size(0), device=x.device).repeat_interleave(2)
+
+		# Collect all neighbors
+		all_neighbors = torch.cat([x[src], x[dst]], dim=0) 
+		all_indices = torch.cat([dst, src], dim=0)
+		all_edgewts = torch.cat([edge_weight, edge_weight], dim=0)
+
+		# Remove self-embedding
+		mask = all_indices != own_indices
+		filtered_neighbors = all_neighbors[mask]
+		filtered_indices = all_indices[mask]
+		filtered_edgewts = all_edgewts[mask]
+
+		edge_features = filtered_neighbors * (1 + self.edge_weight_message_coefficient * filtered_edgewts.unsqueeze(-1))
 
 		# Pool and activate neighbor messages
 		pooled = self.pool(edge_features)
 		pooled = ReLU(pooled)
 		
 		# Aggregate neighbor messages via max
-		aggregate, _ = scatter_max(pooled, dst, dim=0, dim_size=x.size(0))
+		aggregate, _ = scatter_max(pooled, filtered_indices, dim=0, dim_size=x.size(0))
 		
 		# Concatenate self-representation and aggregated neighbors
 		h = torch.cat([x, aggregate], dim=-1)
