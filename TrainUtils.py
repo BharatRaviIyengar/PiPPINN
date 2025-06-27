@@ -45,7 +45,10 @@ class Pool_SAGEConv(nn.Module):
 	def forward_with_message_pooling(self, x, edge_index, edge_weight):
 		src, dst = edge_index
 
-		own_indices = torch.arange(x.size(0), device=x.device).repeat_interleave(2)
+		all_src = torch.cat([src, dst], dim=0)
+		all_dst = torch.cat([dst, src], dim=0)
+		mask = all_src != all_dst
+
 
 		# Collect all neighbors
 		all_neighbors = torch.cat([x[src], x[dst]], dim=0) 
