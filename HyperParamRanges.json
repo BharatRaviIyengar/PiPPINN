@@ -20,11 +20,6 @@
 		"type": "categorical",
 		"choices": [32, 64, 128, 256]
 	},
-	"patience": {
-		"type": "int",
-		"low": 5,
-		"high": 20
-	},
 	"centrality_fraction": {
 		"type": "float",
 		"low": 0.2,

@@ -4,7 +4,7 @@ import sys
 import torch
 import json
 import TrainUtils as utils
-
+from OptimizeHyperparams import run_training
 
 if __name__ == "__main__":
 
@@ -12,7 +12,7 @@ if __name__ == "__main__":
 
 	parser.add_argument("--input_data", "-i",
 		type=str, required=True,
-		help="Path to the data collection to retrain (.pt). Output from OptimizeHyperparams.py",
+		help="Path to the data collection to retrain (.pt).",
 		metavar="<path/file>"
 	)
 	parser.add_argument("--parameters", "-p",

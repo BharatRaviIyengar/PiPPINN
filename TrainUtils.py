@@ -256,7 +256,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		)
 		if self.node_embeddings is not None:
 			batch.x = self.node_embeddings[node_mask, :]
-			batch.n_id = nodes_in_batch
+			# batch.n_id = nodes_in_batch
 
 		# Subset edge attributes if available
 		if self.edge_attr is not None:
@@ -282,7 +282,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		batch_edges = torch.cat([positive_batch, negative_batch], dim=1)
 
 		# Create edge type mask
-		positive_edge_mask = torch.zeros(self.total_positive_edges, dtype=torch.bool, device=self.device)
+		positive_edge_mask = torch.zeros(batch_edges.size(1), dtype=torch.bool, device=self.device)
 		positive_edge_mask[:positive_batch.size(1)] = True  # Mark positive edges as True
 
 		# Track sampled positive edges
@@ -303,7 +303,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		)
 		if self.node_embeddings is not None:
 			batch.x = self.node_embeddings[node_mask, :]
-			batch.n_id = nodes_in_batch
+			#batch.n_id = nodes_in_batch
 
 		# Subset edge attributes if available
 		if self.edge_attr is not None:
@@ -559,11 +559,11 @@ def process_data(data, model, optimizer, device, is_training=False):
 	all_message_edges, _ = mask_edges_random(0.7, data.edge_index, device=device)
 
 	# Sample neighbors for the minibatch
-	nbr_sample_batches = NeighborLoader(
-		data,
-		num_neighbors=[30, 20],
-		batch_size=64,
-	)
+	# nbr_sample_batches = NeighborLoader(
+	# 	data,
+	# 	num_neighbors=[30, 20],
+	# 	batch_size=64,
+	# )
 
 	total_loss = 0.0
 
@@ -576,36 +576,22 @@ def process_data(data, model, optimizer, device, is_training=False):
 		model.eval()
 		conditional_backward = lambda loss: None  # No-op for validation
 
-	# Iterate over neighbor sample batches
-	for batch in nbr_sample_batches:
-		# Move batch to the correct device
-		batch = batch.to(device)
-
-		# Mask the message edges for the batch
-		mask_message_edges = all_message_edges[batch.e_id]
-		mask_positive_edges = batch.positive_edges[batch.e_id]
-
-		# Forward pass through the model
-		edge_probability, edge_weight_pred = model(
-			batch.x,
-			message_edges=batch.edge_index[:,mask_message_edges],
-			prediction_edges=batch.edge_index[:,~mask_message_edges],
-			message_edgewt = batch.edge_attr[mask_message_edges] if batch.edge_attr is not None else None
+	edge_probability, edge_weight_pred = model(
+			data.x,
+			message_edges=data.edge_index[:,all_message_edges],
+			prediction_edges=data.edge_index[:,~all_message_edges],
+			message_edgewt = data.edge_attr[all_message_edges] if data.edge_attr is not None else None
 		)
+	
+	labels = data.positive_edges[~all_message_edges].float().unsqueeze(-1)
 
-		# Create labels for the edges
-		labels = mask_positive_edges[~mask_message_edges].float().unsqueeze(-1)
+	# Compute BCE and MSE losses
+	loss = bce_loss(edge_probability, labels) + mse_loss(edge_weight_pred, data.edge_attr[~all_message_edges].unsqueeze(-1))
 
-		# Compute BCE and MSE losses
-		loss = bce_loss(edge_probability, labels) + mse_loss(edge_weight_pred, batch.edge_attr[~mask_message_edges].unsqueeze(-1))
+	total_loss += loss.item()
 
-		# Accumulate the total loss (for logging)
-		total_loss += loss.item()
+	conditional_backward(loss)
 
-		# Conditionally backpropagate this batch loss
-		conditional_backward(loss)
-
-	# Update optimizer once after accumulating gradients from all batches
 	if is_training:
 		optimizer.step()
 
