@@ -598,8 +598,7 @@ def process_data(data, model, optimizer, device, is_training=False):
 	return total_loss
 
 
-def load_data(input_graphs_filenames, val_fraction, batch_size, save_graphs_to=None, device=None):
-	negative_batch_size = 2 * batch_size
+def load_data(input_graphs_filenames, val_fraction, save_graphs_to=None, device=None):
 	data_to_save = dict() if save_graphs_to is not None else None
 	ingraphs = []
 	for files in input_graphs_filenames:
@@ -631,8 +630,6 @@ def load_data(input_graphs_filenames, val_fraction, batch_size, save_graphs_to=N
 				"Train_Neg": negative_edges_for_training,
 				"Val": val,
 				"Val_Neg": negative_edges_for_validation,
-				"batch_size": batch_size,
-				"negative_batch_size": negative_batch_size
 			})
 
 		# Save processed graphs to file
@@ -640,25 +637,23 @@ def load_data(input_graphs_filenames, val_fraction, batch_size, save_graphs_to=N
 			torch.save(data_to_save, save_graphs_to)
 			print(f"Graphs saved to {save_graphs_to}")
 
-		node_feature_dimension = train.x.size(1)
-
-	return data_to_save, node_feature_dimension
+	return data_to_save
 	
 
-def generate_batch(data, centrality_fraction=0.6, device = None):
+def generate_batch(data, batch_size, centrality_fraction=0.6, device = None):
 	"""Generate a batch of data for training and validation."""
-
+	negative_batch_size = 2 * batch_size
 	# Create minibatch sampler for training set
 	data_sampler = EdgeSampler(
 		positive_edges=data["Train"].edge_index,
 		node_embeddings=data["Train"].x,
 		edge_attr=data["Train"].edge_attr,
-		batch_size=data["batch_size"],
+		batch_size=batch_size,
 		num_batches=None,
 		centrality=data["Train"].node_degree,
 		centrality_fraction=centrality_fraction,
 		negative_edges=data["Train_Neg"],
-		negative_batch_size=data["negative_batch_size"]
+		negative_batch_size=negative_batch_size
 	)
 	minibatch_loader = torch.utils.data.DataLoader(data_sampler, batch_size=None)
 

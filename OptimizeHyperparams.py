@@ -71,7 +71,7 @@ def load_param_set(infile,trial_ids=[0]):
 		trial_parameters = json.load(f)
 	return [trial_parameters[i] for i in trial_ids]
 
-def run_training(params, dataset, device):
+def run_training(params, batch_size, dataset, device):
 	centrality_fraction = params['centrality_fraction']
 	hidden_channels = params['hidden_channels']
 	dropout = params['dropout']
@@ -79,7 +79,7 @@ def run_training(params, dataset, device):
 	weight_decay = params['weight_decay']
 	patience = 10
 
-	data_for_training = [utils.generate_batch(data, centrality_fraction,device=device) for data in dataset]
+	data_for_training = [utils.generate_batch(data, batch_size, centrality_fraction,device=device) for data in dataset]
 
 	# Initialize model and optimizer
 	model = utils.GraphSAGE(
@@ -130,7 +130,7 @@ def run_training(params, dataset, device):
 		"early_stopping_epoch": early_stopping_epoch
 		}
 
-	return result
+	return result, model
 
 	
 
@@ -221,7 +221,7 @@ if __name__ == "__main__":
 		sys.exit(1)
 
 	if args.batch_size == 0:
-		args.batch_size = 32768
+		args.batch_size = 10000
 
 	if not gpu_yes:
 		print("GPU not available: Quitting")
@@ -253,7 +253,6 @@ if __name__ == "__main__":
 		_,_ = utils.load_data(
 			input_graphs_filenames=input_graphs_filenames, 
 			val_fraction=args.val_fraction, 
-			batch_size=args.batch_size, 
 			save_graphs_to=args.training_data,
 			device=device
 		)
@@ -268,7 +267,7 @@ if __name__ == "__main__":
 		dataset = torch.load(args.training_data, weights_only = False)
 
 		for trial_id, params in enumerate(paramset):
-			result = run_training(params, dataset, device)
+			result, _ = run_training(params, args.batch_size, dataset, device)
 			result["trial_id"] = args.trial_ids[trial_id]
 			results.append(result)
 		if args.trial_result is None:
@@ -310,7 +309,6 @@ if __name__ == "__main__":
 		dataset, node_feature_dimension = utils.load_data(
 		input_graphs_filenames=input_graphs_filenames, 
 		val_fraction=args.val_fraction, 
-		batch_size=args.batch_size, 
 		save_graphs_to=args.training_data,
 		device=device
 		)
@@ -322,11 +320,11 @@ if __name__ == "__main__":
 
 		def objective(trial):
 			params = suggest_params(trial, search_space)
-			results = run_training(params, dataset, device)
-			trial.set_user_attr("early_stopping_epoch", results["early_stopping_epoch"])
-			trial.set_user_attr("best_train_loss", results["best_train_loss"])
+			result, _ = run_training(params, args.batch_size, dataset, device)
+			trial.set_user_attr("early_stopping_epoch", result["early_stopping_epoch"])
+			trial.set_user_attr("best_train_loss", result["best_train_loss"])
 
-			return results["best_val_loss"]
+			return result["best_val_loss"]
 		
 		study = optuna.create_study(direction="minimize")
 		study.optimize(objective, n_trials=args.num_trials)
