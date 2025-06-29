@@ -45,18 +45,13 @@ class Pool_SAGEConv(nn.Module):
 	def forward_with_message_pooling(self, x, edge_index, edge_weight):
 		src, dst = edge_index
 
-		# Collect all neighbors
-		all_neighbors = x[torch.cat([src, dst], dim=0)]
-		all_indices = torch.cat([dst, src], dim=0)
-		all_edgewts = edge_weight.repeat(2)
-
-		edge_features = all_neighbors * (1 + self.edge_weight_message_coefficient * all_edgewts.unsqueeze(-1))
+		edge_features = x[src] * (1 + self.edge_weight_message_coefficient * edge_weight.unsqueeze(-1))
 
 		# Pool and activate neighbor messages
 		pooled = ReLU(self.pool(edge_features))
 		
 		# Aggregate neighbor messages via max
-		aggregate, _ = scatter_max(pooled, all_indices, dim=0, dim_size=x.size(0))
+		aggregate, _ = scatter_max(pooled, dst, dim=0, dim_size=x.size(0))
 		
 		# Concatenate self-representation and aggregated neighbors
 		h = torch.cat([x, aggregate], dim=-1)
@@ -297,22 +292,26 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		message_edges = remapped_edge_index[:,~supervision_edge_mask]
 		supervision_labels = torch.ones(supervision_edges.size(1), dtype = torch.float)
 		supervision_labels[-negative_batch_size:] = 0.0
+		srcs, dsts = supervision_edges
+		supervision_importance = self.centrality[srcs] + self.centrality[dsts]
+		supervision_importance[:-negative_batch_size] = 1.0 - supervision_importance[:-negative_batch_size]
 
 		# Create a PyG Data object
 		batch = Data(
 			message_edges = message_edges,
 			supervision_edges = supervision_edges,
-			supervision_labels = supervision_labels
+			supervision_labels = supervision_labels,
+			supervision_importance = supervision_importance
 		)
 		if self.node_embeddings is not None:
-			batch.x = self.node_embeddings[node_mask, :]
+			batch.node_features = self.node_embeddings[node_mask, :]
 			#batch.n_id = nodes_in_batch
 
 		# Subset edge attributes if available
 		if self.edge_attr is not None:
 			all_edge_attr = torch.cat([self.edge_attr, self.edge_attr.flip(), torch.zeros(negative_batch_size)])
-			batch.message_edge_attr = all_edge_attr[~supervision_edge_mask]
-			batch.supervision_edge_attr = all_edge_attr[supervision_edge_mask]
+			batch.message_edgewts = all_edge_attr[~supervision_edge_mask]
+			batch.supervision_edgewts = all_edge_attr[supervision_edge_mask]
 
 		return batch
 	
@@ -536,31 +535,6 @@ def normalize_values(values, min_val=None, max_val=None):
 	return (values - min_val) / (max_val - min_val)
 
 
-def mask_edges_random(mask_size, probability_of_masking=1.0, normalized_centrality=None, device=None): 
-	"""
-	Randomly mask edges based on a probability mask and optional centrality scores.
-
-	Args:
-		probability_of_masking (float): Probability of masking edges.
-		edge_list (torch.Tensor): Edge index tensor of shape (2, num_edges).
-		normalized_centrality (torch.Tensor, optional): Normalized centrality scores for edges (scaled in the [0,1] range). Defaults to None.
-		device (torch.device, optional): Device to perform computations on. Defaults to None.
-
-	Returns:
-		torch.Tensor: Boolean mask indicating which edges are selected.
-		torch.Tensor: Masked edge list.
-	"""
-	# Normalize centrality scores if provided
-	if normalized_centrality is not None and normalized_centrality.size(0) == mask_size:
-		final_probabilities = normalized_centrality.to(device) * probability_of_masking
-	else:
-		final_probabilities = torch.ones(mask_size, device=device) * probability_of_masking
-
-	# Generate Bernoulli mask
-	bernoulli_mask = torch.bernoulli(final_probabilities).bool()
-
-	return bernoulli_mask
-
 bce_loss = nn.BCEWithLogitsLoss()
 mse_loss = nn.MSELoss()
 
@@ -581,16 +555,6 @@ def process_data(data, model, optimizer, device, is_training=False):
 	# Move data to the correct device
 	data = data.to(device)
 
-	# Mask edges randomly for both positive and negative edges
-	all_message_edges, _ = mask_edges_random(0.7, data.edge_index[:,data.positive_edges], device=device)
-
-	# Sample neighbors for the minibatch
-	# nbr_sample_batches = NeighborLoader(
-	# 	data,
-	# 	num_neighbors=[30, 20],
-	# 	batch_size=64,
-	# )
-
 	# Set model mode and optimizer behavior
 	if is_training:
 		model.train()
@@ -601,16 +565,15 @@ def process_data(data, model, optimizer, device, is_training=False):
 		conditional_backward = lambda loss: None  # No-op for validation
 
 	edge_probability, edge_weight_pred = model(
-			data.x,
-			message_edges=data.edge_index[:,all_message_edges],
-			prediction_edges=data.edge_index[:,~all_message_edges],
-			message_edgewt = data.edge_attr[all_message_edges] if data.edge_attr is not None else None
-		)
+		data.node_features,
+		message_edges=data.message_edges,
+		prediction_edges=data.supervision_edges,
+		message_edgewt = data.message_edgewts
+	)
 	
-	labels = data.positive_edges[~all_message_edges].float().unsqueeze(-1)
-
 	# Compute BCE and MSE losses
-	loss = bce_loss(edge_probability, labels) + mse_loss(edge_weight_pred, data.edge_attr[~all_message_edges].unsqueeze(-1))
+
+	loss = bce_loss(edge_probability, data.supervision_labels, weight=data.supervision_importance) + mse_loss(edge_weight_pred, data.supervision_edgewts.unsqueeze(-1))
 
 	conditional_backward(loss)
 
