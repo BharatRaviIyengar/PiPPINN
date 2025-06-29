@@ -18,7 +18,7 @@
 	},
 	"hidden_channels": {
 		"type": "categorical",
-		"choices": [32, 64, 128, 256]
+		"choices": [128, 256, 512, 1024, 2048]
 	},
 	"centrality_fraction": {
 		"type": "float",

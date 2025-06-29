@@ -221,13 +221,16 @@ if __name__ == "__main__":
 		sys.exit(1)
 
 	if args.batch_size == 0:
-		args.batch_size = 10000
+		args.batch_size = 5000
 
 	if not gpu_yes:
 		print("GPU not available: Quitting")
 		sys.exit(0)
 
-	
+	print("Parsed arguments\n===================")
+	for arg, value in vars(args).items():
+		print(f"{arg}: {value}")
+
 	# Torch settings
 	torch.set_num_threads(args.threads)
 	torch.set_num_interop_threads(args.threads)
@@ -250,7 +253,7 @@ if __name__ == "__main__":
 		for pattern in args.input.split(","):
 			input_graphs_filenames.extend(glob(pattern.strip()))
 
-		_,_ = utils.load_data(
+		_ = utils.load_data(
 			input_graphs_filenames=input_graphs_filenames, 
 			val_fraction=args.val_fraction, 
 			save_graphs_to=args.training_data,

@@ -160,7 +160,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			Returns:
 				torch_geometric.data.Data
 	"""
-	def __init__(self, positive_edges, node_embeddings=None, edge_attr=None, batch_size=1000, num_batches=None, centrality=None, centrality_fraction=None, negative_edges=None, negative_batch_size=None):
+	def __init__(self, positive_edges, node_embeddings=None, edge_attr=None, batch_size=1000, num_batches=None, centrality=None, centrality_fraction=None, negative_edges=None, negative_batch_size=None, message_fraction = 0.7, max_neighbors = 30, alpha_max = 3.0, softness = 5.0):
 		super().__init__()
 		self.device = positive_edges.device  # Assign device from positive_edges
 		self.positive_edges = positive_edges.to(self.device)  # Ensure positive_edges is on the correct device
@@ -172,6 +172,11 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.sampled_edges = set()
 		self.total_positive_edges = positive_edges.size(1)
 		self.total_positive_nodes = positive_edges.max().item() + 1
+		self.centrality = normalize_values(centrality)
+		self.message_fraction = message_fraction
+		self.max_neighbors = max_neighbors
+		self.alpha_max = alpha_max
+		self.softness = softness
 
 		# Ensure node indices and edge_attributes are compatible with edge list
 		if node_embeddings is not None:
@@ -233,60 +238,52 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 		return torch.cat([centrality_sampled, uniform_sampled])
 
-	def create_output_batch_only_positive(self):
-		"""Create a PyG Data object for the sampled edges."""
-		# Sample positive edges
-		sampled_edge_idx = self.sampling_fn()
-		batch_edges = self.positive_edges[:, sampled_edge_idx]
-
-		# Track sampled positive edges
-		self.sampled_edges.update(sampled_edge_idx.tolist())
-
-		# Create node mask and relabel nodes
-		node_mask = torch.zeros(self.max_nodes, dtype=torch.bool, device=self.device)
-		node_mask[batch_edges.flatten()] = True
-		nodes_in_batch = torch.where(node_mask)[0]
-
-		remapped_edge_index, _ = map_index(batch_edges.view(-1), nodes_in_batch, max_index=batch_edges.max().item(), inclusive=True)
-		remapped_edge_index = remapped_edge_index.view(2, -1)
-
-		# Create a PyG Data object
-		batch = Data(
-			edge_index=remapped_edge_index,
-		)
-		if self.node_embeddings is not None:
-			batch.x = self.node_embeddings[node_mask, :]
-			# batch.n_id = nodes_in_batch
-
-		# Subset edge attributes if available
-		if self.edge_attr is not None:
-			batch.edge_attr = self.edge_attr[sampled_edge_idx]
-
-		return batch
-
 	def create_output_batch_positive_and_negative(self):
 		"""Create a PyG Data object for the sampled edges."""
 		# Sample positive edges
 		sampled_edge_idx = self.sampling_fn()
-		positive_batch = self.positive_edges[:, sampled_edge_idx]
-		
-		negative_batch_idx = torch.multinomial(
-			torch.ones(self.num_negative_edges, device=self.device),
-			self.negative_batch_size,
-			replacement=False
-			).to(self.device)
-		# Sample negative edges
-		negative_batch = self.negative_edges[:, negative_batch_idx]
-
-		# Combine positive and negative edges
-		batch_edges = torch.cat([positive_batch, negative_batch], dim=1)
-
-		# Create edge type mask
-		positive_edge_mask = torch.zeros(batch_edges.size(1), dtype=torch.bool, device=self.device)
-		positive_edge_mask[:positive_batch.size(1)] = True  # Mark positive edges as True
-
 		# Track sampled positive edges
 		self.sampled_edges.update(sampled_edge_idx.tolist())
+
+		positive_batch = self.positive_edges[:, sampled_edge_idx]
+		positive_rev = positive_batch.flip(0)
+		positive_bidirectional = torch.cat([positive_batch, positive_rev], dim=1)
+
+		src, dst = positive_bidirectional
+
+		positive_batch_size = src.size(0)
+		dst_indegree = torch.bincount(dst,minlength=positive_batch_size)[dst]
+
+		alpha_v  = self.alpha_max * torch.sigmoid((dst_indegree - self.max_neighbors)/self.softness)
+		
+		message_edge_weight = (self.centrality[src]/(self.centrality[dst] + 1e-6))**alpha_v
+
+		message_indices = torch.multinomial(message_edge_weight, int(self.message_fraction*positive_batch_size), replacement = False)
+
+		negative_batch_size = 2*positive_batch_size
+
+		negative_batch_idx = torch.multinomial(
+			torch.ones(self.num_negative_edges, device=self.device),
+			negative_batch_size,
+			replacement=False
+			).to(self.device)
+
+		supervision_edge_mask = torch.ones(positive_batch_size + negative_batch_size, dtype = torch.bool)
+
+		supervision_edge_mask[message_indices] = False
+
+		negative_edge_mask = torch.zeros_like(supervision_edge_mask, dtype = torch.bool)
+
+		negative_edge_mask[-negative_batch_size:] = True
+		
+		batch_edges = torch.cat([
+			positive_bidirectional[:,message_indices],
+			positive_bidirectional[:,supervision_edge_mask[:positive_batch_size]],
+			self.negative_edges[:, negative_batch_idx]
+			],
+			)
+		
+
 
 		# Create node mask and relabel nodes
 		node_mask = torch.zeros(self.max_nodes, dtype=torch.bool, device=self.device)
@@ -296,10 +293,16 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		remapped_edge_index, _ = map_index(batch_edges.view(-1), nodes_in_batch, max_index = batch_edges.max().item(), inclusive=True)
 		remapped_edge_index = remapped_edge_index.view(2, -1)
 
+		supervision_edges = remapped_edge_index[:,supervision_edge_mask]
+		message_edges = remapped_edge_index[:,~supervision_edge_mask]
+		supervision_labels = torch.ones(supervision_edges.size(1), dtype = torch.float)
+		supervision_labels[-negative_batch_size:] = 0.0
+
 		# Create a PyG Data object
 		batch = Data(
-			edge_index=remapped_edge_index,
-			positive_edges=positive_edge_mask  # Mark edges as positive or negative
+			message_edges = message_edges,
+			supervision_edges = supervision_edges,
+			supervision_labels = supervision_labels
 		)
 		if self.node_embeddings is not None:
 			batch.x = self.node_embeddings[node_mask, :]
@@ -307,11 +310,42 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 		# Subset edge attributes if available
 		if self.edge_attr is not None:
-			positive_edge_attr = self.edge_attr[sampled_edge_idx]
-			negative_edge_attr = torch.zeros(negative_batch.size(1), device=self.device)
-			batch.edge_attr = torch.cat([positive_edge_attr, negative_edge_attr], dim=0)
+			all_edge_attr = torch.cat([self.edge_attr, self.edge_attr.flip(), torch.zeros(negative_batch_size)])
+			batch.message_edge_attr = all_edge_attr[~supervision_edge_mask]
+			batch.supervision_edge_attr = all_edge_attr[supervision_edge_mask]
 
 		return batch
+	
+	# def create_output_batch_only_positive(self):
+	# 	"""Create a PyG Data object for the sampled edges."""
+	# 	# Sample positive edges
+	# 	sampled_edge_idx = self.sampling_fn()
+	# 	batch_edges = self.positive_edges[:, sampled_edge_idx]
+
+	# 	# Track sampled positive edges
+	# 	self.sampled_edges.update(sampled_edge_idx.tolist())
+
+	# 	# Create node mask and relabel nodes
+	# 	node_mask = torch.zeros(self.max_nodes, dtype=torch.bool, device=self.device)
+	# 	node_mask[batch_edges.flatten()] = True
+	# 	nodes_in_batch = torch.where(node_mask)[0]
+
+	# 	remapped_edge_index, _ = map_index(batch_edges.view(-1), nodes_in_batch, max_index=batch_edges.max().item(), inclusive=True)
+	# 	remapped_edge_index = remapped_edge_index.view(2, -1)
+
+	# 	# Create a PyG Data object
+	# 	batch = Data(
+	# 		edge_index=remapped_edge_index,
+	# 	)
+	# 	if self.node_embeddings is not None:
+	# 		batch.x = self.node_embeddings[node_mask, :]
+	# 		# batch.n_id = nodes_in_batch
+
+	# 	# Subset edge attributes if available
+	# 	if self.edge_attr is not None:
+	# 		batch.edge_attr = self.edge_attr[sampled_edge_idx]
+
+	# 	return batch
 
 	def __iter__(self):
 		n = 0
@@ -502,7 +536,7 @@ def normalize_values(values, min_val=None, max_val=None):
 	return (values - min_val) / (max_val - min_val)
 
 
-def mask_edges_random(probability_of_masking, edge_list, normalized_centrality=None, device=None): 
+def mask_edges_random(mask_size, probability_of_masking=1.0, normalized_centrality=None, device=None): 
 	"""
 	Randomly mask edges based on a probability mask and optional centrality scores.
 
@@ -516,24 +550,16 @@ def mask_edges_random(probability_of_masking, edge_list, normalized_centrality=N
 		torch.Tensor: Boolean mask indicating which edges are selected.
 		torch.Tensor: Masked edge list.
 	"""
-	# Ensure device compatibility
-	if device is None:
-		device = edge_list.device
-	edge_list = edge_list.to(device)
-
 	# Normalize centrality scores if provided
-	if normalized_centrality is not None:
+	if normalized_centrality is not None and normalized_centrality.size(0) == mask_size:
 		final_probabilities = normalized_centrality.to(device) * probability_of_masking
 	else:
-		final_probabilities = torch.ones(edge_list.size(1), device=device) * probability_of_masking
+		final_probabilities = torch.ones(mask_size, device=device) * probability_of_masking
 
 	# Generate Bernoulli mask
 	bernoulli_mask = torch.bernoulli(final_probabilities).bool()
 
-	# Mask edges
-	masked_edges = edge_list[:, bernoulli_mask]
-
-	return bernoulli_mask, masked_edges
+	return bernoulli_mask
 
 bce_loss = nn.BCEWithLogitsLoss()
 mse_loss = nn.MSELoss()
@@ -556,7 +582,7 @@ def process_data(data, model, optimizer, device, is_training=False):
 	data = data.to(device)
 
 	# Mask edges randomly for both positive and negative edges
-	all_message_edges, _ = mask_edges_random(0.7, data.edge_index, device=device)
+	all_message_edges, _ = mask_edges_random(0.7, data.edge_index[:,data.positive_edges], device=device)
 
 	# Sample neighbors for the minibatch
 	# nbr_sample_batches = NeighborLoader(
@@ -564,8 +590,6 @@ def process_data(data, model, optimizer, device, is_training=False):
 	# 	num_neighbors=[30, 20],
 	# 	batch_size=64,
 	# )
-
-	total_loss = 0.0
 
 	# Set model mode and optimizer behavior
 	if is_training:
@@ -588,14 +612,12 @@ def process_data(data, model, optimizer, device, is_training=False):
 	# Compute BCE and MSE losses
 	loss = bce_loss(edge_probability, labels) + mse_loss(edge_weight_pred, data.edge_attr[~all_message_edges].unsqueeze(-1))
 
-	total_loss += loss.item()
-
 	conditional_backward(loss)
 
 	if is_training:
 		optimizer.step()
 
-	return total_loss
+	return loss.item()
 
 
 def load_data(input_graphs_filenames, val_fraction, save_graphs_to=None, device=None):

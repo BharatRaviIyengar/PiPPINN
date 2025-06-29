@@ -62,7 +62,7 @@ if __name__ == "__main__":
 
 	# Initialize the model with the best hyperparameters
 
-	results, best_model = run_training(best_params, input_data, device=device)
+	results, best_model = run_training(best_params, input_data, args.batch_size, device=device)
 	
 	torch.save(best_model.state_dict(), "args.output")
 
