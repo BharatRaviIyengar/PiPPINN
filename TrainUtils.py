@@ -88,8 +88,8 @@ class GraphSAGE(nn.Module):
 		self.hidden_channels = hidden_channels
 
 		# Edge prediction head
-		self.edge_pred = nn.Linear(self.hidden_channels * 2, 1)
-		self.edge_weight_pred = nn.Linear(self.hidden_channels * 2, 1)
+		self.edge_pred = nn.Linear(self.hidden_channels, 1)
+		self.edge_weight_pred = nn.Linear(self.hidden_channels, 1)
 
 		# Initialize the convolution layers based on the mode
 		self.set_mode(mode)
@@ -129,7 +129,7 @@ class GraphSAGE(nn.Module):
 		x = self.dropout(x)
 
 		# Predict edges
-		edge_embeddings = torch.cat([x[prediction_edges[0]], x[prediction_edges[1]]], dim=-1)
+		edge_embeddings = x[prediction_edges[0]] + x[prediction_edges[1]]
 		edge_weights = ReLU(self.edge_weight_pred(edge_embeddings))
 		edge_predictor = self.edge_pred(edge_embeddings)
 		return edge_weights, edge_predictor
