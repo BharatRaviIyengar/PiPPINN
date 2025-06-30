@@ -89,6 +89,8 @@ def run_training(params, batch_size, dataset, device):
 	).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
+	model = torch.compile(model)
+
 	# Training loop
 	best_val_loss = float('inf')
 	best_train_loss = float('inf')
@@ -177,7 +179,7 @@ if __name__ == "__main__":
 	parser.add_argument("--num_trials","-n",
 		type=int,
 		help="Number of trials to generate",
-		default=100
+		default=60
 	)
 	parser.add_argument("--param_ranges","-p",
 		type=str,

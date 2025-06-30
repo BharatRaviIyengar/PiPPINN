@@ -573,7 +573,7 @@ def process_data(data, model, optimizer, device, is_training=False):
 	
 	# Compute BCE and MSE losses
 
-	loss = bce_loss(edge_probability, data.supervision_labels, weight=data.supervision_importance) + mse_loss(edge_weight_pred, data.supervision_edgewts.unsqueeze(-1))
+	loss = bce_loss(edge_probability.squeeze(-1), data.supervision_labels, weight=data.supervision_importance) + mse_loss(edge_weight_pred.squeeze(-1), data.supervision_edgewts)
 
 	conditional_backward(loss)
 
