@@ -545,7 +545,7 @@ def normalize_values(values, min_val=None, max_val=None):
 	return (values - min_val) / (max_val - min_val)
 
 
-bce_loss = nn.BCEWithLogitsLoss()
+bce_loss = torch.nn.functional.binary_cross_entropy_with_logits()
 mse_loss = nn.MSELoss()
 
 
