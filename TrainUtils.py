@@ -270,15 +270,16 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		negative_edge_mask = torch.zeros_like(supervision_edge_mask, dtype = torch.bool)
 
 		negative_edge_mask[-negative_batch_size:] = True
-		
+
+	
 		batch_edges = torch.cat([
 			positive_bidirectional[:,message_indices],
 			positive_bidirectional[:,supervision_edge_mask[:positive_batch_size]],
 			self.negative_edges[:, negative_batch_idx]
 			],
-			)
+			dim=1)
 		
-
+		print(f"Batch_edges shape = {batch_edges.shape}")
 
 		# Create node mask and relabel nodes
 		node_mask = torch.zeros(self.max_nodes, dtype=torch.bool, device=self.device)
@@ -307,11 +308,20 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			batch.node_features = self.node_embeddings[node_mask, :]
 			#batch.n_id = nodes_in_batch
 
+		print(batch)
+
 		# Subset edge attributes if available
 		if self.edge_attr is not None:
-			all_edge_attr = torch.cat([self.edge_attr, self.edge_attr.flip(), torch.zeros(negative_batch_size)])
+			sampled_positive_edgewts = self.edge_attr[sampled_edge_idx]
+			all_edge_attr = torch.cat([
+				sampled_positive_edgewts, 
+				sampled_positive_edgewts.flip(0), 
+				torch.zeros(negative_batch_size)]
+				)
 			batch.message_edgewts = all_edge_attr[~supervision_edge_mask]
 			batch.supervision_edgewts = all_edge_attr[supervision_edge_mask]
+		
+		print(batch)
 
 		return batch
 	
