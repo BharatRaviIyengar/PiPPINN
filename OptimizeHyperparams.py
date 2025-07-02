@@ -89,7 +89,7 @@ def run_training(params, batch_size, dataset, device):
 	).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-	model = torch.compile(model)
+	# model = torch.compile(model)
 
 	# Training loop
 	best_val_loss = float('inf')
