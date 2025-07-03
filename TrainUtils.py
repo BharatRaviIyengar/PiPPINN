@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.nn.functional import relu as ReLU
+from torch.nn.functional import relu as ReLU, binary_cross_entropy_with_logits as bce_loss, mse_loss
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.utils import degree
@@ -544,11 +544,6 @@ def normalize_values(values, min_val=None, max_val=None):
 		max_val = values.max()
 	return (values - min_val) / (max_val - min_val)
 
-
-bce_loss = torch.nn.functional.binary_cross_entropy_with_logits()
-mse_loss = nn.MSELoss()
-
-
 def process_data(data, model, optimizer, device, is_training=False):
 	"""
 	Process a single batch of data for training or validation.
@@ -567,11 +562,9 @@ def process_data(data, model, optimizer, device, is_training=False):
 
 	# Set model mode and optimizer behavior
 	if is_training:
-		model.train()
 		optimizer.zero_grad()  # Zero gradients before backward calls
 		conditional_backward = lambda loss: loss.backward()  # Define backpropagation
 	else:
-		model.eval()
 		conditional_backward = lambda loss: None  # No-op for validation
 
 	edge_probability, edge_weight_pred = model(

@@ -103,12 +103,16 @@ def run_training(params, batch_size, dataset, device):
 
 		
 		for data in data_for_training:
+			
 			# Training
+			model.train()
 			for batch in data["train_batch_loader"]:
 				total_train_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=True)
 
 			# Validation
-			total_val_loss += utils.process_data(data["val_graph"], model=model, optimizer=optimizer, device=device, is_training=False)
+			model.eval()
+			with torch.inference_mode():
+				total_val_loss += utils.process_data(data["val_graph"], model=model, optimizer=optimizer, device=device, is_training=False)
 
 		# Log losses
 		print(f"Epoch {epoch + 1}/{args.epochs}, Training Loss: {total_train_loss:.4f}, Validation Loss: {total_val_loss:.4f}")
