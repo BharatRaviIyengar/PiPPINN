@@ -654,6 +654,8 @@ def generate_batch(data, batch_size, centrality_fraction=0.6, device = None):
 			dim=0
 		)
 
+		# TODO generat validation graph in the same way as training 
+
 	data_for_training = {
 		"train_batch_loader": minibatch_loader,
 		"val_graph": val
