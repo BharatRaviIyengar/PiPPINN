@@ -155,7 +155,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			Returns:
 				torch_geometric.data.Data
 	"""
-	def __init__(self, positive_edges, node_embeddings=None, edge_attr=None, batch_size=1000, num_batches=None, centrality=None, centrality_fraction=None, negative_edges=None, negative_batch_size=None, message_fraction = 0.7, max_neighbors = 30, alpha_max = 10.0, sharpness_nbr_max = 1):
+	def __init__(self, positive_edges, node_embeddings=None, edge_attr=None, batch_size=1000, num_batches=None, centrality=None, centrality_fraction=None, negative_edges=None, negative_batch_size=None, message_fraction = 0.7, max_neighbors = 30.0, alpha_max = 10.0, sharpness_nbr_max = 1):
 		super().__init__()
 		self.device = positive_edges.device  # Assign device from positive_edges
 		self.positive_edges = positive_edges.to(self.device)  # Ensure positive_edges is on the correct device
@@ -172,7 +172,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.max_neighbors = max_neighbors
 		self.alpha_max = alpha_max
 		self.sharpness_nbr_max = sharpness_nbr_max
-
+		self.node_mask = torch.zeros(self.max_nodes, dtype=torch.bool, device=self.device)
 		# Ensure node indices and edge_attributes are compatible with edge list
 		if node_embeddings is not None:
 			if self.total_positive_nodes > node_embeddings.size(0):
@@ -259,7 +259,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		src, dst = positive_bidirectional
 
 		positive_batch_size = src.size(0)
-		dst_indegree = torch.bincount(dst,minlength=positive_batch_size)[dst]
+		dst_indegree = degree(dst, num_nodes=self.max_nodes)
 
 		alpha_v  = self.alpha_max * torch.sigmoid(self.sharpness_nbr_max*(dst_indegree - self.max_neighbors))
 		
@@ -290,16 +290,17 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		print(f"Batch_edges shape = {batch_edges.shape}")
 
 		# Create node mask and relabel nodes
-		node_mask = torch.zeros(self.max_nodes, dtype=torch.bool, device=self.device)
-		node_mask[batch_edges.flatten()] = True
-		nodes_in_batch = torch.where(node_mask)[0]
+		
+		self.node_mask.fill_(False)
+		self.node_mask[batch_edges.flatten()] = True
+		nodes_in_batch = torch.where(self.node_mask)[0]
 
-		remapped_edge_index, _ = map_index(batch_edges.view(-1), nodes_in_batch, max_index = batch_edges.max().item(), inclusive=True)
+		remapped_edge_index, _ = map_index(batch_edges.view(-1), nodes_in_batch, max_index = nodes_in_batch.size(0), inclusive=True)
 		remapped_edge_index = remapped_edge_index.view(2, -1)
 
 		supervision_edges = remapped_edge_index[:,supervision_edge_mask]
 		message_edges = remapped_edge_index[:,~supervision_edge_mask]
-		supervision_labels = torch.ones(supervision_edges.size(1), dtype = torch.float)
+		supervision_labels = torch.ones(supervision_edges.size(1), dtype = torch.float, device=self.device)
 		supervision_labels[-self.negative_batch_size:] = 0.0
 		srcs, dsts = supervision_edges
 		supervision_importance = (self.centrality[srcs] + self.centrality[dsts])/2
@@ -313,7 +314,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			supervision_importance = supervision_importance
 		)
 		if self.node_embeddings is not None:
-			batch.node_features = self.node_embeddings[node_mask, :]
+			batch.node_features = self.node_embeddings[self.node_mask, :]
 			#batch.n_id = nodes_in_batch
 
 		# Subset edge attributes if available
@@ -347,7 +348,7 @@ def subgraph_with_relabel(original_graph, edge_mask):
 	selected_nodes = torch.where(node_mask)[0]
 
 	# Relabel edges
-	remapped_edge_index, _ = map_index(selected_edges.view(-1), selected_nodes, max_index=num_nodes, inclusive=True)
+	remapped_edge_index, _ = map_index(selected_edges.view(-1), selected_nodes, max_index=selected_nodes.size(0), inclusive=True)
 	remapped_edge_index = remapped_edge_index.view(2, -1)
 
 	# Create the output graph
