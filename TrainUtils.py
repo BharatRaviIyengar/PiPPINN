@@ -265,7 +265,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		
 		ratio = ((self.centrality[dst] + 1e-6) / (self.centrality[src] + 1e-6)).clamp(min=1e-6)
 		log_weight = alpha_v[dst] * torch.log(ratio)
-		message_edge_weight = torch.sigmoid(alpha_v * log_weight)
+		message_edge_weight = torch.sigmoid(log_weight)
 
 		message_indices = torch.multinomial(message_edge_weight, int(self.message_fraction*positive_batch_size), replacement = False)
 
