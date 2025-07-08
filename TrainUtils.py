@@ -287,8 +287,6 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			],
 			dim=1)
 		
-		print(f"Batch_edges shape = {batch_edges.shape}")
-
 		# Create node mask and relabel nodes
 		
 		self.node_mask.fill_(False)
@@ -617,25 +615,26 @@ def generate_batch(data, batch_size, centrality_fraction=0.6, device = None):
 		negative_edges=data["Train_Neg"],
 		negative_batch_size=negative_batch_size
 	)
-	minibatch_loader = torch.utils.data.DataLoader(data_sampler, batch_size=None)
+	train_loader = torch.utils.data.DataLoader(data_sampler, batch_size=None)
 
 	data_sampler_val = EdgeSampler(
 		positive_edges=data["Val"].edge_index,
 		node_embeddings=data["Val"].x,
 		edge_attr = data["Val"].edge_attr,
-		batch_size=data["Val"].edge_index.size(1),
+		batch_size=200000,
 		num_batches=None,
 		centrality=data["Val"].node_degree,
 		centrality_fraction=centrality_fraction,
 		negative_edges=data["Val_Neg"],
-		negative_batch_size=2*data["Val"].edge_index.size(1)
+		negative_batch_size=400000
 	)
 	# Prepare validation graph
-	val_data = data_sampler_val.create_output_batch()
+	val_loader = torch.utils.data.DataLoader(data_sampler_val, batch_size=None)
 
 	data_for_training = {
-		"train_batch_loader": minibatch_loader,
-		"val_graph": val_data
+		"train_batch_loader": train_loader,
+		"val_batch_loader": val_loader,
+		"input_channels": data["Val"].x.size(1)
 	}
 
 	return data_for_training

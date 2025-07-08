@@ -83,7 +83,7 @@ def run_training(params, batch_size, dataset, device):
 
 	# Initialize model and optimizer
 	model = utils.GraphSAGE(
-		in_channels=data_for_training[0]["val_graph"].node_features.size(1),
+		in_channels=data_for_training[0]["input_channels"],
 		hidden_channels=hidden_channels,
 		dropout = dropout
 	).to(device)
@@ -112,7 +112,8 @@ def run_training(params, batch_size, dataset, device):
 			# Validation
 			model.eval()
 			with torch.inference_mode():
-				total_val_loss += utils.process_data(data["val_graph"], model=model, optimizer=optimizer, device=device, is_training=False)
+				for batch in data["val_batch_loader"]:
+					total_val_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=False)
 
 		# Log losses
 		print(f"Epoch {epoch + 1}/{args.epochs}, Training Loss: {total_train_loss:.4f}, Validation Loss: {total_val_loss:.4f}")
