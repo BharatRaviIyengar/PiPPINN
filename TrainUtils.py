@@ -172,7 +172,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.max_neighbors = max_neighbors
 		self.alpha_max = alpha_max
 		self.sharpness_nbr_max = sharpness_nbr_max
-		self.node_mask = torch.zeros(self.max_nodes, dtype=torch.bool, device=self.device)
+		
 		# Ensure node indices and edge_attributes are compatible with edge list
 		if node_embeddings is not None:
 			if self.total_positive_nodes > node_embeddings.size(0):
@@ -203,7 +203,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.num_negative_edges = self.negative_edges.size(1)
 
 		self.max_nodes = max(self.negative_edges.max().item() + 1, self.total_positive_nodes)
-
+		
 		# Create node mask on the correct device
 		self.node_mask = torch.zeros(self.max_nodes, dtype=torch.bool, device=self.device)
 
@@ -264,7 +264,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		alpha_v  = self.alpha_max * torch.sigmoid(self.sharpness_nbr_max*(dst_indegree - self.max_neighbors))
 		
 		ratio = ((self.centrality[dst] + 1e-6) / (self.centrality[src] + 1e-6)).clamp(min=1e-6)
-		log_weight = alpha_v * torch.log(ratio)
+		log_weight = alpha_v[dst] * torch.log(ratio)
 		message_edge_weight = torch.sigmoid(alpha_v * log_weight)
 
 		message_indices = torch.multinomial(message_edge_weight, int(self.message_fraction*positive_batch_size), replacement = False)
