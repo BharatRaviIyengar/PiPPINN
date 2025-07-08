@@ -295,7 +295,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.node_mask[batch_edges.flatten()] = True
 		nodes_in_batch = torch.where(self.node_mask)[0]
 
-		remapped_edge_index, _ = map_index(batch_edges.view(-1), nodes_in_batch, max_index = nodes_in_batch.size(0), inclusive=True)
+		remapped_edge_index, _ = map_index(batch_edges.view(-1), nodes_in_batch, max_index = nodes_in_batch.max()+1, inclusive=True)
 		remapped_edge_index = remapped_edge_index.view(2, -1)
 
 		supervision_edges = remapped_edge_index[:,supervision_edge_mask]
@@ -348,7 +348,7 @@ def subgraph_with_relabel(original_graph, edge_mask):
 	selected_nodes = torch.where(node_mask)[0]
 
 	# Relabel edges
-	remapped_edge_index, _ = map_index(selected_edges.view(-1), selected_nodes, max_index=selected_nodes.size(0), inclusive=True)
+	remapped_edge_index, _ = map_index(selected_edges.view(-1), selected_nodes, max_index=selected_nodes.max()+1, inclusive=True)
 	remapped_edge_index = remapped_edge_index.view(2, -1)
 
 	# Create the output graph
