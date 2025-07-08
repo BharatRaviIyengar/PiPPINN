@@ -168,7 +168,7 @@ if __name__ == "__main__":
 	parser.add_argument("--batch_size", "-b",
 		type=int,
 		help="Minibatch size for training",
-		default=0
+		default=5000
 	)
 	parser.add_argument("--training_data",
 		type=str,
@@ -225,9 +225,6 @@ if __name__ == "__main__":
 		print("Error: essential arguments not provided.")
 		parser.print_help() # Print the help message
 		sys.exit(1)
-
-	if args.batch_size == 0:
-		args.batch_size = 5000
 
 	if not gpu_yes:
 		print("GPU not available: Quitting")
