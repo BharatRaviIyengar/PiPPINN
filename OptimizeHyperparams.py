@@ -83,7 +83,7 @@ def run_training(params, batch_size, dataset, device):
 
 	# Initialize model and optimizer
 	model = utils.GraphSAGE(
-		in_channels=data_for_training[0]["val_graph"].x.size(1),
+		in_channels=data_for_training[0]["val_graph"].node_features.size(1),
 		hidden_channels=hidden_channels,
 		dropout = dropout
 	).to(device)
