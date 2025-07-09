@@ -71,7 +71,7 @@ def load_param_set(infile,trial_ids=[0]):
 		trial_parameters = json.load(f)
 	return [trial_parameters[i] for i in trial_ids]
 
-def run_training(params, batch_size, dataset, device):
+def run_training(params, num_batches, batch_size, dataset, device):
 	centrality_fraction = params['centrality_fraction']
 	hidden_channels = params['hidden_channels']
 	dropout = params['dropout']
@@ -79,7 +79,11 @@ def run_training(params, batch_size, dataset, device):
 	weight_decay = params['weight_decay']
 	patience = 10
 
-	data_for_training = [utils.generate_batch(data, batch_size, centrality_fraction,device=device) for data in dataset]
+	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction,device=device) for data in dataset]
+
+	all_sampled_edges = [torch.zeros(data["Train"].edge_index.size(1), dtype=torch.bool, device="cpu") for data in dataset]
+
+	frac_sampled = torch.zeros(len(dataset))
 
 	# Initialize model and optimizer
 	model = utils.GraphSAGE(
@@ -88,8 +92,6 @@ def run_training(params, batch_size, dataset, device):
 		dropout = dropout
 	).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-
-	# model = torch.compile(model)
 
 	# Training loop
 	best_val_loss = float('inf')
@@ -102,12 +104,23 @@ def run_training(params, batch_size, dataset, device):
 		total_val_loss = 0.0  # Reset total validation loss for the epoch
 
 		
-		for data in data_for_training:
+		for idx, data in enumerate(data_for_training):
 			
 			# Training
+			batch_count = 0
 			model.train()
-			for batch in data["train_batch_loader"]:
+			for sampled_edges, batch in data["train_batch_loader"]:
 				total_train_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=True)
+				all_sampled_edges[idx][sampled_edges] = True
+				
+				batch_count += 1
+				if batch_count % 10 == 0:
+					unsampled = ~all_sampled_edges[idx]
+						# Promote sampling of unsampled edges #
+					data["train_data_sampler"].edge_probs[unsampled] *= 1.1
+					data["train_data_sampler"].uniform_probs[unsampled] *= 1.1
+					data["train_data_sampler"].edge_probs[~unsampled] = data["train_data_sampler"].edge_centrality_scores[~unsampled]
+					data["train_data_sampler"].uniform_probs[~unsampled].fill_(1.0)
 
 			# Validation
 			model.eval()
@@ -117,6 +130,9 @@ def run_training(params, batch_size, dataset, device):
 
 		# Log losses
 		print(f"Epoch {epoch + 1}/{args.epochs}, Training Loss: {total_train_loss:.4f}, Validation Loss: {total_val_loss:.4f}")
+		
+		for i,x in enumerate(all_sampled_edges):
+			frac_sampled[i] = x.sum()/x.size(0)
 
 		# Early stopping logic
 		if total_val_loss < best_val_loss:
@@ -126,7 +142,7 @@ def run_training(params, batch_size, dataset, device):
 			early_stopping_epoch = epoch + 1
 		else:
 			epochs_without_improvement += 1
-			if epochs_without_improvement >= patience:
+			if epochs_without_improvement >= patience and torch.all(frac_sampled > 0.95):
 				print(f"Early stopping triggered after {epoch + 1} epochs.")
 				break
 	
@@ -170,6 +186,11 @@ if __name__ == "__main__":
 		type=int,
 		help="Minibatch size for training",
 		default=5000
+	)
+	parser.add_argument("--num_batches",
+		type=int,
+		help="Number of minibatches for training",
+		default=300
 	)
 	parser.add_argument("--training_data",
 		type=str,
@@ -274,7 +295,7 @@ if __name__ == "__main__":
 		dataset = torch.load(args.training_data, weights_only = False)
 
 		for trial_id, params in enumerate(paramset):
-			result, _ = run_training(params, args.batch_size, dataset, device)
+			result, _ = run_training(params, args.num_batches, args.batch_size, dataset, device)
 			result["trial_id"] = args.trial_ids[trial_id]
 			results.append(result)
 		if args.trial_result is None:
