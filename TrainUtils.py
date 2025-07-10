@@ -171,9 +171,12 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.alpha_max = alpha_max
 		self.sharpness_nbr_max = sharpness_nbr_max
 
-		self.unsampled_edges = torch.ones(self.total_positive_edges, dtype=torch.bool)
-		self.uniform_probs = torch.ones(self.total_positive_edges)
-		self.strata_mask_hubs = torch.ones(self.total_positive_edges, dtype=torch.bool)
+		self.unsampled_edges = torch.ones(self.total_positive_edges, dtype=torch.bool, device = self.device)
+		self.uniform_probs = torch.ones(self.total_positive_edges, device = self.device)
+		self.strata_mask_hubs = torch.ones(self.total_positive_edges, dtype=torch.bool, device = self.device)
+		self.unsampled_mask = torch.ones(self.total_positive_edges, dtype=torch.bool, device = self.device)
+		self.positive_edge_idx = torch.arange(self.total_positive_edges, device = self.device)
+
 
 		# Ensure node indices and edge_attributes are compatible with edge list
 		if node_embeddings is not None:
@@ -189,10 +192,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		if centrality is not None and self.total_positive_nodes < centrality.size(0):
 			self.centrality = normalize_values(centrality)
 			self.edge_centrality_scores = self.get_edge_centrality(self.positive_edges)
-			self.edge_probs = self.edge_centrality_scores.clone().to(self.device)
-		else:
-			self.edge_probs = self.uniform_probs.to(self.device)
-
+			
 		if negative_edges is not None:
 			self.negative_edges = negative_edges.to(self.device)
 			if negative_batch_size is None:
@@ -228,26 +228,44 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			replacement=False
 			)
 
+ 
 	def get_edge_centrality(self,edge_list):
 		return self.centrality[edge_list[0]] + self.centrality[edge_list[1]]
 
 	def sample_edges_basic(self):
 		return torch.multinomial(self.edge_probs, self.batch_size, replacement=False)
-
-	def sample_edges_strata(self):
-		centrality_batch_size = int(self.batch_size * self.centrality_fraction)  # type: ignore
-		uniform_batch_size = self.batch_size - centrality_batch_size
+	
+	def sample_edges_strata(self, sample_size):
+		centrality_batch_size = int(sample_size * self.centrality_fraction)  # type: ignore
+		uniform_batch_size = sample_size - centrality_batch_size
 
 		# Centrality-based sampling
-		centrality_sampled = torch.multinomial(self.edge_probs, centrality_batch_size, replacement=False)
-		self.strata_mask_hubs[centrality_sampled] = False
+		centrality_sampled_edges = torch.multinomial(self.edge_probs, centrality_batch_size, replacement=False)
+		self.strata_mask_hubs[centrality_sampled_edges] = False
 
 		# Uniform sampling from the rest
-		uniform_pool = torch.where(self.uniform_probs[self.strata_mask_hubs])[0]
-		uniform_sampled = uniform_pool[torch.multinomial(self.uniform_probs[self.strata_mask_hubs], uniform_batch_size, replacement=False)]
+		uniform_sampled_indices = torch.multinomial(self.uniform_probs[self.strata_mask_hubs], uniform_batch_size, replacement=False)
+		uniform_sampled_edges = self.positive_edge_idx[self.strata_mask_hubs][uniform_sampled_indices]
 		self.strata_mask_hubs.fill_(True)
+		return torch.cat([centrality_sampled_edges, uniform_sampled_edges])
 
-		return torch.cat([centrality_sampled, uniform_sampled])
+	def sample_edges_strata_total(self):
+		sampled_edges = self.sample_edges_strata(self.batch_size)
+		return sampled_edges
+	
+	def sample_edges_strata_with_unsampled_tracking(self):
+		# Sample from total
+		num_sample_from_total = int(self.batch_size*(1-self.frac_sample_from_unsampled))
+		sampled_from_total = self.sample_edges_strata(num_sample_from_total)
+		self.unsampled_edges[sampled_from_total] = False
+
+		# Sampling from unsampled 
+		num_unsampled = self.unsampled.sum()
+		num_sample_from_unsampled = min(self.batch_size - num_sample_from_total, num_unsampled)
+		sampled_indices_from_unsampled = torch.multinomial(self.uniform_probs[:num_unsampled], num_sample_from_unsampled, replacement=False)
+		sampled_edges_from_unsampled =  self.positive_edge_idx[self.unsampled_mask][sampled_indices_from_unsampled]
+		self.unsampled_edges[sampled_edges_from_unsampled] = False
+		return torch.cat([sampled_from_total, sampled_edges_from_unsampled])
 
 	def create_output_batch(self):
 		"""Create a PyG Data object for the sampled edges."""
