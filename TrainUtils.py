@@ -155,7 +155,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			Returns:
 				torch_geometric.data.Data
 	"""
-	def __init__(self, positive_edges, node_embeddings=None, edge_attr=None, batch_size=1000, num_batches=100, centrality=None, centrality_fraction=None, negative_edges=None, negative_batch_size=None, message_fraction = 0.7, max_neighbors = 30.0, alpha_max = 10.0, sharpness_nbr_max = 1):
+	def __init__(self, positive_edges, node_embeddings=None, edge_attr=None, batch_size=1000, num_batches=100, centrality=None, centrality_fraction=None, negative_edges=None, negative_batch_size=None, supervision_fraction = 0.3, max_neighbors = 30.0, alpha_max = 10.0, sharpness_nbr_max = 1):
 		super().__init__()
 		self.device = positive_edges.device  # Assign device from positive_edges
 		self.positive_edges = positive_edges.to(self.device)  # Ensure positive_edges is on the correct device
@@ -166,7 +166,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.centrality_fraction = centrality_fraction
 		self.total_positive_edges = positive_edges.size(1)
 		self.total_positive_nodes = positive_edges.max().item() + 1
-		self.message_fraction = message_fraction
+		self.supervision_fraction = supervision_fraction
 		self.max_neighbors = max_neighbors
 		self.alpha_max = alpha_max
 		self.sharpness_nbr_max = sharpness_nbr_max
@@ -176,7 +176,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.strata_mask_hubs = torch.ones(self.total_positive_edges, dtype=torch.bool, device = self.device)
 		self.unsampled_mask = torch.ones(self.total_positive_edges, dtype=torch.bool, device = self.device)
 		self.positive_edge_idx = torch.arange(self.total_positive_edges, device = self.device)
-
+		self.supervision_edge_mask = torch.zeros(self.batch_size, dtype = torch.bool)
 
 		# Ensure node indices and edge_attributes are compatible with edge list
 		if node_embeddings is not None:
@@ -196,7 +196,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		if negative_edges is not None:
 			self.negative_edges = negative_edges.to(self.device)
 			if negative_batch_size is None:
-				self.negative_batch_size = self.batch_size*(1-message_fraction)*2 # Twice the number of supervision edges
+				self.negative_batch_size = self.batch_size*supervision_fraction*2 # Twice the number of supervision edges
 			else:
 				self.negative_batch_size = negative_batch_size
 		else:
@@ -272,41 +272,35 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		# Sample positive edges
 		sampled_edge_idx = self.sampling_fn()
 		positive_batch = self.positive_edges[:, sampled_edge_idx]
-		positive_rev = positive_batch.flip(0)
-		positive_bidirectional = torch.cat([positive_batch, positive_rev], dim=1)
 
-		src, dst = positive_bidirectional
+		# Define supervision edges
+		self.supervision_edge_mask.fill_(False)
+		num_supervision_positive = int(self.supervision_fraction * self.batch_size)
+		num_message_edges = self.batch_size - num_supervision_positive
+		supervision_positive_idx = torch.multinomial(self.uniform_probs[:self.batch_size], num_supervision_positive, replacement=False)
+		self.supervision_edge_mask[supervision_positive_idx] = True
+		negative_edges = self.negative_edges[:,self.sample_negative_edges()].to(self.device)
+		all_supervision_edges = torch.cat([positive_batch[:,supervision_positive_idx], negative_edges])
 
-		positive_batch_size = src.size(0)
-		dst_indegree = degree(dst, num_nodes=self.max_nodes)
+		srcs, dsts = all_supervision_edges
+		# Learning weights for negative edges (high score negatives between hubs )
+		supervision_importance = (self.centrality[srcs] + self.centrality[dsts])/2
+		# Learning weights for positive edges (high score positives between peripheral nodes)
+		supervision_importance[:-self.negative_batch_size] = 1.0 - supervision_importance[:-self.negative_batch_size]
+		# Label positive and negative edges
+		supervision_labels = torch.ones(all_supervision_edges.size(1), dtype = torch.float, device=self.device)
+		supervision_labels[-self.negative_batch_size:] = 0.0
 
-		alpha_v  = self.alpha_max * torch.sigmoid(self.sharpness_nbr_max*(dst_indegree - self.max_neighbors))
+		# Define message edges
+
+		tentative_message_edges = positive_batch[:,~self.supervision_edge_mask]
 		
-		ratio = ((self.centrality[dst] + 1e-6) / (self.centrality[src] + 1e-6)).clamp(min=1e-6)
-		log_weight = alpha_v[dst] * torch.log(ratio)
-		message_edge_weight = torch.sigmoid(log_weight)
-
-		message_indices = torch.multinomial(message_edge_weight, int(self.message_fraction*positive_batch_size), replacement = False)
-
-		negative_batch_idx = self.sample_negative_edges().to(self.device)
-
-		supervision_edge_mask = torch.ones(positive_batch_size + self.negative_batch_size, dtype = torch.bool)
-
-		supervision_edge_mask[message_indices] = False
-
-		negative_edge_mask = torch.zeros_like(supervision_edge_mask, dtype = torch.bool)
-
-		negative_edge_mask[-self.negative_batch_size:] = True
-
-	
+		# Relabel batch edges #
 		batch_edges = torch.cat([
-			positive_bidirectional[:,message_indices],
-			positive_bidirectional[:,supervision_edge_mask[:positive_batch_size]],
-			self.negative_edges[:, negative_batch_idx]
+			tentative_message_edges,
+			all_supervision_edges
 			],
 			dim=1)
-		
-		# Create node mask and relabel nodes
 		
 		self.node_mask.fill_(False)
 		self.node_mask[batch_edges.flatten()] = True
@@ -314,36 +308,57 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 		remapped_edge_index, _ = map_index(batch_edges.view(-1), nodes_in_batch, max_index = nodes_in_batch.max()+1, inclusive=True)
 		remapped_edge_index = remapped_edge_index.view(2, -1)
+		
+		
+		tentative_message_edges = remapped_edge_index[:,:num_message_edges]
 
-		supervision_edges = remapped_edge_index[:,supervision_edge_mask]
-		message_edges = remapped_edge_index[:,~supervision_edge_mask]
-		supervision_labels = torch.ones(supervision_edges.size(1), dtype = torch.float, device=self.device)
-		supervision_labels[-self.negative_batch_size:] = 0.0
-		srcs, dsts = supervision_edges
-		supervision_importance = (self.centrality[srcs] + self.centrality[dsts])/2
-		supervision_importance[:-self.negative_batch_size] = 1.0 - supervision_importance[:-self.negative_batch_size]
+
+		# Make messages directional 
+
+		message_bidirectional = torch.cat([tentative_message_edges,tentative_message_edges.flip(0)], dim =1)
+		src, dst = message_bidirectional
+		degrees = degree(src, num_nodes = tentative_message_edges.max()+1)
+		deg_src = degrees[src]
+		deg_dst = degrees[dst]
+
+		# Apply neighborhood restriction
+		weights = deg_src / deg_dst
+
+		violators_mask = deg_dst > self.max_neighbors
+		violator_dst_nodes = torch.unique(dst[violators_mask])
+
+		sampled_edge_indices = []
+
+		for d in violator_dst_nodes:
+			edge_indices = (dst == d).nonzero(as_tuple=False).view(-1)
+			w = weights[edge_indices]
+			sampled = torch.multinomial(w, self.max_neighbors, replacement=False)
+			sampled_edge_indices.append(edge_indices[sampled])
+
+		final_message_indices = torch.cat(sampled_edge_indices)
+		final_message_edges = message_bidirectional[:,final_message_indices]
+
+		
 
 		# Create a PyG Data object
 		batch = Data(
-			message_edges = message_edges,
-			supervision_edges = supervision_edges,
+			message_edges = final_message_edges,
+			supervision_edges = all_supervision_edges,
 			supervision_labels = supervision_labels,
 			supervision_importance = supervision_importance
 		)
 		if self.node_embeddings is not None:
 			batch.node_features = self.node_embeddings[self.node_mask, :]
-			#batch.n_id = nodes_in_batch
 
 		# Subset edge attributes if available
 		if self.edge_attr is not None:
 			sampled_positive_edgewts = self.edge_attr[sampled_edge_idx]
-			all_edge_attr = torch.cat([
-				sampled_positive_edgewts, 
-				sampled_positive_edgewts.flip(0), 
-				torch.zeros(self.negative_batch_size)]
-				)
-			batch.message_edgewts = all_edge_attr[~supervision_edge_mask]
-			batch.supervision_edgewts = all_edge_attr[supervision_edge_mask]
+			message_edgewts = sampled_positive_edgewts[~self.supervision_edge_mask]
+			
+			batch.message_edgewts = torch.cat([message_edgewts,message_edgewts],dim=0)[final_message_indices]
+			batch.supervision_edgewts = torch.cat([sampled_positive_edgewts[self.supervision_edge_mask], torch.zeros(self.negative_batch_size)], dim = 0)
+
+		
 		return sampled_edge_idx, batch
 	
 	def __iter__(self):
