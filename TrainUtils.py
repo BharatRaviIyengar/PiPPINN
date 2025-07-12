@@ -167,13 +167,16 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			  negative_batch_size=None,
 			  supervision_fraction = 0.3,
 			  max_neighbors = 30.0,
-			  frac_sample_from_unsampled=0.5):  
-		super().__init__()  
-		self.device = positive_edges.device  # Assign device from positive_edges  
-		self.positive_edges = positive_edges.to(self.device)  # Ensure positive_edges is on the correct device  
+			  frac_sample_from_unsampled=0.5,
+			  device=None):  
+		super().__init__()
+		if node_embeddings is None:
+			raise SystemExit('Node embeddings are required for EdgeSampler.')
+		self.device = device if device is not None else positive_edges.device
+		self.positive_edges = positive_edges.to(self.device)
 		self.num_batches = num_batches  
 		self.edge_attr = edge_attr.to(self.device) if edge_attr is not None else None  
-		self.node_embeddings = node_embeddings.to(self.device) if node_embeddings is not None else None  
+		self.node_embeddings = node_embeddings.to(self.device)
 		self.batch_size = batch_size  
 		self.centrality_fraction = centrality_fraction  
 		self.total_positive_edges = positive_edges.size(1)  
@@ -428,22 +431,22 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		if self.node_embeddings is not None:  
 			batch.node_features = self.node_embeddings[self.node_mask, :]  
 
+		self.supervision_edgewts.zero_()
+		self.message_edgewts.zero_()
 		# Subset edge attributes if available  
 		if self.edge_attr is not None:  
 			sampled_positive_edgewts = self.edge_attr[sampled_edge_idx]  
 			message_edgewts = sampled_positive_edgewts[~self.supervision_edge_mask]
 
-			self.supervision_edgewts.zero_()
 			# Assign positive supervision edge weights (negative edges have zero weight)
 			self.supervision_edgewts[:self.num_supervision_edges] = sampled_positive_edgewts[self.supervision_edge_mask]
 			
-			self.message_edgewts.zero_()
 			self.message_edgewts[:self.num_message_edges] = message_edgewts
 			self.message_edgewts[self.num_message_edges:] = message_edgewts
 
-			# Assign edge weights to the batch
-			batch.message_edgewts = self.message_edgewts[self.final_message_mask]  
-			batch.supervision_edgewts = self.supervision_edgewts
+		# Assign edge weights to the batch (if available, otherwise zero)
+		batch.message_edgewts = self.message_edgewts[self.final_message_mask]  
+		batch.supervision_edgewts = self.supervision_edgewts
 
 		return sampled_edge_idx, batch  
 	
