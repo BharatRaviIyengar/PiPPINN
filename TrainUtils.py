@@ -140,10 +140,10 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 	Args:  
 		positive_edges (torch.Tensor): Edge index tensor (2 x num_edges).  
-		node_embeddings (torch.Tensor, optional): Node feature embeddings. Defaults to None.  
+		node_embeddings (torch.Tensor, optional): Node feature embeddings. Defaults to None. 
 		edge_attr (torch.Tensor, optional): Edge attributes. Defaults to None.  
 		batch_size (int, optional): Number of edges to sample per minibatch. Defaults to 1000.  
-		num_batches (int, optional): Number of batches to create. Defaults to None.  
+		num_batches (int, optional): Number of batches to create. Defaults to 100.  
 		centrality (torch.Tensor, optional): Centrality scores for nodes. Defaults to None.  
 		centrality_fraction (float, optional): Fraction of edges to sample based on centrality. Defaults to 0.5.  
 		negative_edges (torch.Tensor, optional): Negative edge index tensor. Defaults to None.  
@@ -157,7 +157,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 	"""  
 	def __init__(self, 
 			  positive_edges,
-			  node_embeddings=None,
+			  node_embeddings,
 			  edge_attr=None,
 			  batch_size=1000,
 			  num_batches=100,
@@ -170,13 +170,11 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			  frac_sample_from_unsampled=0.5,
 			  device=None):  
 		super().__init__()
-		if node_embeddings is None:
-			raise SystemExit('Node embeddings are required for EdgeSampler.')
 		self.device = device if device is not None else positive_edges.device
 		self.positive_edges = positive_edges.to(self.device)
 		self.num_batches = num_batches  
 		self.edge_attr = edge_attr.to(self.device) if edge_attr is not None else None  
-		self.node_embeddings = node_embeddings.to(self.device)
+		self.node_embeddings = node_embeddings.to(self.device) if node_embeddings is not None else None
 		self.batch_size = batch_size  
 		self.centrality_fraction = centrality_fraction  
 		self.total_positive_edges = positive_edges.size(1)  
@@ -190,10 +188,9 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 	
 
 		# Ensure node indices and edge_attributes are compatible with edge list  
-		if node_embeddings is not None:  
-			if self.total_positive_nodes > node_embeddings.size(0):  
-				self.node_embeddings = None  
-				warn("Node embeddings incompatible with edge list. Proceeding without them.")  
+		if node_embeddings is not None and self.total_positive_nodes > node_embeddings.size(0):  
+			self.node_embeddings = None  
+			warn("Node embeddings incompatible with edge list. Proceeding without them.")  
 
 		if edge_attr is not None and edge_attr.size(0) != self.total_positive_edges:  
 			self.edge_attr = None  
