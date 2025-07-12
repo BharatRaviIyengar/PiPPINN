@@ -198,7 +198,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 		# Compute edge probabilities for sampling  
 		if centrality is None or self.total_positive_nodes > centrality.size(0): 
-			self.centrality = degree(torch.cat([positive_edges[0], positive_edges[1]]), num_nodes=self.total_positive_nodes).to(self.device)
+			self.centrality = degree(positive_edges.flatten(), num_nodes=self.total_positive_nodes).to(self.device)
 
 		self.centrality = normalize_values(centrality)
 		self.edge_centrality_scores = self.get_edge_centrality(self.positive_edges)  
