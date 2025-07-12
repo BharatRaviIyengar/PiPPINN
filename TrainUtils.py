@@ -733,17 +733,21 @@ def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, devic
 	)
 	train_loader = torch.utils.data.DataLoader(train_data_sampler, batch_size=None)
 
+	# Create minibatch sampler for validation set
+	val_batch_size = data["Val"].edge_index.size(1) // 10
+	num_val_batches = data["Val"].edge_index.size(1) // val_batch_size + 1
+
 	val_data_sampler = EdgeSampler(
 		positive_edges=data["Val"].edge_index,
 		node_embeddings=data["Val"].x,
 		edge_attr = data["Val"].edge_attr,
-		batch_size=200000,
-		num_batches=num_batches,
+		batch_size=val_batch_size,
+		num_batches=num_val_batches,
 		centrality=data["Val"].node_degree,
 		centrality_fraction=centrality_fraction,
 		negative_edges=data["Val_Neg"],
 	)
-	# Prepare validation graph
+
 	val_loader = torch.utils.data.DataLoader(val_data_sampler, batch_size=None)
 
 	data_for_training = {
