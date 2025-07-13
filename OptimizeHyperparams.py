@@ -71,7 +71,7 @@ def load_param_set(infile,trial_ids=[0]):
 		trial_parameters = json.load(f)
 	return [trial_parameters[i] for i in trial_ids]
 
-def run_training(params, num_batches, batch_size, dataset, device):
+def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device):
 	centrality_fraction = params['centrality_fraction']
 	hidden_channels = params['hidden_channels']
 	dropout = params['dropout']
@@ -348,7 +348,7 @@ if __name__ == "__main__":
 
 		def objective(trial):
 			params = suggest_params(trial, search_space)
-			result, _ = run_training(params, args.batch_size, dataset, device)
+			result, _ = run_training(params, args.num_batches, args.batch_size, dataset, device)
 			trial.set_user_attr("early_stopping_epoch", result["early_stopping_epoch"])
 			trial.set_user_attr("best_train_loss", result["best_train_loss"])
 
