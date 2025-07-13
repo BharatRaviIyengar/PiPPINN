@@ -420,7 +420,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		
 		self.node_mask.fill_(False)  
 		self.node_mask[self.batch_edges.flatten()] = True  
-		nodes_in_batch = torch.where(self.node_mask)[0]  
+		nodes_in_batch = self.node_mask.nonzero(as_tuple=False).view(-1)
 
 		remapped_edge_index, _ = map_index(self.batch_edges.view(-1), nodes_in_batch, max_index = nodes_in_batch.max()+1, inclusive=True)  
 		remapped_edge_index = remapped_edge_index.view(2, -1)  
@@ -430,7 +430,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 		# Make messages directional  
 		self.bidirectional_message_edges.zero_()
-		self.bidirectional_message_edges[:,self.num_nodes] = tentative_message_edges
+		self.bidirectional_message_edges[:,self.num_message_edges] = tentative_message_edges
 		self.bidirectional_message_edges[:, self.num_message_edges:] = tentative_message_edges.flip(0)
 
 		self.supervision_edgewts.zero_()
@@ -520,7 +520,7 @@ def subgraph_with_relabel(original_graph: Data, edge_mask: torch.Tensor) -> Data
 	selected_edges = original_graph.edge_index[:, edge_mask]
 	node_mask = torch.zeros(num_nodes, dtype=torch.bool, device=device)
 	node_mask[selected_edges.flatten()] = True
-	selected_nodes = torch.where(node_mask)[0]
+	selected_nodes = node_mask.nonzero(as_tuple=False).view(-1)
 
 	# Relabel edges
 	remapped_edge_index, _ = map_index(selected_edges.view(-1), selected_nodes, max_index=selected_nodes.max()+1, inclusive=True)
@@ -532,7 +532,7 @@ def subgraph_with_relabel(original_graph: Data, edge_mask: torch.Tensor) -> Data
 		edge_index=remapped_edge_index,
 		edge_attr=original_graph.edge_attr[edge_mask],
 		n_id=selected_nodes,
-		e_id=torch.where(edge_mask)[0]  # Edge indices in the new graph
+		e_id=edge_mask.nonzero(as_tuple=False).view(-1)  # Edge indices in the new graph
 	)
 	try:
 		outgraph.node_degree = original_graph.node_degree[selected_nodes]
