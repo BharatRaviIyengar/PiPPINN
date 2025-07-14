@@ -24,6 +24,12 @@
 		"type": "float",
 		"low": 0.2,
 		"high": 0.8
+	},
+	"nbr_weight_intensity": {
+		"type": "float",
+		"low": 0.5,
+		"high": 2,
+		"log": true
 	}
 }
 

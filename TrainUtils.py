@@ -163,13 +163,14 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			  supervision_fraction = 0.3,
 			  max_neighbors = 30.0,
 			  frac_sample_from_unsampled=0.5,
+			  nbr_weight_intensity=1.0,
 			  device=None):  
 		super().__init__()
 		self.device = device if device is not None else positive_graph.device
-		self.positive_edges = positive_graph.edge_index.to(self.device)
+		self.positive_edges = positive_graph.edge_index.to("cpu")
 		self.num_batches = num_batches  
-		self.edge_attr = positive_graph.edge_attr.to(self.device) if "edge_attr" in positive_graph else None
-		self.node_embeddings = positive_graph.x.to(self.device) if "x" in positive_graph else None
+		self.edge_attr = positive_graph.edge_attr.to("cpu") if "edge_attr" in positive_graph else None
+		self.node_embeddings = positive_graph.x.to("cpu") if "x" in positive_graph else None
 		self.batch_size = batch_size 
 		self.centrality_fraction = centrality_fraction  
 		self.total_positive_edges = self.positive_edges.size(1)  
@@ -177,7 +178,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.supervision_fraction = supervision_fraction  
 		self.max_neighbors = max_neighbors  
 		self.frac_sample_from_unsampled = frac_sample_from_unsampled  
-
+		self.nbr_weight_intensity = nbr_weight_intensity
 		self.num_supervision_edges = int(self.batch_size * self.supervision_fraction)
 		self.num_message_edges = self.batch_size - self.num_supervision_edges
 	
@@ -200,9 +201,9 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.edge_centrality_scores = self.get_edge_centrality(self.positive_edges)  
 			
 		if negative_edges is not None:  
-			self.negative_edges = negative_edges.to(self.device)  
+			self.negative_edges = negative_edges.to("cpu")  
 		else:  
-			self.negative_edges = generate_negative_edges(self.positive_graph,device=self.device)  
+			self.negative_edges = generate_negative_edges(self.positive_graph,device=self.device).to("cpu")
 			self.negative_batch_size = self.batch_size * 2 
 		
 		if negative_batch_size is None:  
@@ -385,9 +386,9 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		"""
 		# Sample positive edges  
 		sampled_edge_idx = self.sampling_fn()  
-		positive_batch = self.positive_edges.index_select(1,sampled_edge_idx)
+		positive_batch = self.positive_edges.index_select(1,sampled_edge_idx).to(self.device)
 
-		# Define supervision edges  
+		# Define supervision edges 
 		self.supervision_edge_mask.fill_(False)
 
 		# Sample supervision edges  
@@ -395,7 +396,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.supervision_edge_mask[supervision_positive_idx] = True  
 
 		# Sample negative edges  
-		negative_edges = self.sample_negative_edges()  
+		negative_edges = self.negative_edges.index_select(1,self.sample_negative_edges()).to(self.device)
 	
 		self.batch_edges.zero_()
 		
@@ -404,6 +405,8 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 		# Add positive supervision edges
 		self.batch_edges[:, self.num_message_edges:self.batch_size] = positive_batch[:, supervision_positive_idx]
+
+		del positive_batch
 
 		# Add negative edges
 		self.batch_edges[:, self.batch_size:] = negative_edges
@@ -424,7 +427,6 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 		remapped_edge_index, _ = map_index(self.batch_edges.view(-1), nodes_in_batch, max_index = nodes_in_batch.max()+1, inclusive=True)  
 		remapped_edge_index = remapped_edge_index.view(2, -1)  
-		
 		
 		tentative_message_edges = remapped_edge_index[:,:self.num_message_edges]
 
@@ -453,7 +455,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		src, dst = self.bidirectional_message_edges 
 		
 		# Compute degrees for message nodes  
-		degrees = degree(src, num_nodes = tentative_message_edges.max()+1)  
+		degrees = degree(src, num_nodes = src.max()+1)  
 		deg_src = degrees[src]  
 		deg_dst = degrees[dst]
 		
@@ -462,6 +464,9 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		# Augment neighbor weights with edge weights if available
 		if self.edge_attr is not None:
 			weights.mul_(self.message_edgewts)
+
+		# Intensify or dampen neighbor weights
+		weights.pow_(self.nbr_weight_intensity)
 
 		# Identify violators (nodes with degree greater than max_neighbors)
 		violators_mask = deg_dst > self.max_neighbors  
@@ -484,9 +489,9 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			supervision_edges = remapped_edge_index[:, -self.num_all_sup_edges:], 
 			supervision_labels = self.supervision_labels,  
 			supervision_importance = supervision_importance  
-		)  
+		).to(self.device)
 		if self.node_embeddings is not None:  
-			batch.node_features = self.node_embeddings[self.node_mask, :]  
+			batch.node_features = self.node_embeddings[self.node_mask, :].to(self.device)
 
 			
 		# Assign edge weights to the batch (if available, otherwise zero)
@@ -644,7 +649,9 @@ def generate_negative_edges(positive_graph: Data, negative_positive_ratio=2, dev
         torch.Tensor: Negative edges (shape [2, num_negative_edges]).
     """
 	if device is None:
-		device = positive_graph.edge_index.device 
+		device = positive_graph.edge_index.device
+	else:
+		positive_graph.to(device)
 
 	num_nodes = positive_graph.x.size(0)
 	num_positive_edges = positive_graph.edge_index.size(1)
