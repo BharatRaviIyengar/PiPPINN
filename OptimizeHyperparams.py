@@ -71,7 +71,9 @@ def load_param_set(infile,trial_ids=[0]):
 		trial_parameters = json.load(f)
 	return [trial_parameters[i] for i in trial_ids]
 
-def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device):
+def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, threads:int=1):
+	""" Run training for a single trial with the given parameters."""
+
 	centrality_fraction = params['centrality_fraction']
 	hidden_channels = params['hidden_channels']
 	dropout = params['dropout']
@@ -79,7 +81,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	weight_decay = params['weight_decay']
 	patience = 10
 
-	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction,device=device) for data in dataset]
+	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction,device=device, threads=threads) for data in dataset]
 
 	all_sampled_edges = [torch.zeros(data["Train"].edge_index.size(1), dtype=torch.bool, device="cpu") for data in dataset]
 
@@ -232,6 +234,11 @@ if __name__ == "__main__":
 		help="Output File for best hyperparameters (json)",
 		default=None
 	)
+	parser.add_argument("threads",
+		type=int,
+		help="Number of CPU threads to use",
+		default=5
+	)
 
 	SEED = 48149
 	torch.manual_seed(SEED)
@@ -240,6 +247,8 @@ if __name__ == "__main__":
 	sampler = optuna.samplers.TPESampler(seed=SEED)
 
 	args = parser.parse_args()
+	torch.num_threads = args.threads
+	torch.num_interop_threads = args.threads
 
 	gpu_yes = torch.cuda.is_available()
 
@@ -295,7 +304,7 @@ if __name__ == "__main__":
 		dataset = torch.load(args.training_data, weights_only = False)
 
 		for trial_id, params in enumerate(paramset):
-			result, _ = run_training(params, args.num_batches, args.batch_size, dataset, device)
+			result, _ = run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads)
 			result["trial_id"] = args.trial_ids[trial_id]
 			results.append(result)
 		if args.trial_result is None:
@@ -348,7 +357,7 @@ if __name__ == "__main__":
 
 		def objective(trial):
 			params = suggest_params(trial, search_space)
-			result, _ = run_training(params, args.num_batches, args.batch_size, dataset, device)
+			result, _ = run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads)
 			trial.set_user_attr("early_stopping_epoch", result["early_stopping_epoch"])
 			trial.set_user_attr("best_train_loss", result["best_train_loss"])
 

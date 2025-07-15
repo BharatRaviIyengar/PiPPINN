@@ -163,7 +163,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			  negative_batch_size=None,
 			  supervision_fraction = 0.3,
 			  max_neighbors = 30.0,
-			  frac_sample_from_unsampled=0.5,
+			  frac_sample_from_unsampled=0.1,
 			  nbr_weight_intensity=1.0,
 			  device=None,
 			  threads=1):  
@@ -817,7 +817,7 @@ def load_data(input_graphs_filenames, val_fraction, save_graphs_to=None, device=
 	return data_to_save
 	
 
-def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, device = None):
+def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, device = None, threads=1):
 	"""
     Generates training and validation batch loaders and samplers.
 
@@ -839,6 +839,7 @@ def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, devic
 		centrality=data["Train"].node_degree,
 		centrality_fraction=centrality_fraction,
 		negative_edges=data["Train_Neg"],
+		threads=threads
 	)
 	train_loader = torch.utils.data.DataLoader(train_data_sampler, batch_size=None)
 
@@ -853,7 +854,8 @@ def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, devic
 		centrality=data["Val"].node_degree,
 		centrality_fraction=centrality_fraction,
 		negative_edges=data["Val_Neg"],
-	)
+		threads=threads
+		)
 
 	val_loader = torch.utils.data.DataLoader(val_data_sampler, batch_size=None)
 
