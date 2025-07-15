@@ -4,7 +4,7 @@
 #include <torch/extension.h>
 #include <vector>
 
-at::Tensor batch_multinomial_sampling(
+at::Tensor max_nbr(
 	torch::Tensor dst,
 	torch::Tensor weights,
 	int64_t max_neighbors = 30,
@@ -45,5 +45,5 @@ at::Tensor batch_multinomial_sampling(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-	m.def("batch_multinomial_sampling", &batch_multinomial_sampling, "Batch multinomial sampling (CPU)");
+	m.def("max_nbr", &max_nbr, "Maximum neighborhood restriction");
 }
