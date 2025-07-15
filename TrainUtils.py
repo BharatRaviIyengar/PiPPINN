@@ -7,6 +7,7 @@ from torch_geometric.utils.map import map_index
 from torch_scatter import scatter_max
 from warnings import warn
 from pathlib import Path
+from max_nbr import max_nbr
 
 class Pool_SAGEConv(nn.Module):
 	"""
@@ -164,7 +165,8 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			  max_neighbors = 30.0,
 			  frac_sample_from_unsampled=0.5,
 			  nbr_weight_intensity=1.0,
-			  device=None):  
+			  device=None,
+			  threads=1):  
 		super().__init__()
 		self.device = device if device is not None else positive_graph.device
 		self.positive_edges = positive_graph.edge_index.to("cpu")
@@ -181,7 +183,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.nbr_weight_intensity = nbr_weight_intensity
 		self.num_supervision_edges = int(self.batch_size * self.supervision_fraction)
 		self.num_message_edges = self.batch_size - self.num_supervision_edges
-	
+		self.threads = threads
 
 		# Ensure node indices and edge_attributes are compatible with edge list  
 		if self.node_embeddings is not None and self.total_positive_nodes > self.node_embeddings.size(0):  
@@ -470,16 +472,18 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 		# Identify violators (nodes with degree greater than max_neighbors)
 		violators_mask = deg_dst > self.max_neighbors  
-		violator_dst_nodes = torch.unique(dst[violators_mask]) 
+		# violator_dst_nodes = torch.unique(dst[violators_mask]) 
 
 		# Mark non-violators as True in final_message_mask
 		self.final_message_mask[~violators_mask] = True  
 
-		for d in violator_dst_nodes:  
-			edge_indices = (dst == d).nonzero(as_tuple=False).view(-1)  
-			w = weights[edge_indices]  
-			sampled = torch.multinomial(w, self.max_neighbors, replacement=False)  
-			self.final_message_mask[sampled] = True   
+		self.final_message_mask |= max_nbr(dst[violators_mask], weights[violators_mask], self.max_neighbors, threads=self.threads)
+
+		# for d in violator_dst_nodes:  
+		# 	edge_indices = (dst == d).nonzero(as_tuple=False).view(-1)  
+		# 	w = weights[edge_indices]  
+		# 	sampled = torch.multinomial(w, self.max_neighbors, replacement=False)  
+		# 	self.final_message_mask[sampled] = True   
 
 		final_message_edges = self.bidirectional_message_edges[:,self.final_message_mask]  
 
