@@ -477,7 +477,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		# Mark non-violators as True in final_message_mask
 		self.final_message_mask[~violators_mask] = True  
 
-		self.final_message_mask |= max_nbr(dst[violators_mask], weights[violators_mask], self.max_neighbors, threads=self.threads)
+		self.final_message_mask |= max_nbr(dst, weights, violators_mask, self.max_neighbors, threads=self.threads)
 
 		# for d in violator_dst_nodes:  
 		# 	edge_indices = (dst == d).nonzero(as_tuple=False).view(-1)  
