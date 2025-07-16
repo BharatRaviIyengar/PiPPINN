@@ -234,11 +234,6 @@ if __name__ == "__main__":
 		help="Output File for best hyperparameters (json)",
 		default=None
 	)
-	parser.add_argument("threads",
-		type=int,
-		help="Number of CPU threads to use",
-		default=5
-	)
 
 	SEED = 48149
 	torch.manual_seed(SEED)
