@@ -260,10 +260,6 @@ if __name__ == "__main__":
 	for arg, value in vars(args).items():
 		print(f"{arg}: {value}")
 
-	# Torch settings
-	torch.set_num_threads(args.threads)
-	torch.set_num_interop_threads(args.threads)
-
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	print(f"Using device: {device}")
 
