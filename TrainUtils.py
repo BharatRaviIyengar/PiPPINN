@@ -299,7 +299,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 		# Centrality-based sampling  
 		centrality_sampled_edges = torch.multinomial(self.centrality, centrality_batch_size, replacement=False)  
-		self.strata_mask_hubs.index_select[centrality_sampled_edges] = False  
+		self.strata_mask_hubs[centrality_sampled_edges] = False  
 
 		# Uniform sampling from the rest  
 		uniform_sampled_indices = torch.multinomial(self.uniform_probs[self.strata_mask_hubs], uniform_batch_size, replacement=False)  
