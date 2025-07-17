@@ -307,7 +307,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.strata_mask_hubs.fill_(True) 
 
 		self.positive_batch_indices[:centrality_batch_size] = centrality_sampled_edges
-		self.positive_batch_indices[centrality_batch_size:] = uniform_sampled_edges
+		self.positive_batch_indices[centrality_batch_size:sample_size-1] = uniform_sampled_edges
 		return self.positive_batch_indices  
 
 	def sample_edges_strata_total(self):  
