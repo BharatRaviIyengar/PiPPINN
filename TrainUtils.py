@@ -168,7 +168,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			  device=None,
 			  threads=1):  
 		super().__init__()
-		self.device = device if device is not None else positive_graph.device
+		self.device = device if device is not None else positive_graph.edge_index.device
 		self.positive_edges = positive_graph.edge_index.to("cpu")
 		self.num_batches = num_batches  
 		self.edge_attr = positive_graph.edge_attr.to("cpu") if "edge_attr" in positive_graph else None
