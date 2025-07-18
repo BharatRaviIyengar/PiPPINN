@@ -169,10 +169,10 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			  threads=1):  
 		super().__init__()
 		self.device = device if device is not None else positive_graph.edge_index.device
-		self.positive_edges = positive_graph.edge_index.to("cpu")
+		self.positive_edges = positive_graph.edge_index.to(self.device)
 		self.num_batches = num_batches  
-		self.edge_attr = positive_graph.edge_attr.to("cpu") if "edge_attr" in positive_graph else None
-		self.node_embeddings = positive_graph.x.to("cpu") if "x" in positive_graph else None
+		self.edge_attr = positive_graph.edge_attr.to(self.device) if "edge_attr" in positive_graph else None
+		self.node_embeddings = positive_graph.x.to(self.device) if "x" in positive_graph else None
 		self.batch_size = batch_size 
 		self.centrality_fraction = centrality_fraction  
 		self.total_positive_edges = self.positive_edges.size(1)  
@@ -203,9 +203,9 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.edge_centrality_scores = self.get_edge_centrality(self.positive_edges)  
 			
 		if negative_edges is not None:  
-			self.negative_edges = negative_edges.to("cpu")  
+			self.negative_edges = negative_edges.to(self.device) 
 		else:  
-			self.negative_edges = generate_negative_edges(self.positive_graph,device=self.device).to("cpu")
+			self.negative_edges = generate_negative_edges(self.positive_graph,device=self.device).to(self.device)
 			self.negative_batch_size = self.batch_size * 2 
 		
 		if negative_batch_size is None:  
@@ -307,7 +307,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.strata_mask_hubs.fill_(True) 
 
 		self.positive_batch_indices[:centrality_batch_size] = centrality_sampled_edges
-		self.positive_batch_indices[centrality_batch_size:sample_size-1] = uniform_sampled_edges
+		self.positive_batch_indices[centrality_batch_size:sample_size] = uniform_sampled_edges
 		return self.positive_batch_indices  
 
 	def sample_edges_strata_total(self):  
@@ -387,8 +387,8 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			batch (torch_geometric.data.Data): Data object containing batch edges (message and supervision), labels and weights, and node features.
 		"""
 		# Sample positive edges  
-		sampled_edge_idx = self.sampling_fn()  
-		positive_batch = self.positive_edges.index_select(1,sampled_edge_idx).to(self.device)
+		self.sampling_fn()  
+		positive_batch = self.positive_edges.index_select(1,self.positive_batch_indices).to(self.device)
 
 		# Define supervision edges 
 		self.supervision_edge_mask.fill_(False)
@@ -441,7 +441,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.message_edgewts.zero_()
 		# Subset edge attributes if available  
 		if self.edge_attr is not None:  
-			sampled_positive_edgewts = self.edge_attr.index_select(0,sampled_edge_idx)  
+			sampled_positive_edgewts = self.edge_attr.index_select(0,self.positive_batch_indices)  
 			message_edgewts = sampled_positive_edgewts[~self.supervision_edge_mask]
 
 			# Assign positive supervision edge weights (negative edges have zero weight)

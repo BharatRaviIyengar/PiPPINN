@@ -6,6 +6,7 @@ import torch
 import optuna, json
 import TrainUtils as utils
 from glob import glob
+import gc
 
 def parse_num_list(s):
 	result = set()
@@ -83,9 +84,9 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 
 	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction,device=device, threads=threads) for data in dataset]
 
-	all_sampled_edges = [torch.zeros(data["Train"].edge_index.size(1), dtype=torch.bool, device="cpu") for data in dataset]
-
-	frac_sampled = torch.zeros(len(dataset))
+	del dataset
+	gc.collect()
+	torch.cuda.empty_cache()
 
 	# Initialize model and optimizer
 	model = utils.GraphSAGE(
@@ -109,20 +110,9 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		for idx, data in enumerate(data_for_training):
 			
 			# Training
-			batch_count = 0
 			model.train()
-			for sampled_edges, batch in data["train_batch_loader"]:
+			for batch in data["train_batch_loader"]:
 				total_train_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=True)
-				all_sampled_edges[idx][sampled_edges] = True
-				
-				batch_count += 1
-				if batch_count % 10 == 0:
-					unsampled = ~all_sampled_edges[idx]
-						# Promote sampling of unsampled edges #
-					data["train_data_sampler"].edge_probs[unsampled] *= 1.1
-					data["train_data_sampler"].uniform_probs[unsampled] *= 1.1
-					data["train_data_sampler"].edge_probs[~unsampled] = data["train_data_sampler"].edge_centrality_scores[~unsampled]
-					data["train_data_sampler"].uniform_probs[~unsampled].fill_(1.0)
 
 			# Validation
 			model.eval()
@@ -132,9 +122,6 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 
 		# Log losses
 		print(f"Epoch {epoch + 1}/{args.epochs}, Training Loss: {total_train_loss:.4f}, Validation Loss: {total_val_loss:.4f}")
-		
-		for i,x in enumerate(all_sampled_edges):
-			frac_sampled[i] = x.sum()/x.size(0)
 
 		# Early stopping logic
 		if total_val_loss < best_val_loss:
@@ -144,7 +131,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 			early_stopping_epoch = epoch + 1
 		else:
 			epochs_without_improvement += 1
-			if epochs_without_improvement >= patience and torch.all(frac_sampled > 0.95):
+			if epochs_without_improvement >= patience:
 				print(f"Early stopping triggered after {epoch + 1} epochs.")
 				break
 	
