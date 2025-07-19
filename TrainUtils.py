@@ -199,8 +199,8 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			warn("Centrality not provided or incompatible with edge list. Recalculating using torch_geometric.utils.degree.") 
 			centrality = degree(self.positive_edges.flatten(), num_nodes=self.total_positive_nodes).to(self.device)
 
-		self.centrality = normalize_values(centrality)
-		self.edge_centrality_scores = self.get_edge_centrality(self.positive_edges)  
+		self.centrality = centrality
+		self.edge_centrality_scores = self.get_edge_centrality(self.positive_edges)
 			
 		if negative_edges is not None:  
 			self.negative_edges = negative_edges.to(self.device) 
@@ -252,6 +252,8 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.supervision_labels[:self.num_supervision_edges] = 1.0
 		# Supervision edge weights for training
 		self.supervision_edgewts = torch.zeros_like(self.supervision_labels, dtype= torch.float, device = self.device)
+		# Supervision edge importance for loss calculation
+		self.supervision_importance = torch.zeros_like(self.supervision_labels, dtype= torch.float, device = self.device)
 		# Message edge weights for training
 		self.message_edgewts = torch.zeros(2*self.num_message_edges, dtype=torch.float, device = self.device)
 		# Indices of sampled positive edges
@@ -260,7 +262,8 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.bidirectional_message_edges = torch.zeros((2,self.num_message_edges*2), dtype = torch.long, device = self.device)
 		# Final message mask to filter valid message edges
 		self.final_message_mask = torch.zeros(self.num_message_edges*2, dtype = torch.bool, device = self.device)
-		
+		self.positive_wt_scaling = (1/self.edge_centrality_scores.log2()).mean()
+		self.negative_wt_scaling = 2*self.edge.centrality_scores.mean()
 		
 		# Define sampling method for positive edges  
 		if self.batch_size >= self.total_positive_edges:  
@@ -298,7 +301,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		uniform_batch_size = sample_size - centrality_batch_size  
 
 		# Centrality-based sampling  
-		centrality_sampled_edges = torch.multinomial(self.centrality, centrality_batch_size, replacement=False)  
+		centrality_sampled_edges = torch.multinomial(self.edge_centrality_scores, centrality_batch_size, replacement=False)  
 		self.strata_mask_hubs[centrality_sampled_edges] = False  
 
 		# Uniform sampling from the rest  
@@ -413,12 +416,12 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		# Add negative edges
 		self.batch_edges[:, -self.negative_batch_size:] = negative_batch_edges
 
-
-		srcs, dsts = self.batch_edges[:, -self.num_all_sup_edges:]  
+		self.supervision_importance.zero_()
 		# Learning weights for negative edges (high score negatives between hubs)  
-		supervision_importance = (self.centrality[srcs] + self.centrality[dsts])/2  
+		self.supervision_importance[self.num_supervision_edges:] = (self.centrality[negative_batch_edges[0]] + self.centrality[negative_batch_edges[1]])/self.negative_wt_scaling
+
 		# Learning weights for positive edges (high score positives between peripheral nodes)  
-		supervision_importance[:self.num_supervision_edges] = 1.0 - supervision_importance[:self.num_supervision_edges]  
+		self.supervision_importance[:self.num_supervision_edges] = (1/torch.log2(self.edge_centrality_scores[self.positive_batch_indices[self.supervision_edge_mask]]))/self.positive_wt_scaling
 		
 		
 		# Relabel batch edges #  
@@ -492,7 +495,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			message_edges = final_message_edges,  
 			supervision_edges = remapped_edge_index[:, -self.num_all_sup_edges:], 
 			supervision_labels = self.supervision_labels,  
-			supervision_importance = supervision_importance  
+			supervision_importance = self.supervision_importance  
 		).to(self.device)
 		if self.node_embeddings is not None:  
 			batch.node_features = self.node_embeddings[self.node_mask, :].to(self.device)
