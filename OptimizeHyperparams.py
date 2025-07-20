@@ -80,9 +80,10 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	dropout = params['dropout']
 	learning_rate = params['learning_rate']
 	weight_decay = params['weight_decay']
-	patience = 10
-
-	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction,device=device, threads=threads) for data in dataset]
+	patience = 20
+	scheduler_factor = params['scheduler_factor']
+	nbr_wt_intensity = params['nbr_wt_intensity']
+	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
 
 	del dataset
 	gc.collect()
@@ -95,7 +96,13 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		dropout = dropout
 	).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-
+	scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+		optimizer= optimizer,
+		mode='min',
+		factor=scheduler_factor,
+		patience=10,
+		verbose=True
+	)
 	# Training loop
 	best_val_loss = float('inf')
 	best_train_loss = float('inf')
@@ -118,6 +125,8 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 			with torch.no_grad():
 				for batch in data["val_batch_loader"]:
 					total_val_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=False)
+		
+		scheduler.step()
 
 		# Log losses
 		print(f"Epoch {epoch + 1}/{args.epochs}, Training Loss: {total_train_loss:.4f}, Validation Loss: {total_val_loss:.4f}")

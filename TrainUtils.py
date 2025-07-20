@@ -820,7 +820,7 @@ def load_data(input_graphs_filenames, val_fraction, save_graphs_to=None, device=
 	return data_to_save
 	
 
-def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, device = None, threads=1):
+def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, nbr_wt_intensity=1.0, device = None, threads=1):
 	"""
     Generates training and validation batch loaders and samplers.
 
@@ -845,6 +845,7 @@ def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, devic
 		centrality=data["Train"].node_degree,
 		centrality_fraction=centrality_fraction,
 		negative_edges=data["Train_Neg"],
+		nbr_weight_intensity=nbr_wt_intensity,
 		threads=threads
 	)
 	train_loader = torch.utils.data.DataLoader(train_data_sampler, batch_size=None)
@@ -860,6 +861,7 @@ def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, devic
 		centrality=data["Val"].node_degree,
 		centrality_fraction=centrality_fraction,
 		negative_edges=data["Val_Neg"],
+		nbr_weight_intensity=nbr_wt_intensity,
 		threads=threads
 		)
 
