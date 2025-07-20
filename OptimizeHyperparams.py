@@ -95,7 +95,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		hidden_channels=hidden_channels,
 		dropout = dropout
 	).to(device)
-	optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+	optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=weight_decay)
 	scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 		optimizer= optimizer,
 		mode='min',
