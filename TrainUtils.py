@@ -263,7 +263,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		# Final message mask to filter valid message edges
 		self.final_message_mask = torch.zeros(self.num_message_edges*2, dtype = torch.bool, device = self.device)
 		self.positive_wt_scaling = (1/self.edge_centrality_scores.log2()).mean()
-		self.negative_wt_scaling = 2*self.edge.centrality_scores.mean()
+		self.negative_wt_scaling = 2*self.edge_centrality_scores.mean()
 		
 		# Define sampling method for positive edges  
 		if self.batch_size >= self.total_positive_edges:  
@@ -835,6 +835,9 @@ def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, devic
         dict: Contains train/val samplers, loaders, and input channel size.
     """
 	# Create minibatch sampler for training set
+	if num_batches is None:
+		data["Train"].edge_index.size(1)//int(batch_size*0.8) # type: ignore 
+
 	train_data_sampler = EdgeSampler(
 		positive_graph=data["Train"],
 		batch_size=batch_size,

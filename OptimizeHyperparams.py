@@ -107,8 +107,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		total_val_loss = 0.0  # Reset total validation loss for the epoch
 
 		
-		for idx, data in enumerate(data_for_training):
-			
+		for data in data_for_training:
 			# Training
 			model.train()
 			for batch in data["train_batch_loader"]:
@@ -116,7 +115,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 
 			# Validation
 			model.eval()
-			with torch.inference_mode():
+			with torch.no_grad():
 				for batch in data["val_batch_loader"]:
 					total_val_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=False)
 
@@ -179,7 +178,7 @@ if __name__ == "__main__":
 	parser.add_argument("--num_batches",
 		type=int,
 		help="Number of minibatches for training",
-		default=300
+		default=None
 	)
 	parser.add_argument("--training_data",
 		type=str,
