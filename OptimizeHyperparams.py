@@ -72,13 +72,12 @@ def load_param_set(infile,trial_ids=[0]):
 		trial_parameters = json.load(f)
 	return [trial_parameters[i] for i in trial_ids]
 
-def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, threads:int=1):
+def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, max_epochs = 100, threads:int=1):
 	""" Run training for a single trial with the given parameters."""
 
 	centrality_fraction = params['centrality_fraction']
 	hidden_channels = params['hidden_channels']
 	dropout = params['dropout']
-	learning_rate = params['learning_rate']
 	weight_decay = params['weight_decay']
 	patience = 20
 	scheduler_factor = params['scheduler_factor']
@@ -101,40 +100,46 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		mode='min',
 		factor=scheduler_factor,
 		patience=10,
-		verbose=True
+		cooldown=1
 	)
 	# Training loop
 	best_val_loss = float('inf')
 	best_train_loss = float('inf')
 	epochs_without_improvement = 0
-	early_stopping_epoch = args.epochs
+	early_stopping_epoch = max_epochs
 
-	for epoch in range(args.epochs):
+	for epoch in range(max_epochs):
 		total_train_loss = 0.0  # Reset total training loss for the epoch
 		total_val_loss = 0.0  # Reset total validation loss for the epoch
-
+		val_batch_count = 0
+		train_batch_count = 0
 		
 		for data in data_for_training:
 			# Training
 			model.train()
 			for batch in data["train_batch_loader"]:
+				train_batch_count += 1
 				total_train_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=True)
 
 			# Validation
 			model.eval()
 			with torch.no_grad():
 				for batch in data["val_batch_loader"]:
+					val_batch_count += 1
 					total_val_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=False)
-		
-		scheduler.step()
+
+		# Average losses
+		average_train_loss = total_train_loss / train_batch_count
+		average_val_loss = total_val_loss / val_batch_count
+		scheduler.step(average_val_loss)
 
 		# Log losses
-		print(f"Epoch {epoch + 1}/{args.epochs}, Training Loss: {total_train_loss:.4f}, Validation Loss: {total_val_loss:.4f}")
+		print(f"Epoch {epoch + 1}/{args.epochs}, Average training Loss: {average_train_loss:.4f}, Average validation Loss: {average_val_loss:.4f}")
 
 		# Early stopping logic
-		if total_val_loss < best_val_loss:
-			best_val_loss = total_val_loss
-			best_train_loss = total_train_loss
+		if average_val_loss < best_val_loss:
+			best_val_loss = average_val_loss
+			best_train_loss = average_train_loss
 			epochs_without_improvement = 0
 			early_stopping_epoch = epoch + 1
 		else:
