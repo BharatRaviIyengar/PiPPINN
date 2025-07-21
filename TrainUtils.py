@@ -836,7 +836,7 @@ def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, nbr_w
     """
 	# Create minibatch sampler for training set
 	if num_batches is None:
-		data["Train"].edge_index.size(1)//int(batch_size*0.8) # type: ignore 
+		num_batches = data["Train"].edge_index.size(1)//int(batch_size*0.8) # type: ignore 
 
 	train_data_sampler = EdgeSampler(
 		positive_graph=data["Train"],
