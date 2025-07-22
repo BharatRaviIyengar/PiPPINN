@@ -4,6 +4,7 @@ import sys
 from time import time
 import torch
 import optuna, json
+from optuna.samplers import TPESampler
 import TrainUtils as utils
 from glob import glob
 import gc
@@ -52,14 +53,14 @@ def optuna_dist_from_suggested_params(search_space):
 	return distributions
 
 def generate_param_sets(num_trials, search_space, outfile=None):
-	study = optuna.create_study(direction="minimize")
+	study = optuna.create_study(direction="minimize", sampler=TPESampler(multivariate=True))
 	search_space = json.load(open(search_space))
 	trial_parameters = []
 	for _ in range(num_trials):
 		trial = study.ask()
 		params = suggest_params(trial, search_space)
+		study.tell(trial, 10.0 + torch.rand(1).item())  # Dummy objective value
 		trial_parameters.append(params)
-
 	if outfile is not None:
 		# Save all suggested parameters
 		with open(outfile, "w") as f:
@@ -72,7 +73,7 @@ def load_param_set(infile,trial_ids=[0]):
 		trial_parameters = json.load(f)
 	return [trial_parameters[i] for i in trial_ids]
 
-def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, max_epochs = 100, threads:int=1):
+def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, max_epochs = 200, threads:int=1):
 	""" Run training for a single trial with the given parameters."""
 
 	centrality_fraction = params['centrality_fraction']
@@ -207,7 +208,7 @@ if __name__ == "__main__":
 	parser.add_argument("--num_trials","-n",
 		type=int,
 		help="Number of trials to generate",
-		default=60
+		default=100
 	)
 	parser.add_argument("--param_ranges","-p",
 		type=str,
@@ -324,9 +325,10 @@ if __name__ == "__main__":
 			study.add_trial(trial)
 
 		# Print the best trial
-		print("Best trial:", study.best_trial)
+		best = study.best_trial
+		print("Best trial:", best)
 		with open(args.params_best, "w") as f:
-			json.dump(study.best_trial, f, indent=2)
+			json.dump(best.params, f, indent=2)
 
 	elif args.runmode=="A":
 		input_graphs_filenames = []
