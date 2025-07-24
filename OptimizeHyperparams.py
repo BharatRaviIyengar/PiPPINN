@@ -101,7 +101,8 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		mode='min',
 		factor=scheduler_factor,
 		patience=10,
-		cooldown=1
+		cooldown=2,
+		min_lr=1e-6
 	)
 	# Training loop
 	best_val_loss = float('inf')
