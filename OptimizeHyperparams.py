@@ -82,7 +82,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	weight_decay = params['weight_decay']
 	patience = 20
 	scheduler_factor = params['scheduler_factor']
-	nbr_wt_intensity = params['nbr_wt_intensity']
+	nbr_wt_intensity = params['nbr_weight_intensity']
 	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
 
 	del dataset
