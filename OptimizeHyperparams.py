@@ -73,7 +73,7 @@ def load_param_set(infile,trial_ids=[0]):
 		trial_parameters = json.load(f)
 	return [trial_parameters[i] for i in trial_ids]
 
-def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, max_epochs = 200, threads:int=1):
+def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, max_epochs = 200, threads:int=1, dual_head:bool=False):
 	""" Run training for a single trial with the given parameters."""
 
 	centrality_fraction = params['centrality_fraction']
@@ -83,6 +83,10 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	patience = 20
 	scheduler_factor = params['scheduler_factor']
 	nbr_wt_intensity = params['nbr_weight_intensity']
+	GNN_head_weight = params['GNN_head_weight']
+	NOD_head_weight = 1- GNN_head_weight
+	head_weights = [GNN_head_weight, NOD_head_weight]
+
 	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
 
 	del dataset
@@ -90,11 +94,19 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	torch.cuda.empty_cache()
 
 	# Initialize model and optimizer
-	model = utils.GraphSAGE(
-		in_channels=data_for_training[0]["input_channels"],
-		hidden_channels=hidden_channels,
-		dropout = dropout
-	).to(device)
+	if dual_head:
+		model = utils.DualHeadModel(
+			in_channels=data_for_training[0]["input_channels"],
+			hidden_channels=hidden_channels,
+			dropout=dropout
+		).to(device)
+	else:
+		# Single head GNN model
+		model = utils.GraphSAGE(
+			in_channels=data_for_training[0]["input_channels"],
+			hidden_channels=hidden_channels,
+			dropout = dropout
+		).to(device)
 	optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=weight_decay)
 	scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 		optimizer= optimizer,
@@ -121,14 +133,14 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 			model.train()
 			for batch in data["train_batch_loader"]:
 				train_batch_count += 1
-				total_train_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=True)
+				total_train_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, head_weights=head_weights, is_training=True)
 
 			# Validation
 			model.eval()
 			with torch.no_grad():
 				for batch in data["val_batch_loader"]:
 					val_batch_count += 1
-					total_val_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=False)
+					total_val_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, head_weights=head_weights, is_training=False)
 
 		# Average losses
 		average_train_loss = total_train_loss / train_batch_count
@@ -136,7 +148,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		scheduler.step(average_val_loss)
 
 		# Log losses
-		print(f"Epoch {epoch + 1}/{args.epochs}, Average training Loss: {average_train_loss:.4f}, Average validation Loss: {average_val_loss:.4f}")
+		print(f"Epoch {epoch + 1}/{max_epochs}, Average training Loss: {average_train_loss:.4f}, Average validation Loss: {average_val_loss:.4f}")
 
 		# Early stopping logic
 		if average_val_loss < best_val_loss:

@@ -8,6 +8,61 @@ from torch_scatter import scatter_max
 from warnings import warn
 from pathlib import Path
 from max_nbr import max_nbr
+from collections import namedtuple
+
+class NodeOnlyDecoder(nn.Module):
+	"""
+	Implements a simple decoder that predicts edges based on node features.
+
+	Args:
+		in_channels (int): Number of input features per node.
+		hidden_channels (list[int], optional): List of hidden layer sizes.
+		dropout (float, optional): Dropout rate.
+	Methods:
+		forward(x, edge_index):
+			Performs the forward pass of the decoder.
+			Args:
+				x (torch.Tensor): Node features.
+				edge_index (torch.Tensor): Edge indices.
+			Returns:
+				torch.Tensor: Output edge features.
+	"""
+
+	def __init__(self, in_channels, hidden_channels=[2048, 1024, 512], dropout=0.0):
+		""" Initializes the NodeOnlyDecoder.
+		Args:
+			in_channels (int): Number of input features per node.
+			out_channels (int): Number of output features per edge.
+			hidden_channels (list): List of hidden layer sizes.
+		"""
+		super().__init__()
+		self.in_channels = in_channels
+		if hidden_channels is None:
+			hidden_channels = [2048, 1024, 512]
+		self.hidden_channels = hidden_channels
+		self.dropout = dropout
+		self.dims = [self.in_channels] + self.hidden_channels + [1]
+		self.edge_probability = self.generate_conv_layer()
+		self.edge_weight_pred = self.generate_conv_layer()
+
+	def generate_conv_layer(self):
+		layers = []
+		for i in range(len(self.dims) - 2):
+			layers.append(nn.Linear(self.dims[i], self.dims[i + 1]))
+			layers.append(ReLU())
+			if self.dropout > 0:
+				layers.append(nn.Dropout(p=self.dropout))
+		layers.append(nn.Linear(self.dims[-2], self.dims[-1]))
+		return nn.Sequential(*layers)
+
+
+
+	def forward(self, x, edge_index):
+		edge_features = (x[edge_index[0]] + x[edge_index[1]])
+		edge_probabilities = self.edge_probability(edge_features)
+		edge_weights = ReLU(self.edge_weight_pred(edge_features))
+		return edge_weights, edge_probabilities
+
 
 class Pool_SAGEConv(nn.Module):
 	"""
@@ -28,7 +83,7 @@ class Pool_SAGEConv(nn.Module):
 				torch.Tensor: Output node features after aggregation.
 	"""
 
-	def __init__(self, in_channels, out_channels, message_passing=True):
+	def __init__(self, in_channels, out_channels, message_passing=True, p_drop_message=0.0):
 		super().__init__()
 		
 		# Linear fully connected pooling
@@ -39,9 +94,33 @@ class Pool_SAGEConv(nn.Module):
 
 		# Learnable parameter that controls how much the edge weight influences message aggregation
 		self.edge_weight_message_coefficient = nn.Parameter(torch.tensor(0.5))
+
+		self.forward = self.forward_with_message_pooling
+
+		# # Probability of dropping messages during training
+		# self.p_drop_message = p_drop_message
+
+	# 	if self.training:
+	# 		if self.p_drop_message == 0.0:
+	# 			self.forward = self.forward_with_message_pooling
+	# 		else:
+	# 			self.forward = self.forward_with_drop
+	# 	else:
+	# 		if message_passing:
+	# 			self.forward = self.forward_with_message_pooling
+	# 		else:
+	# 			self.forward = self.forward_without_message_pooling
 		
-		self.forward = self.forward_with_message_pooling if message_passing else self.forward_without_message_pooling
-			
+	# def forward_with_drop(self, x, edge_index, edge_weight):
+
+	# 	drop_messages = torch.rand(1).item() < self.p_drop_message and self.training
+
+	# 	if drop_messages:
+	# 		return self.forward_without_message_pooling(x, edge_index, edge_weight)
+	# 	else:
+	# 		return self.forward_with_message_pooling(x, edge_index, edge_weight)
+
+
 	def forward_with_message_pooling(self, x, edge_index, edge_weight):
 		src, dst = edge_index
 
@@ -133,6 +212,44 @@ class GraphSAGE(nn.Module):
 		edge_weights = ReLU(self.edge_weight_pred(edge_embeddings))
 		edge_predictor = self.edge_pred(edge_embeddings)
 		return edge_weights, edge_predictor
+	
+class DualHeadModel(nn.Module):
+	"""
+	Model with two heads: a GNN-based head and a node-only decoder head.
+
+	Args:
+		in_channels (int): Number of input features per node.
+		hidden_channels (int): Number of hidden features per node.
+		dropout (float, optional): Dropout rate.
+	"""
+	def __init__(self, in_channels, hidden_channels, dropout=0.0, pred_head = None):
+		super().__init__()
+		self.GNN = GraphSAGE(in_channels=in_channels, hidden_channels=hidden_channels, dropout=dropout)
+		self.NOD = NodeOnlyDecoder(in_channels=in_channels, dropout=dropout)
+
+		if pred_head == "gnn":
+			self.forward = self.forward_gnn
+		elif pred_head == "nod":
+			self.forward = self.forward_nod
+		else:
+			self.DualOutput = namedtuple("DualOutput", ["gnn", "nod"])
+			self.forward = self.forward_both
+
+	def forward_gnn(self, x, supervision_edges, message_edges, message_edgewt=None):
+		return self.GNN(x, supervision_edges, message_edges, message_edgewt)
+
+	def forward_nod(self, x, supervision_edges, message_edges=None, message_edgewt=None):
+		return self.NOD(x, supervision_edges)
+	
+	def forward_both(self, x, supervision_edges, message_edges, message_edgewt=None):
+		outputs = self.DualOutput(
+			gnn = self.GNN(x, supervision_edges, message_edges, message_edgewt),
+			nod = self.NOD(x, supervision_edges)
+		)
+		return outputs
+
+	
+
 	
 class EdgeSampler(torch.utils.data.IterableDataset):
 	"""
@@ -714,7 +831,27 @@ def normalize_values(values: torch.tensor, min_val=None, max_val=None):
 		max_val = values.max()
 	return (values - min_val) / (max_val - min_val)
 
-def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False):
+def calculate_loss(model_output, data, head_weights = [0.5, 0.5]):
+	"""
+	Calculates the loss for the model output.
+
+	Args:
+		model_output (tuple): Output from the model containing edge probabilities and edge weights. DualHeadModel outputs two tuples of (edge_weights, edge_predictor) where the first tuple is for the GNN and the second is for the node-only decoder.
+		data (torch_geometric.data.Data): Data object containing supervision labels and importance.
+		head_weights (torch.Tensor): Weights for the heads in the model.
+	Returns:
+		torch.Tensor: Computed loss value.
+	"""
+	assert len(model_output) == len(head_weights), "Mismatch between model output and head weights length."
+	total_loss = torch.tensor(0.0, device=data.supervision_labels.device, requires_grad=True)
+
+	for i, w in enumerate(head_weights):
+		edge_probability, edge_weight_pred = model_output[i]
+		loss = bce_loss(edge_probability.squeeze(-1), data.supervision_labels, weight=data.supervision_importance) + mse_loss(edge_weight_pred.squeeze(-1), data.supervision_edgewts)
+		total_loss += w * loss
+	return total_loss
+
+def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, head_weights = [0.5, 0.5], is_training=False):
 	"""
     Processes a single batch for training or validation.
 
@@ -741,7 +878,7 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	else:
 		conditional_backward = lambda loss: None  # No-op for validation
 
-	edge_probability, edge_weight_pred = model(
+	model_output = model(
 		data.node_features,
 		message_edges=data.message_edges,
 		prediction_edges=data.supervision_edges,
@@ -750,8 +887,7 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	
 	# Compute BCE and MSE losses
 
-	loss = bce_loss(edge_probability.squeeze(-1), data.supervision_labels, weight=data.supervision_importance) + mse_loss(edge_weight_pred.squeeze(-1), data.supervision_edgewts)
-
+	loss = calculate_loss(model_output, data, head_weights)
 	conditional_backward(loss)
 
 	if is_training:

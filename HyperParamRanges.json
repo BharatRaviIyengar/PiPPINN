@@ -29,6 +29,11 @@
 		"type": "float",
 		"low": 0.1,
 		"high": 0.5
+	},
+	"GNN_weight":{
+		"type": "float",
+		"low": 0.25,
+		"high": 0.75
 	}
 }
 
