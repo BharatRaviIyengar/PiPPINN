@@ -3,9 +3,10 @@ from pathlib import Path
 import sys
 from time import time
 import torch
+import TrainUtils as utils
 import optuna, json
 from optuna.samplers import TPESampler
-import TrainUtils as utils
+
 from glob import glob
 import gc
 
@@ -77,7 +78,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	""" Run training for a single trial with the given parameters."""
 
 	centrality_fraction = params['centrality_fraction']
-	hidden_channels = params['hidden_channels']
+	hidden_channels = 1024
 	dropout = params['dropout']
 	weight_decay = params['weight_decay']
 	patience = 20
@@ -177,27 +178,27 @@ if __name__ == "__main__":
 
 	parser = ap.ArgumentParser(description="GraphSAGE model for edge detection")
 
-	parser.add_argument("--input", "-i",
-		type=str,
-		help="Path to the input graph data files (.pt)",
-		metavar="file-pattern, comma-separated for multiple files",
-		default=None
-	)
+	# parser.add_argument("--input", "-i",
+	# 	type=str,
+	# 	help="Path to the input graph data files (.pt)",
+	# 	metavar="file-pattern, comma-separated for multiple files",
+	# 	default=None
+	# )
 	parser.add_argument("--threads", "-t",
 		type=int,
 		help="Number of CPU threads to use",
 		default=1
 	)
-	parser.add_argument("--val_fraction",
-		type=float,
-		default= 0.2,
-		help= "Fraction of data for validation (rest for training)"
-	)
-	parser.add_argument("--epochs", "-e",
-		type=int,
-		help="Maximum number of training epochs",
-		default=200
-	)
+	# parser.add_argument("--val_fraction",
+	# 	type=float,
+	# 	default= 0.2,
+	# 	help= "Fraction of data for validation (rest for training)"
+	# )
+	# parser.add_argument("--epochs", "-e",
+	# 	type=int,
+	# 	help="Maximum number of training epochs",
+	# 	default=200
+	# )
 	parser.add_argument("--batch_size", "-b",
 		type=int,
 		help="Minibatch size for training",
@@ -213,40 +214,44 @@ if __name__ == "__main__":
 		help="Save split data and negative edges to file (.pt)",
 		default=None
 	)
-	parser.add_argument("--runmode","-m",
-		choices=["G","T","I","A"],
-		help="Run mode: [G] generate trials and save hyperparameter values to json. [T] Train + validate on a chosen trial. [I] perform inference on a set of trial results. [A] perform all actions in the same execution",
-		default="A"
-	)
+	# parser.add_argument("--runmode","-m",
+	# 	choices=["G","T","I","A"],
+	# 	help="Run mode: [G] generate trials and save hyperparameter values to json. [T] Train + validate on a chosen trial. [I] perform inference on a set of trial results. [A] perform all actions in the same execution",
+	# 	default="A"
+	# )
 	parser.add_argument("--num_trials","-n",
 		type=int,
 		help="Number of trials to generate",
 		default=100
 	)
-	parser.add_argument("--param_ranges","-p",
-		type=str,
-		help="JSON file for hyperparameter ranges.",
-		default=None
-	)
-	parser.add_argument("--trial_ids",
-		type=parse_num_list,
-		help="e.g. 0,2,5-7",
-		default=[]
-	)
-	parser.add_argument("--trials_params",
-		type=str,
-		help="Save/load generated parameter sets to/from <filename>.",
-		default=None
-	)
-	parser.add_argument("--trial_result","-r",
-		type=str,
-		help="Save/load output of trial(s)",
-		default=None
-	)
+	# parser.add_argument("--param_ranges","-p",
+	# 	type=str,
+	# 	help="JSON file for hyperparameter ranges.",
+	# 	default=None
+	# )
+	# parser.add_argument("--trial_ids",
+	# 	type=parse_num_list,
+	# 	help="e.g. 0,2,5-7",
+	# 	default=[]
+	# )
+	# parser.add_argument("--trials_params",
+	# 	type=str,
+	# 	help="Save/load generated parameter sets to/from <filename>.",
+	# 	default=None
+	# )
+	# parser.add_argument("--trial_result","-r",
+	# 	type=str,
+	# 	help="Save/load output of trial(s)",
+	# 	default=None
+	# )
 	parser.add_argument("--params_best",
 		type=str,
 		help="Output File for best hyperparameters (json)",
 		default=None
+	)
+	parser.add_argument("--dual_head",
+		action="store_true",
+		help="Use dual head model for training (default: False)"
 	)
 
 	SEED = 48149
@@ -277,100 +282,129 @@ if __name__ == "__main__":
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	print(f"Using device: {device}")
 
-	if args.runmode == "G":
-		if args.param_ranges is not None and args.input is not None:
-			if args.trials_params is None:
-				args.trials_params = f"{Path(args.param_ranges).with_suffix('')}_{args.num_trials}_trials.json"
-			with open(args.param_ranges,"r") as f:
-				search_space = json.load(f)
-			generate_param_sets(args.num_trials, args.param_ranges, args.trials_params)
-		else:
-			print("Error: input file(s) not provided")
+	# if args.runmode == "G":
+	# 	if args.param_ranges is not None and args.input is not None:
+	# 		if args.trials_params is None:
+	# 			args.trials_params = f"{Path(args.param_ranges).with_suffix('')}_{args.num_trials}_trials.json"
+	# 		with open(args.param_ranges,"r") as f:
+	# 			search_space = json.load(f)
+	# 		generate_param_sets(args.num_trials, args.param_ranges, args.trials_params)
+	# 	else:
+	# 		print("Error: input file(s) not provided")
 
-		input_graphs_filenames = []
-		# Split input patterns and load graphs
-		for pattern in args.input.split(","):
-			input_graphs_filenames.extend(glob(pattern.strip()))
+	# 	input_graphs_filenames = []
+	# 	# Split input patterns and load graphs
+	# 	for pattern in args.input.split(","):
+	# 		input_graphs_filenames.extend(glob(pattern.strip()))
 
-		_ = utils.load_data(
-			input_graphs_filenames=input_graphs_filenames, 
-			val_fraction=args.val_fraction, 
-			save_graphs_to=args.training_data,
-			device=device
-		)
-		sys.exit(0)
+	# 	_ = utils.load_data(
+	# 		input_graphs_filenames=input_graphs_filenames, 
+	# 		val_fraction=args.val_fraction, 
+	# 		save_graphs_to=args.training_data,
+	# 		device=device
+	# 	)
+	# 	sys.exit(0)
 
-	elif args.runmode =="T":
-		if args.trials_params is None or not args.trial_ids:
-			print("Error input information not provided")
-			sys.exit(0)
-		paramset = load_param_set(args.trials_params, args.trial_ids)
-		results = []
-		dataset = torch.load(args.training_data, weights_only = False)
+	# elif args.runmode =="T":
+	# 	if args.trials_params is None or not args.trial_ids:
+	# 		print("Error input information not provided")
+	# 		sys.exit(0)
+	# 	paramset = load_param_set(args.trials_params, args.trial_ids)
+	# 	results = []
+	# 	dataset = torch.load(args.training_data, weights_only = False)
 
-		for trial_id, params in enumerate(paramset):
-			result, _ = run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads)
-			result["trial_id"] = args.trial_ids[trial_id]
-			results.append(result)
-		if args.trial_result is None:
-			args.trial_result = f"{Path(args.trials_params).with_suffix('')}_{args.trial_ids}_results.json"
-		with open(args.trial_result, "w") as f:
-			json.dump(results, f, indent=2)
+	# 	for trial_id, params in enumerate(paramset):
+	# 		result, _ = run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads)
+	# 		result["trial_id"] = args.trial_ids[trial_id]
+	# 		results.append(result)
+	# 	if args.trial_result is None:
+	# 		args.trial_result = f"{Path(args.trials_params).with_suffix('')}_{args.trial_ids}_results.json"
+	# 	with open(args.trial_result, "w") as f:
+	# 		json.dump(results, f, indent=2)
 
-	elif args.runmode=="I":
-		with open(args.trial_result, "r") as f:
-			trial_results = json.load(f)
+	# elif args.runmode=="I":
+	# 	import numpy as np
+	# 	from sklearn.ensemble import RandomForestRegressor
 
-		# Create a new Optuna study
-		study = optuna.create_study(direction="minimize")
+	# 	with open(args.trial_result, "r") as f:
+	# 		trial_results = json.load(f)
 
-		# Add trials to the study
-		for result in trial_results:
-			trial = optuna.trial.create_trial(
-				params=result["params"],
-				distributions= optuna_dist_from_suggested_params(result["params"]),
-				value=result["best_val_loss"],
-				user_attrs={
-					"early_stopping_epoch": result["early_stopping_epoch"],
-					"best_train_loss" : result["best_train_loss"]
-					}
-			)
-			study.add_trial(trial)
+	# 	# Create a new Optuna study
+	# 	param_names = list(trial_results[0]["params"].keys())
+	# 	X = np.array([[trial["params"][k] for k in param_names] for trial in trial_results])
+	# 	y = np.array([trial["best_val_loss"] for trial in trial_results])
 
-		# Print the best trial
-		best = study.best_trial
-		print("Best trial:", best)
-		with open(args.params_best, "w") as f:
-			json.dump(best.params, f, indent=2)
+	# 	# Fit surrogate model
+	# 	surrogate = RandomForestRegressor(n_estimators=100)
+	# 	surrogate.fit(X, y)
 
-	elif args.runmode=="A":
-		input_graphs_filenames = []
-		# Split input patterns and load graphs
-		for pattern in args.input.split(","):
-			input_graphs_filenames.extend(glob(pattern.strip()))
-		
-		dataset, node_feature_dimension = utils.load_data(
-		input_graphs_filenames=input_graphs_filenames, 
-		val_fraction=args.val_fraction, 
-		save_graphs_to=args.training_data,
-		device=device
-		)
-		if args.param_ranges is None:
-			print("Error: param_ranges file not provided.")
-			sys.exit(1)
-		with open(args.param_ranges,"r") as f:
-			search_space = json.load(f)
+	# 	# Build search space from previous results
+	# 	with open(args.param_ranges, "r") as f:
+	# 		search_space = json.load(f)
 
-		def objective(trial):
-			params = suggest_params(trial, search_space)
-			result, _ = run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads)
-			trial.set_user_attr("early_stopping_epoch", result["early_stopping_epoch"])
-			trial.set_user_attr("best_train_loss", result["best_train_loss"])
+	# 	def objective_with_existing(trial):
+	# 		params = {}
+	# 		for k, spec in search_space.items():
+	# 				if spec["type"] == "float":
+	# 						params[k] = trial.suggest_float(k, spec["low"], spec["high"])
+	# 				elif spec["type"] == "int":
+	# 						params[k] = trial.suggest_int(k, spec["low"], spec["high"])
+	# 				elif spec["type"] == "categorical":
+	# 						params[k] = trial.suggest_categorical(k, spec["choices"])
+	# 		# Predict loss using surrogate
+	# 		x = np.array([params[k] for k in param_names]).reshape(1, -1)
+	# 		pred_loss = surrogate.predict(x)[0]
+	# 		return pred_loss
 
-			return result["best_val_loss"]
-		
-		study = optuna.create_study(direction="minimize")
-		study.optimize(objective, n_trials=args.num_trials)
-		best_trial = study.best_trial
-		with open(args.params_best, "w") as f:
-			json.dump(study.best_trial, f, indent=2)
+	# 	study = optuna.create_study(direction="minimize")
+	# 	study.optimize(objective_with_existing, n_trials=len(trial_results))
+
+	# 	if args.params_best is not None:
+	# 		with open(args.params_best, "w") as f:
+	# 			json.dump(study.best_trial.params, f, indent=2)
+	# 	else:
+	# 		print("Best parameters:", study.best_trial.params)
+
+	# Sequentially run all trials
+	# elif args.runmode=="A":
+
+	dataset = torch.load(args.training_data, weights_only = False)
+
+	def early_stop_callback(study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
+		if len(study.trials) > 10:
+			recent = [t.value for t in study.trials[-10:] if t.value is not None]
+			if max(recent) - min(recent) < 1e-4:
+				raise optuna.exceptions.OptunaError("Stopping: Converged")
+
+	def objective(trial):
+		params = {
+			"centrality_fraction": trial.suggest_float("centrality_fraction", 0.1, 0.5, log=True),
+			"dropout": trial.suggest_float("dropout", 0.15, 0.35),
+			"weight_decay": trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True),
+			"scheduler_factor": trial.suggest_float("scheduler_factor", 0.1, 0.5),
+			"nbr_weight_intensity": trial.suggest_float("nbr_weight_intensity", 0.5, 2.0, log=True),
+			"GNN_head_weight": trial.suggest_float("GNN_head_weight", 0.25, 0.75, log=True)
+		}
+		result, _ = run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads, dual_head=args.dual_head)
+		trial.set_user_attr("early_stopping_epoch", result["early_stopping_epoch"])
+		trial.set_user_attr("best_train_loss", result["best_train_loss"])
+
+		return result["best_val_loss"]
+	
+	study = optuna.create_study(direction="minimize", sampler=TPESampler(multivariate=True))
+	study.enqueue_trial({
+	"weight_decay": 0.0002111537171925507,
+	"dropout": 0.3490958414034747,
+	"centrality_fraction": 0.36731422946424275,
+	"nbr_weight_intensity": 1.4806115270497722,
+	"scheduler_factor": 0.42883498817627824,
+	"GNN_head_weight": 0.5
+})
+	study.optimize(objective, n_trials=args.num_trials, callbacks=[early_stop_callback])
+	best_trial = study.best_trial
+	with open(args.params_best, "w") as f:
+		json.dump({
+			"params": best_trial.params,
+			"value": best_trial.value,
+			"user_attrs": best_trial.user_attrs
+		}, f, indent=2)

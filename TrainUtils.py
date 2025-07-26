@@ -49,7 +49,7 @@ class NodeOnlyDecoder(nn.Module):
 		layers = []
 		for i in range(len(self.dims) - 2):
 			layers.append(nn.Linear(self.dims[i], self.dims[i + 1]))
-			layers.append(ReLU())
+			layers.append(nn.ReLU())
 			if self.dropout > 0:
 				layers.append(nn.Dropout(p=self.dropout))
 		layers.append(nn.Linear(self.dims[-2], self.dims[-1]))
@@ -193,7 +193,7 @@ class GraphSAGE(nn.Module):
 		
 		self.mode = mode
 
-	def forward(self, x, prediction_edges, message_edges, message_edgewt=None):
+	def forward(self, x, supervision_edges, message_edges, message_edgewt=None):
 		"""
 		Forward logic with message passing.
 		"""
@@ -208,7 +208,7 @@ class GraphSAGE(nn.Module):
 		x = self.dropout(x)
 
 		# Predict edges
-		edge_embeddings = x[prediction_edges[0]] + x[prediction_edges[1]]
+		edge_embeddings = x[supervision_edges[0]] + x[supervision_edges[1]]
 		edge_weights = ReLU(self.edge_weight_pred(edge_embeddings))
 		edge_predictor = self.edge_pred(edge_embeddings)
 		return edge_weights, edge_predictor
@@ -848,7 +848,7 @@ def calculate_loss(model_output, data, head_weights = [0.5, 0.5]):
 	for i, w in enumerate(head_weights):
 		edge_probability, edge_weight_pred = model_output[i]
 		loss = bce_loss(edge_probability.squeeze(-1), data.supervision_labels, weight=data.supervision_importance) + mse_loss(edge_weight_pred.squeeze(-1), data.supervision_edgewts)
-		total_loss += w * loss
+		total_loss = total_loss + w * loss
 	return total_loss
 
 def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, head_weights = [0.5, 0.5], is_training=False):
@@ -881,7 +881,7 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	model_output = model(
 		data.node_features,
 		message_edges=data.message_edges,
-		prediction_edges=data.supervision_edges,
+		supervision_edges=data.supervision_edges,
 		message_edgewt = data.message_edgewts
 	)
 	
