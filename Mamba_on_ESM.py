@@ -5,53 +5,35 @@ from pathlib import Path
 from warnings import warn
 from mamba_ssm import Mamba
 from EncodeProteins import load_model_without_regression, get_batch_idx, prepare_dataloader
-from Typing import Tuple
+from Typing import Tuple, List
 import numpy as np
 extra_toks_per_seq = 1
 
 # Don't even try training without a GPU :D
 gpu = torch.cuda.is_available()
 
+chunk_size = 1022 # Limit for ESM models
 if not gpu:
     raise RuntimeError("This script requires a GPU to run.")
 
-def chunk_sequences(sequence, chunk_size, stride=1):
+def chunk_sequences_optimal(sequence, chunk_size, seqid = "", stride=1):
     """Yield chunks of sequences of a specified size."""
-    nchunks = (len(sequence) - chunk_size + stride)
     if stride > chunk_size:
         warn("Stride greater than chunk size. You will lose some positions in the sequence.")
-    return [sequence[i:i+chunk_size] for i in range(0, nchunks, stride)]
-
-def bidirectional_chunk_seq(seq: str, chunk_size: int, stride: int):
-
-	L = len(seq)
-	center = L // 2
-	x = (L - chunk_size + stride) % stride  # uncovered length in one-directional
-
-	# Shift center so that we align both directions evenly
-	# This helps balance the ends and eliminate uncovered tail
-	start_center = center - x // 2
-
-	# Generate chunk starts to the left
-	left_starts = list(range(start_center - stride, -1, -stride))[::-1]
-
-	# Generate chunk starts to the right
-	right_starts = list(range(start_center, L - chunk_size + 1, stride))
-
-	all_starts = left_starts + right_starts
-	chunks = [seq[i:i+chunk_size] for i in all_starts]
-
-	# Centered positional encoding
-	center_index = len(left_starts)  # index in the list where position is 0
-	positions = np.arange(len(chunks)) - center_index
-	positions = positions / max(1, len(positions) // 2)  # normalized
-
-	return chunks, positions
+    L = len(sequence)
+    range_stop = (L - chunk_size + stride)
+    if range_stop % stride == 0:
+        starts = np.arange(0, range_stop, stride)
+    else:
+        n_chunks = int(np.ceil((L - chunk_size) / stride)) + 1
+        stride = int(np.floor(L - chunk_size) / (n_chunks - 1))
+        starts = np.arange(n_chunks) * stride
+    seqlist = [(seqid+str(i), sequence[i:i+chunk_size])  for i in starts]
+    position_embedding = torch.tensor(starts / L, dtype=torch.float32)
+    return seqlist, position_embedding
 
 
-chunk_size = 1022 # Limit for ESM models
-
-def get_esm_embeddings(sequences: Tuple[str,str]):
+def get_esm_embeddings(sequences: List[Tuple[str,str]]):
     """Get ESM embeddings for a list of sequences."""
     data_loader = prepare_dataloader(sequences)
     all_reps = []
