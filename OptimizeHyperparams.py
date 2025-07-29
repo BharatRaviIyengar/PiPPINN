@@ -6,6 +6,8 @@ import torch
 import TrainUtils as utils
 import optuna, json
 from optuna.samplers import TPESampler
+from optuna.storages import JournalStorage
+from optuna.storages.journal import JournalFileBackend
 
 from glob import glob
 import gc
@@ -253,6 +255,11 @@ if __name__ == "__main__":
 		action="store_true",
 		help="Use dual head model for training (default: False)"
 	)
+	parser.add_argument("--journal_file",
+		type=str,
+		help="Path to the Optuna journal file for storing study results",
+		default=None
+	)
 
 	SEED = 48149
 	torch.manual_seed(SEED)
@@ -274,6 +281,12 @@ if __name__ == "__main__":
 	if not gpu_yes:
 		print("GPU not available: Quitting")
 		sys.exit(0)
+
+	if args.journal_file is not None:
+		journal_path = Path(args.best_params).parent.resolve() if args.best_params is not None else Path(__file__).parent.resolve()
+		journal_file = f"{journal_path}/OptunaJournal.log"
+
+	storage = JournalStorage(JournalFileBackend(args.journal_file)) 
 
 	print("Parsed arguments\n===================")
 	for arg, value in vars(args).items():
@@ -391,7 +404,7 @@ if __name__ == "__main__":
 
 		return result["best_val_loss"]
 	
-	study = optuna.create_study(direction="minimize", sampler=TPESampler(multivariate=True))
+	study = optuna.create_study(direction="minimize", sampler=TPESampler(multivariate=True), storage=storage)
 	study.enqueue_trial({
 	"weight_decay": 0.0002111537171925507,
 	"dropout": 0.3490958414034747,
