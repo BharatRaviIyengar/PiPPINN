@@ -7,12 +7,14 @@ from mamba_ssm import Mamba
 from EncodeProteins import load_model_without_regression, get_batch_idx, prepare_dataloader
 from Typing import Tuple, List
 import numpy as np
-extra_toks_per_seq = 1
 
+extra_toks_per_seq = 1
+chunk_size = 1022 # Limit for ESM models
+max_tokens_per_batch = 65536
 # Don't even try training without a GPU :D
 gpu = torch.cuda.is_available()
 
-chunk_size = 1022 # Limit for ESM models
+
 if not gpu:
     raise RuntimeError("This script requires a GPU to run.")
 
@@ -23,22 +25,23 @@ def chunk_sequences_optimal(sequence, chunk_size, seqid = "", stride=1):
     L = len(sequence)
     range_stop = (L - chunk_size + stride)
     if range_stop % stride == 0:
-        starts = np.arange(0, range_stop, stride)
+        starts = torch.arange(0, range_stop, stride)
     else:
-        n_chunks = int(np.ceil((L - chunk_size) / stride)) + 1
-        stride = int(np.floor(L - chunk_size) / (n_chunks - 1))
-        starts = np.arange(n_chunks) * stride
-    seqlist = [(seqid+str(i), sequence[i:i+chunk_size])  for i in starts]
-    position_embedding = torch.tensor(starts / L, dtype=torch.float32)
-    return seqlist, position_embedding
+        n_chunks =(torch.ceil((L - chunk_size) // stride)) + 1
+        stride = torch.floor(L - chunk_size) // (n_chunks - 1)
+        starts = torch.arange(n_chunks) * stride
+    seqlist = [(f"{seqid}_{i}", sequence[start : start+chunk_size])  for i,start in enumerate(starts)]
+    offsets = torch.arange(chunk_size).unsqueeze(1)
+    position_embeddings = (starts + offsets) / L
+    return seqlist, position_embeddings.T
 
 
-def get_esm_embeddings(sequences: List[Tuple[str,str]]):
+def get_esm_embeddings(model, layers, sequences: List[Tuple[str,str]]):
     """Get ESM embeddings for a list of sequences."""
     data_loader = prepare_dataloader(sequences)
     all_reps = []
     all_labels = []
-    for _, (labels, strs, toks) in enumerate(data_loader):
+    for labels, strs, toks in data_loader:
       bsize = len(strs)
       if gpu:
         toks = toks.to(device="cuda", non_blocking=True)
@@ -48,18 +51,23 @@ def get_esm_embeddings(sequences: List[Tuple[str,str]]):
       all_labels.extend(labels)
     return all_labels, all_reps
 
-# TODO implement long seq esm inference with output as a list of 3D tensors
-
-def get_long_esm_embeddings(sequences:Tuple[str,str], chunk_size:int=chunk_size, stride=1):
+def get_long_esm_embeddings(model, layers, sequences:Tuple[str,str], chunk_size:int=chunk_size, stride=1):
     """Get ESM embeddings for long sequences by chunking."""
     all_reps = []
     all_labels = []
     for seqid, sequence in sequences:
-        chunks = chunk_sequences(sequence, chunk_size, stride)
-        _, chunk_reps = get_esm_embeddings([chunk])
-        for i,chunk in chunks:
-            
-            reps.append(chunk_reps[0])  # Assuming single sequence per chunk
-        all_reps.append(torch.stack(reps))
-        all_labels.append(labels[0])  # Assuming single label per sequence
+        chunks, positional_embeddings = chunk_sequences_optimal(sequence, chunk_size, seqid = seqid, stride = stride)
+        reps = torch.empty(len(chunks), chunk_size, model.embed_dim + 1)
+        reps[:,:,-1] = positional_embeddings
+        data_loader = prepare_dataloader(chunks)
+        offset = 0
+        for _, _, toks in data_loader:
+            batch_size = len(toks)
+            if gpu:
+                toks = toks.to(device="cuda", non_blocking=True)
+            out = model(toks, repr_layers=[layers])
+            reps[offset:offset+batch_size,:,:model.embed_dim] = out["representations"][layers].to("cpu")
+            offset += batch_size
+        all_reps.append(reps)
+        all_labels.append(seqid)
     return all_labels, all_reps
