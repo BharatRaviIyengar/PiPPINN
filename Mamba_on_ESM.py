@@ -51,23 +51,39 @@ def get_esm_embeddings(model, layers, sequences: List[Tuple[str,str]]):
       all_labels.extend(labels)
     return all_labels, all_reps
 
-def get_long_esm_embeddings(model, layers, sequences:Tuple[str,str], chunk_size:int=chunk_size, stride=1):
+def get_long_esm_embeddings(model, layers, sequences:Tuple[str,str], chunk_size:int=chunk_size, stride=1, device="cuda"):
     """Get ESM embeddings for long sequences by chunking."""
     all_reps = []
     all_labels = []
     for seqid, sequence in sequences:
-        chunks, positional_embeddings = chunk_sequences_optimal(sequence, chunk_size, seqid = seqid, stride = stride)
-        reps = torch.empty(len(chunks), chunk_size, model.embed_dim + 1)
-        reps[:,:,-1] = positional_embeddings
+        chunks, positional_embeddings = chunk_sequences_optimal(sequence, chunk_size, seqid=seqid, stride=stride)
+        T = len(chunks) * chunk_size
+        reps = torch.empty(T, model.embed_dim + 1, device = device)
+        # Positional embeddings
+        reps[:, -1] = positional_embeddings.flatten()
         data_loader = prepare_dataloader(chunks)
         offset = 0
         for _, _, toks in data_loader:
-            batch_size = len(toks)
-            if gpu:
-                toks = toks.to(device="cuda", non_blocking=True)
+            toks = toks.to(device = device, non_blocking=True)
             out = model(toks, repr_layers=[layers])
-            reps[offset:offset+batch_size,:,:model.embed_dim] = out["representations"][layers].to("cpu")
-            offset += batch_size
-        all_reps.append(reps)
+            embedding = out["representations"][layers].reshape(-1, model.embed_dim)
+            reps[offset:offset + embedding.size(0), :model.embed_dim] = embedding
+            offset += embedding.size(0)
+        all_reps.append(reps.to(device="cpu"))
         all_labels.append(seqid)
     return all_labels, all_reps
+
+def bucketize_sequences(sequences: List[str], seqids: List[str], bucket_width = 50, embedding_size = 2561, max_batch_memory = None) -> List[List[int]]:
+    """Bucketize sequences into batches based on their lengths."""
+    seq_lengths = torch.tensor([len(seq)  for seq in sequences], dtype=torch.int32)
+    boundaries = (bucket_width * seq_lengths // bucket_width).unique()
+    buckets = torch.bucketize(seq_lengths, boundaries)
+    batches = []
+    for i in boundaries.unique():
+        batch_indices = (buckets == i).nonzero(as_tuple=False).squeeze(1)
+        batch_memory = seq_lengths[batch_indices].sum() * 4 * embedding_size/1024**2  # in MB
+        num_sub_batches = (batch_memory // max_batch_memory) + 1 if max_batch_memory else 1
+        sub_batches = torch.chunk(batch_indices, num_sub_batches)
+        batch_sequences = [[(seqids[idx], sequences[idx]) for idx in sub_batch] for sub_batch in sub_batches]
+        batches.extend(batch_sequences)
+    return batches
