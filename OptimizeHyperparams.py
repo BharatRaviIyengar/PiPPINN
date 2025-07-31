@@ -291,7 +291,7 @@ if __name__ == "__main__":
 			"weight_decay": trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True),
 			"scheduler_factor": trial.suggest_float("scheduler_factor", 0.1, 0.5),
 			"nbr_weight_intensity": trial.suggest_float("nbr_weight_intensity", 0.5, 2.0, log=True),
-			"GNN_head_weight": trial.suggest_float("GNN_head_weight", 0.25, 0.75, log=True)
+			"GNN_head_weight": trial.suggest_float("GNN_head_weight", 0.3, 0.7, log=True)
 		}
 		for result in run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads, dual_head=args.dual_head):
 			epoch = result["epoch"]
@@ -310,13 +310,15 @@ if __name__ == "__main__":
 		return best_val_loss
 	
 	study = optuna.create_study(study_name = "PiPPINN_HPO", direction="minimize", sampler=TPESampler(multivariate=True), storage=storage)
+
+	
 	study.enqueue_trial({
-	"weight_decay": 0.0002111537171925507,
-	"dropout": 0.3490958414034747,
-	"centrality_fraction": 0.36731422946424275,
-	"nbr_weight_intensity": 1.4806115270497722,
-	"scheduler_factor": 0.42883498817627824,
-	"GNN_head_weight": 0.5
+	'centrality_fraction': 0.45589735003901094,
+	'dropout': 0.319782872298281,
+	'weight_decay': 0.00011011691973337221,
+	'scheduler_factor': 0.30738592097342027,
+	'nbr_weight_intensity': 1.9702720585607403,
+	'GNN_head_weight': 0.3133970264487372
 })
 	study.optimize(objective, n_trials=args.num_trials, callbacks=[early_stop_callback])
 	best_trial = study.best_trial

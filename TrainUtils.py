@@ -482,11 +482,11 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 			# Resample remaining from total
 			num_resample_from_total = self.batch_size - (num_sample_from_total + num_unsampled)
-			resampled_from_total = torch.multinomial(self.uniform_probs, num_resample_from_total, replacement=False)
+			if num_resample_from_total > 0:
+				resampled_from_total = torch.multinomial(self.uniform_probs, num_resample_from_total, replacement=False)
 
-			# Fill the remaining slots in the preallocated buffer
-			self.positive_batch_indices[-num_resample_from_total:] = self.positive_edge_idx[resampled_from_total]
-
+				# Fill the remaining slots in the preallocated buffer
+				self.positive_batch_indices[-num_resample_from_total:] = self.positive_edge_idx[resampled_from_total]
 
 		return self.positive_batch_indices
 
