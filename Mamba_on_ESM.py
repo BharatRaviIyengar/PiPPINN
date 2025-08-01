@@ -4,10 +4,9 @@ import argparse as ap
 from pathlib import Path
 from warnings import warn
 from mamba_ssm import Mamba
-from EncodeProteins import load_model_without_regression, get_batch_idx, prepare_dataloader
+from EncodeProteins import load_model_without_regression, prepare_dataloader, esmdict
 from Typing import Tuple, List
-import numpy as np
-from collections import namedtuple
+import pickle
 
 extra_toks_per_seq = 1
 max_chunk_size = 1022 # Limit for ESM models
@@ -109,21 +108,64 @@ def bucketize_sequences(sequences: List[str], seqids: List[str], bucket_width = 
     short_seqs = seq_lengths <= short_seq_size_limit
     strides = torch.ones(len(sequences), dtype=torch.int32)
     strides[~short_seqs] = optimial_stride(seq_lengths[~short_seqs], chunk_size, factor=factor)
-    def process_subset(subset_mask):
-        indices = torch.nonzero(subset_mask).squeeze(1)
-        lengths = seq_lengths[indices]
-        boundaries = (bucket_width * lengths // bucket_width).unique(sorted=False)
-        buckets = torch.bucketize(lengths, boundaries)
-        result_batches = []
+    num_chunks = torch.clamp((seq_lengths - chunk_size) // strides + 1, min=1)
+    mem_MB = num_chunks * chunk_size * 4 * embedding_size / 1024**2
+    max_batch_memory = int(max_batch_memory) if max_batch_memory else None
+    boundaries = (bucket_width * seq_lengths // bucket_width).unique(sorted=False)
+    buckets = torch.bucketize(seq_lengths, boundaries)
+    result_batches = torch.empty((len(buckets),3), dtype=torch.int64)
+    result_batches[:, 0] = torch.arange(len(buckets))
+    result_batches[:, 1] = buckets
+    if max_batch_memory is not None:
+        num_buckets = boundaries.numel()
+        bucket_mem = torch.zeros(num_buckets, dtype=mem_MB.dtype)
+        bucket_mem = bucket_mem.index_add(0, buckets, mem_MB)
+        num_sub_batches = (bucket_mem // max_batch_memory) + 1
+        result_batches[:, 2] = num_sub_batches[buckets]
+    else:
+        result_batches[:, 2] = 1
+    return result_batches, short_seqs
 
-        for boundary in boundaries:
-            batch_idxs = indices[buckets == (boundary == boundaries).nonzero(as_tuple=False).item()]
-            batch_memory = seq_lengths[batch_idxs].sum() * 4 * embedding_size / 1024**2  # MB
-            num_sub_batches = int(batch_memory // max_batch_memory) + 1 if max_batch_memory else 1
-            sub_batches = torch.chunk(batch_idxs, num_sub_batches)
-            batch_seqs = [[(seqids[i], sequences[i]) for i in sb] for sb in sub_batches]
-            result_batches.extend(batch_seqs)
+if __name__ == "__main__":
+    parser = ap.ArgumentParser(description="Script to extract ESM embeddings for protein sequences.")
+    parser.add_argument("--sequences","-s", type=str, required=True, help="Path to the file containing protein sequences in tab separated format.")
+    parser.add_argument("--model", "-m", type=str, required=True, help="ESM model path use for embeddings.")
+    parser.add_argument("--layers", type=int, default=33, help="Layer from which to extract embeddings.")
+    parser.add_argument("--chunk_size", type=int, default=max_chunk_size, help="Size of the chunks to split the sequences into.")
+    parser.add_argument("--stride", type=int, default=1, help="Stride for chunking the sequences.")
+    parser.add_argument("--save_intermediate", action="store_true", help="Save intermediate results to disk.")
+    args = parser.parse_args()
+    
+    if args.modelpath is not None:
+        model, alphabet =  load_model_without_regression(args.modelpath)
+    else:
+        model_info = esmdict[args.model]
+        model, alphabet = pretrained.load_model_and_alphabet(model_info["name"])
+    model.eval()
+    if gpu:
+        model = model.cuda()
+    
+    with open(args.sequences, "r") as f:
+        sequences = [line.strip().split("\t") for line in f if line.strip()]
+    seqids, sequences = zip(*sequences)
+    
+    sequence_batches, short_seqs = bucketize_sequences(
+        sequences, seqids,
+        bucket_width=50,
+        embedding_size=model.embed_dim + 1,
+        short_seq_size_limit=args.chunk_size,
+        chunk_size=args.chunk_size,
+        factor=3,
+        max_batch_memory=1024  # Set a limit for batch memory in MB
+    )
 
-        return result_batches
-    batches = namedtuple("batches", ["short", "long"])
-    return batches(short=process_subset(short_seqs), long = process_subset(~short_seqs))
+    chunked_long_seqs = []
+
+    for seqindex in ~short_seqs.nonzero(as_tuple=True)[0]:
+        seqid = seqids[seqindex]
+        sequence = sequences[seqindex]
+        stride = optimial_stride(len(sequence), args.chunk_size, factor=3)
+        chunks, positional_embeddings = chunk_sequences_optimal(sequence, args.chunk_size, seqid=seqid, stride=stride)
+        chunked_long_seqs.extend(chunks)
+
+    
