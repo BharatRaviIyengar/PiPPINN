@@ -32,11 +32,10 @@ class NodeOnlyDecoder(nn.Module):
 		""" Initializes the NodeOnlyDecoder.
 		Args:
 			in_channels (int): Number of input features per node.
-			out_channels (int): Number of output features per edge.
 			hidden_channels (list): List of hidden layer sizes.
 		"""
 		super().__init__()
-		self.in_channels = in_channels
+		self.in_channels = in_channels*2
 		if hidden_channels is None:
 			hidden_channels = [2048, 1024, 512]
 		self.hidden_channels = hidden_channels
@@ -49,16 +48,17 @@ class NodeOnlyDecoder(nn.Module):
 		layers = []
 		for i in range(len(self.dims) - 2):
 			layers.append(nn.Linear(self.dims[i], self.dims[i + 1]))
+			layers.append(nn.BatchNorm1d(self.dims[i + 1]))
 			layers.append(nn.ReLU())
 			if self.dropout > 0:
 				layers.append(nn.Dropout(p=self.dropout))
 		layers.append(nn.Linear(self.dims[-2], self.dims[-1]))
 		return nn.Sequential(*layers)
 
-
-
 	def forward(self, x, edge_index):
-		edge_features = (x[edge_index[0]] + x[edge_index[1]])
+		add = x[edge_index[0]] + x[edge_index[1]]
+		prod = x[edge_index[0]] * x[edge_index[1]]
+		edge_features = torch.cat([add, prod], dim=-1)
 		edge_probabilities = self.edge_probability(edge_features)
 		edge_weights = ReLU(self.edge_weight_pred(edge_features))
 		return edge_weights, edge_probabilities
@@ -83,66 +83,46 @@ class Pool_SAGEConv(nn.Module):
 				torch.Tensor: Output node features after aggregation.
 	"""
 
-	def __init__(self, in_channels, out_channels, message_passing=True, p_drop_message=0.0):
+	def __init__(self, in_channels, out_channels, message_passing=True):
 		super().__init__()
 		
 		# Linear fully connected pooling
 		self.pool = nn.Linear(in_channels, in_channels)
+		self.BN_pool = nn.BatchNorm1d(in_channels)
 
 		# Final linear layer after aggregation
 		self.final_lin = nn.Linear(in_channels * 2, out_channels)
+		self.BN_final = nn.BatchNorm1d(out_channels)
 
 		# Learnable parameter that controls how much the edge weight influences message aggregation
 		self.edge_weight_message_coefficient = nn.Parameter(torch.tensor(0.5))
 
-		self.forward = self.forward_with_message_pooling
-
-		# # Probability of dropping messages during training
-		# self.p_drop_message = p_drop_message
-
-	# 	if self.training:
-	# 		if self.p_drop_message == 0.0:
-	# 			self.forward = self.forward_with_message_pooling
-	# 		else:
-	# 			self.forward = self.forward_with_drop
-	# 	else:
-	# 		if message_passing:
-	# 			self.forward = self.forward_with_message_pooling
-	# 		else:
-	# 			self.forward = self.forward_without_message_pooling
 		
-	# def forward_with_drop(self, x, edge_index, edge_weight):
-
-	# 	drop_messages = torch.rand(1).item() < self.p_drop_message and self.training
-
-	# 	if drop_messages:
-	# 		return self.forward_without_message_pooling(x, edge_index, edge_weight)
-	# 	else:
-	# 		return self.forward_with_message_pooling(x, edge_index, edge_weight)
-
-
-	def forward_with_message_pooling(self, x, edge_index, edge_weight):
+	def forward(self, x, edge_index, edge_weight):
 		src, dst = edge_index
 
 		edge_features = x[src] * (1 + self.edge_weight_message_coefficient * edge_weight.unsqueeze(-1))
 
 		# Pool and activate neighbor messages
-		pooled = ReLU(self.pool(edge_features))
+		pooled = self.pool(edge_features)
+		pooled = self.BN_pool(pooled)
+		pooled = ReLU(pooled)
 		
 		# Aggregate neighbor messages via max
 		aggregate, _ = scatter_max(pooled, dst, dim=0, dim_size=x.size(0))
 		
 		# Concatenate self-representation and aggregated neighbors
 		h = torch.cat([x, aggregate], dim=-1)
-		
+		h = self.final_lin(h)
+		h = self.BN_final(h)
 		# Final transformation
-		return ReLU(self.final_lin(h))
+		return ReLU(h)
 		
 		
-	def forward_without_message_pooling(self, x, edge_index, edge_weight):
-		h = torch.cat([x, torch.zeros_like(x)], dim=-1)
-		# Final transformation
-		return ReLU(self.final_lin(h))
+	# def forward_without_message_pooling(self, x, edge_index, edge_weight):
+	# 	h = torch.cat([x, torch.zeros_like(x)], dim=-1)
+	# 	# Final transformation
+	# 	return ReLU(self.final_lin(h))
 
 
 class GraphSAGE(nn.Module):
@@ -167,31 +147,11 @@ class GraphSAGE(nn.Module):
 		self.hidden_channels = hidden_channels
 
 		# Edge prediction head
-		self.edge_pred = nn.Linear(self.hidden_channels, 1)
-		self.edge_weight_pred = nn.Linear(self.hidden_channels, 1)
+		self.edge_pred = nn.Linear(2*self.hidden_channels, 1)
+		self.edge_weight_pred = nn.Linear(2*self.hidden_channels, 1)
 
 		# Initialize the convolution layers based on the mode
 		self.set_mode(mode)
-
-	def set_mode(self, mode):
-		"""
-		Dynamically set the forward logic based on the mode.
-
-		Args:
-			mode (str): The mode to set. Options are:
-						- "message_passing": Use message passing.
-						- "no_message_passing": Skip message passing.
-		"""
-		if mode == "message_passing":
-			self.conv1 = Pool_SAGEConv(self.in_channels, self.hidden_channels)
-			self.conv2 = Pool_SAGEConv(self.hidden_channels, self.hidden_channels)
-		elif mode == "no_message_passing":
-			self.conv1 = Pool_SAGEConv(self.in_channels, self.hidden_channels, message_passing=False)
-			self.conv2 = Pool_SAGEConv(self.hidden_channels, self.hidden_channels, message_passing=False)
-		else:
-			raise ValueError(f"Invalid mode: {mode}")
-		
-		self.mode = mode
 
 	def forward(self, x, supervision_edges, message_edges, message_edgewt=None):
 		"""
@@ -208,7 +168,9 @@ class GraphSAGE(nn.Module):
 		x = self.dropout(x)
 
 		# Predict edges
-		edge_embeddings = x[supervision_edges[0]] + x[supervision_edges[1]]
+		add = x[supervision_edges[0]] + x[supervision_edges[1]]
+		prod = x[supervision_edges[0]] * x[supervision_edges[1]]
+		edge_embeddings = torch.cat([add, prod], dim=-1)
 		edge_weights = ReLU(self.edge_weight_pred(edge_embeddings))
 		edge_predictor = self.edge_pred(edge_embeddings)
 		return edge_weights, edge_predictor

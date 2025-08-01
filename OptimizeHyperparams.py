@@ -242,7 +242,6 @@ if __name__ == "__main__":
 	torch.manual_seed(SEED)
 	torch.cuda.manual_seed(SEED)
 	torch.cuda.manual_seed_all(SEED)
-	sampler = optuna.samplers.TPESampler(seed=SEED)
 
 	args = parser.parse_args()
 	torch.num_threads = args.threads
@@ -260,11 +259,13 @@ if __name__ == "__main__":
 		sys.exit(0)
 
 	if args.journal_file is not None:
-		journal_path = Path(args.best_params).parent.resolve() if args.best_params is not None else Path(__file__).parent.resolve()
-		journal_file = f"{journal_path}/OptunaJournal.log"
+			journal_file = args.journal_file
+	else:
+			journal_file = f"{Path(__file__).parent.resolve()}/OptunaJournal.log"
 
-	storage = JournalStorage(JournalFileBackend(args.journal_file))
+	storage = JournalStorage(JournalFileBackend(journal_file))
 	pruner = HyperbandPruner(min_resource=15, reduction_factor=3)
+	sampler = TPESampler(seed=SEED, multivariate=True)
 
 	print("Parsed arguments\n===================")
 	for arg, value in vars(args).items():
@@ -309,7 +310,13 @@ if __name__ == "__main__":
 		trial.set_user_attr("best_train_loss", best_train_loss)
 		return best_val_loss
 	
-	study = optuna.create_study(study_name = "PiPPINN_HPO", direction="minimize", sampler=TPESampler(multivariate=True), storage=storage)
+	study = optuna.create_study(
+		study_name="PiPPINN_HPO",
+		direction="minimize",
+		sampler=sampler,
+		storage=storage,
+		pruner=pruner
+	)
 
 	
 	study.enqueue_trial({
@@ -322,12 +329,13 @@ if __name__ == "__main__":
 })
 	study.optimize(objective, n_trials=args.num_trials, callbacks=[early_stop_callback])
 	best_trial = study.best_trial
-	with open(args.params_best, "w") as f:
-		json.dump({
-			"params": best_trial.params,
-			"value": best_trial.value,
-			"user_attrs": best_trial.user_attrs
-		}, f, indent=2)
+	if study.best_trial.number == 0:
+		with open(args.params_best, "w") as f:
+			json.dump({
+				"params": best_trial.params,
+				"value": best_trial.value,
+				"user_attrs": best_trial.user_attrs
+			}, f, indent=2)
 
 
 	# if args.runmode == "G":
