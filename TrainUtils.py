@@ -130,15 +130,12 @@ class GraphSAGE(nn.Module):
 	Defines the GraphSAGE model with multiple forward logics for different use cases.
 	"""
 
-	def __init__(self, in_channels, hidden_channels, dropout=0.0, mode="message_passing"):
+	def __init__(self, in_channels, hidden_channels, dropout=0.0):
 		"""
 		Args:
 			in_channels (int): Number of input features per node.
 			hidden_channels (int): Number of hidden features per node.
 			dropout (float): Dropout rate.
-			mode (str): Mode of operation. Options are:
-						- "message_passing": Use message edges for training/inference.
-						- "no_message_passing": Skip message passing, use node embeddings only.
 		"""
 		super().__init__()
 		
@@ -149,9 +146,9 @@ class GraphSAGE(nn.Module):
 		# Edge prediction head
 		self.edge_pred = nn.Linear(2*self.hidden_channels, 1)
 		self.edge_weight_pred = nn.Linear(2*self.hidden_channels, 1)
+		self.conv1 = Pool_SAGEConv(in_channels, hidden_channels)
+		self.conv2 = Pool_SAGEConv(hidden_channels, hidden_channels)
 
-		# Initialize the convolution layers based on the mode
-		self.set_mode(mode)
 
 	def forward(self, x, supervision_edges, message_edges, message_edgewt=None):
 		"""

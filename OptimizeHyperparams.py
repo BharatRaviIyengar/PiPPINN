@@ -315,6 +315,7 @@ if __name__ == "__main__":
 		direction="minimize",
 		sampler=sampler,
 		storage=storage,
+		load_if_exists=True,
 		pruner=pruner
 	)
 
