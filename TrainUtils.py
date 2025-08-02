@@ -142,12 +142,13 @@ class GraphSAGE(nn.Module):
 		self.dropout = nn.Dropout(p=dropout)
 		self.in_channels = in_channels
 		self.hidden_channels = hidden_channels
+		self.conv1 = Pool_SAGEConv(in_channels, hidden_channels)
+		self.conv2 = Pool_SAGEConv(hidden_channels, hidden_channels)
 
 		# Edge prediction head
 		self.edge_pred = nn.Linear(2*self.hidden_channels, 1)
 		self.edge_weight_pred = nn.Linear(2*self.hidden_channels, 1)
-		self.conv1 = Pool_SAGEConv(in_channels, hidden_channels)
-		self.conv2 = Pool_SAGEConv(hidden_channels, hidden_channels)
+		
 
 
 	def forward(self, x, supervision_edges, message_edges, message_edgewt=None):
