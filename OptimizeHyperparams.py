@@ -14,70 +14,6 @@ from optuna.pruners import HyperbandPruner
 from glob import glob
 import gc
 
-def parse_num_list(s):
-	result = set()
-	for part in s.split(','):
-		if '-' in part:
-			start, end = map(int, part.split('-'))
-			result.update(range(start, end + 1))
-		else:
-			result.add(int(part))
-	return sorted(result)
-
-
-def suggest_params(trial, search_space):
-	params = {}
-	for name, spec in search_space.items():
-		suggest_type = spec["type"]
-		if suggest_type == "float":
-			params[name] = trial.suggest_float(
-				name, spec["low"], spec["high"], log=spec.get("log", False)
-			)
-		elif suggest_type == "int":
-			params[name] = trial.suggest_int(
-				name, spec["low"], spec["high"], log=spec.get("log", False)
-			)
-		elif suggest_type == "categorical":
-			params[name] = trial.suggest_categorical(name, spec["choices"])
-	return params
-
-def optuna_dist_from_suggested_params(search_space):
-	distributions = {}
-	for name, spec in search_space.items():
-		suggest_type = spec["type"]
-		if suggest_type == "float":
-			distributions[name] = optuna.distributions.FloatDistribution(
-				spec["low"], spec["high"], log=spec.get("log", False)
-			)
-		elif suggest_type == "int":
-			distributions[name] = optuna.distributions.IntDistribution(
-				spec["low"], spec["high"], log=spec.get("log", False)
-			)
-		elif suggest_type == "categorical":
-			distributions[name] = optuna.distributions.CategoricalDistribution( spec["choices"])
-	return distributions
-
-def generate_param_sets(num_trials, search_space, outfile=None):
-	study = optuna.create_study(direction="minimize", sampler=TPESampler(multivariate=True))
-	search_space = json.load(open(search_space))
-	trial_parameters = []
-	for _ in range(num_trials):
-		trial = study.ask()
-		params = suggest_params(trial, search_space)
-		study.tell(trial, 10.0 + torch.rand(1).item())  # Dummy objective value
-		trial_parameters.append(params)
-	if outfile is not None:
-		# Save all suggested parameters
-		with open(outfile, "w") as f:
-			json.dump(trial_parameters, f, indent=2)
-	
-	return trial_parameters
-
-def load_param_set(infile,trial_ids=[0]):
-	with open(infile, "r") as f:
-		trial_parameters = json.load(f)
-	return [trial_parameters[i] for i in trial_ids]
-
 def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, max_epochs = 200, threads:int=1, dual_head:bool=False):
 	""" Run training for a single trial with the given parameters."""
 
@@ -175,34 +111,15 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 			print(f"Early stopping triggered after {epoch + 1} epochs.")
 			break
 
-
-	
-
 if __name__ == "__main__":
 
 	parser = ap.ArgumentParser(description="GraphSAGE model for edge detection")
 
-	# parser.add_argument("--input", "-i",
-	# 	type=str,
-	# 	help="Path to the input graph data files (.pt)",
-	# 	metavar="file-pattern, comma-separated for multiple files",
-	# 	default=None
-	# )
 	parser.add_argument("--threads", "-t",
 		type=int,
 		help="Number of CPU threads to use",
 		default=1
 	)
-	# parser.add_argument("--val_fraction",
-	# 	type=float,
-	# 	default= 0.2,
-	# 	help= "Fraction of data for validation (rest for training)"
-	# )
-	# parser.add_argument("--epochs", "-e",
-	# 	type=int,
-	# 	help="Maximum number of training epochs",
-	# 	default=200
-	# )
 	parser.add_argument("--batch_size", "-b",
 		type=int,
 		help="Minibatch size for training",
@@ -337,27 +254,3 @@ if __name__ == "__main__":
 				"value": best_trial.value,
 				"user_attrs": best_trial.user_attrs
 			}, f, indent=2)
-
-
-	# if args.runmode == "G":
-	# 	if args.param_ranges is not None and args.input is not None:
-	# 		if args.trials_params is None:
-	# 			args.trials_params = f"{Path(args.param_ranges).with_suffix('')}_{args.num_trials}_trials.json"
-	# 		with open(args.param_ranges,"r") as f:
-	# 			search_space = json.load(f)
-	# 		generate_param_sets(args.num_trials, args.param_ranges, args.trials_params)
-	# 	else:
-	# 		print("Error: input file(s) not provided")
-
-	# 	input_graphs_filenames = []
-	# 	# Split input patterns and load graphs
-	# 	for pattern in args.input.split(","):
-	# 		input_graphs_filenames.extend(glob(pattern.strip()))
-
-	# 	_ = utils.load_data(
-	# 		input_graphs_filenames=input_graphs_filenames, 
-	# 		val_fraction=args.val_fraction, 
-	# 		save_graphs_to=args.training_data,
-	# 		device=device
-	# 	)
-	# 	sys.exit(0)

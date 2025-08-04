@@ -132,8 +132,10 @@ if __name__ == "__main__":
     parser.add_argument("--model", "-m", type=str, required=True, help="ESM model path use for embeddings.")
     parser.add_argument("--layers", type=int, default=33, help="Layer from which to extract embeddings.")
     parser.add_argument("--chunk_size", type=int, default=max_chunk_size, help="Size of the chunks to split the sequences into.")
-    parser.add_argument("--stride", type=int, default=1, help="Stride for chunking the sequences.")
-    parser.add_argument("--save_intermediate", action="store_true", help="Save intermediate results to disk.")
+    # parser.add_argument("--stride", type=int, default=1, help="Stride for chunking the sequences.")
+    parser.add_argument("--save_intermediate", help="Name of the pickle file to save intermediate results", default=None)
+    parser.add_argument("--load_intermediate", help="Name of the pickle file to load intermediate results", default=None)
+    parser.add_argument("--exit_point","-x", help = "Exit program after checkpoints, 0: Full execution, 1: Before ESM embeddings, 2: After ESM embeddings", choices=[0,1,2], default=0)
     args = parser.parse_args()
     
     if args.modelpath is not None:
@@ -149,7 +151,7 @@ if __name__ == "__main__":
         sequences = [line.strip().split("\t") for line in f if line.strip()]
     seqids, sequences = zip(*sequences)
     
-    sequence_batches, short_seqs = bucketize_sequences(
+    sequence_batches, short_seq_mask = bucketize_sequences(
         sequences, seqids,
         bucket_width=50,
         embedding_size=model.embed_dim + 1,
@@ -160,12 +162,22 @@ if __name__ == "__main__":
     )
 
     chunked_long_seqs = []
-
-    for seqindex in ~short_seqs.nonzero(as_tuple=True)[0]:
+    chunk_pos_embedding_temp = []
+    for seqindex in ~short_seq_mask.nonzero(as_tuple=True)[0]:
         seqid = seqids[seqindex]
         sequence = sequences[seqindex]
         stride = optimial_stride(len(sequence), args.chunk_size, factor=3)
         chunks, positional_embeddings = chunk_sequences_optimal(sequence, args.chunk_size, seqid=seqid, stride=stride)
         chunked_long_seqs.extend(chunks)
-
+        chunk_pos_embedding_temp.append(positional_embeddings)
     
+    chunked_positional_embeddings = torch.cat(chunk_pos_embedding_temp, dim = 0)
+
+    if args.exit_point == 1:
+        if args.save_intermediate is not None:
+            tensors_file = f"{Path(args.save_intermediate).with_suffix('')}_tensors.pt"
+            with open(args.save_intermediate,"wb") as f:
+                shortseqs = [(seqids[i],sequences[i]) for i in short_seq_mask.nonzero(as_tuple=True)[0]]
+                pickle.dump(f,shortseqs)
+                pickle.dump(f,chunked_long_seqs)
+            torch.save({"batches": sequence_batches, "shortseqmask" : short_seq_mask, "longchunked_pos_emb" : chunked_positional_embeddings}, tensors_file)
