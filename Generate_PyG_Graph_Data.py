@@ -69,26 +69,26 @@ if __name__ == "__main__":
 	target_nodes = []
 	edge_weights = []
 
-with open(args.edges, 'r') as f:
-	for line in f:
-		line = line.strip()
-		if not line or line.startswith('#'):
-			continue
-		parts = line.split('\t')
-		if len(parts) < 2:
-			raise ValueError(f"Invalid edge format: {line}")
-		if len(parts) > 2:
-			try:
-				edge_weight = float(parts[2])/1000
-			except ValueError:
-				raise ValueError(f"Invalid edge weight: {parts[2]}")
-		else:
-			edge_weight = 1.0
-		if parts[0] not in node_name_to_index or parts[1] not in node_name_to_index:
-			raise ValueError(f"Node names {parts[0]} or {parts[2]} not found in node embeddings.")
-		source_nodes.append(parts[0])
-		target_nodes.append(parts[1])
-		edge_weights.append(edge_weight)
+	with open(args.edges, 'r') as f:
+		for line in f:
+			line = line.strip()
+			if not line or line.startswith('#'):
+				continue
+			parts = line.split('\t')
+			if len(parts) < 2:
+				raise ValueError(f"Invalid edge format: {line}")
+			if len(parts) > 2:
+				try:
+					edge_weight = float(parts[2])/1000
+				except ValueError:
+					raise ValueError(f"Invalid edge weight: {parts[2]}")
+			else:
+				edge_weight = 1.0
+			if parts[0] not in node_name_to_index or parts[1] not in node_name_to_index:
+				raise ValueError(f"Node names {parts[0]} or {parts[2]} not found in node embeddings.")
+			source_nodes.append(parts[0])
+			target_nodes.append(parts[1])
+			edge_weights.append(edge_weight)
 
 	# Convert to PyTorch tensors
 	source_indices = [node_name_to_index[name] for name in source_nodes]
