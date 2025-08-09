@@ -4,7 +4,96 @@ import sys
 import torch
 import json
 import TrainUtils as utils
-from OptimizeHyperparams import run_training
+import optuna
+from optuna.storages import JournalStorage, JournalFileBackend
+
+def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_outfile, device:torch.device, max_epochs = 200, threads:int=1, dual_head:bool=False):
+	""" Run training for a single trial with the given parameters."""
+
+	centrality_fraction = params['centrality_fraction']
+	hidden_channels = 1024
+	dropout = params['dropout']
+	weight_decay = params['weight_decay']
+	patience = 20
+	scheduler_factor = params['scheduler_factor']
+	nbr_wt_intensity = params['nbr_weight_intensity']
+	GNN_head_weight = params['GNN_head_weight']
+	NOD_head_weight = 1- GNN_head_weight
+	head_weights = [GNN_head_weight, NOD_head_weight]
+
+	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
+
+	del dataset
+	gc.collect()
+	torch.cuda.empty_cache()
+
+	# Initialize model and optimizer
+	if dual_head:
+		model = utils.DualHeadModel(
+			in_channels=data_for_training[0]["input_channels"],
+			hidden_channels=hidden_channels,
+			dropout=dropout
+		).to(device)
+	else:
+		# Single head GNN model
+		model = utils.GraphSAGE(
+			in_channels=data_for_training[0]["input_channels"],
+			hidden_channels=hidden_channels,
+			dropout = dropout
+		).to(device)
+	optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=weight_decay)
+	scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+		optimizer= optimizer,
+		mode='min',
+		factor=scheduler_factor,
+		patience=10,
+		cooldown=2,
+		min_lr=1e-6
+	)
+	# Training loop
+	best_val_loss = float('inf')
+	best_train_loss = float('inf')
+	epochs_without_improvement = 0
+	early_stopping_epoch = max_epochs
+
+	for epoch in range(max_epochs):
+		total_train_loss = 0.0  # Reset total training loss for the epoch
+		total_val_loss = 0.0  # Reset total validation loss for the epoch
+		val_batch_count = 0
+		train_batch_count = 0
+		
+		for data in data_for_training:
+			# Training
+			model.train()
+			for batch in data["train_batch_loader"]:
+				train_batch_count += 1
+				total_train_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, head_weights=head_weights, is_training=True)
+
+			# Validation
+			model.eval()
+			with torch.no_grad():
+				for batch in data["val_batch_loader"]:
+					val_batch_count += 1
+					total_val_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, head_weights=head_weights, is_training=False)
+
+		# Average losses
+		average_train_loss = total_train_loss / train_batch_count
+		average_val_loss = total_val_loss / val_batch_count
+		scheduler.step(average_val_loss)
+
+		# Early stopping logic
+		if average_val_loss < best_val_loss:
+			best_val_loss = average_val_loss
+			epochs_without_improvement = 0
+			best_epoch = epoch
+			torch.save(model.state_dict(), model_outfile)
+		else:
+			epochs_without_improvement += 1
+		
+
+		if epochs_without_improvement >= patience:
+			print(f"Early stopping triggered after {epoch + 1} epochs.")
+			break
 
 if __name__ == "__main__":
 
@@ -15,9 +104,9 @@ if __name__ == "__main__":
 		help="Path to the data collection to retrain (.pt).",
 		metavar="<path/file>"
 	)
-	parser.add_argument("--parameters", "-p",
+	parser.add_argument("--trials",
 		type=str, required=True,
-		help="Path to the best hyperparameters file (json)",
+		help="Path to the trials file",
 		metavar="<path/file>"
 	)
 	parser.add_argument("--output", "-o",
@@ -45,8 +134,12 @@ if __name__ == "__main__":
 		parser.print_help() # Print the help message
 		sys.exit(1)
 
-	with open(args.parameters, "r") as f:
-		best_params = json.load(f)
+	storage = JournalStorage(JournalFileBackend(args.trials))
+
+	study = optuna.load_study(
+	name="PiPPINN_HPO",
+	storage=storage
+	)
 
 	if args.threads > 1:
 		torch.set_num_threads(args.threads)
@@ -57,13 +150,13 @@ if __name__ == "__main__":
 
 	input_data = torch.load(args.input_data, weights_only=False)
 
+	best_params = study.best_trial.params
+
 	# Retrain the model with the best hyperparameters
 	print("Retraining the model with the best hyperparameters...")
 
 	# Initialize the model with the best hyperparameters
 
-	results, best_model = run_training(best_params, input_data, args.batch_size, device=device)
+	run_training(params=best_params, dataset=input_data, batch_size=40000, num_batches=None, device=device, model_outfile= args.output, threads=5, dual_head=True)
 	
-	torch.save(best_model.state_dict(), "args.output")
-
 	print(f"Retraining complete. Best model saved as {args.output}.")
