@@ -5,7 +5,9 @@ import torch
 import json
 import TrainUtils as utils
 import optuna
-from optuna.storages import JournalStorage, JournalFileBackend
+from optuna.storages import JournalStorage
+from optuna.storages.journal import JournalFileBackend
+import gc
 
 def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_outfile, device:torch.device, max_epochs = 200, threads:int=1, dual_head:bool=False):
 	""" Run training for a single trial with the given parameters."""
@@ -119,11 +121,6 @@ if __name__ == "__main__":
 		help="Number of CPU threads to use",
 		default=1
 	)
-	parser.add_argument("--epochs", "-e",
-		type=int,
-		help="Number of training epochs",
-		default=50
-	)
 
 	args = parser.parse_args()
 
@@ -137,8 +134,8 @@ if __name__ == "__main__":
 	storage = JournalStorage(JournalFileBackend(args.trials))
 
 	study = optuna.load_study(
-	name="PiPPINN_HPO",
-	storage=storage
+		study_name="PiPPINN_HPO",
+		storage=storage
 	)
 
 	if args.threads > 1:
@@ -152,11 +149,16 @@ if __name__ == "__main__":
 
 	best_params = study.best_trial.params
 
+	best_params_file = Path(args.output).parent.joinpath("Best_Params.json")
+
+	with open(best_params_file,"w") as f:
+		json.dump(best_params, f, indent=2)
+
 	# Retrain the model with the best hyperparameters
 	print("Retraining the model with the best hyperparameters...")
 
 	# Initialize the model with the best hyperparameters
 
-	run_training(params=best_params, dataset=input_data, batch_size=40000, num_batches=None, device=device, model_outfile= args.output, threads=5, dual_head=True)
+	run_training(params=best_params, dataset=input_data, batch_size=40000, num_batches=None, device=device, model_outfile= args.output, threads=args.threads, dual_head=True)
 	
 	print(f"Retraining complete. Best model saved as {args.output}.")

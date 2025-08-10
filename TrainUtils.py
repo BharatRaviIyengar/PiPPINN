@@ -28,7 +28,7 @@ class NodeOnlyDecoder(nn.Module):
 				torch.Tensor: Output edge features.
 	"""
 
-	def __init__(self, in_channels, hidden_channels=[2048, 1024, 512], dropout=0.0):
+	def __init__(self, in_channels, hidden_channels, dropout=0.0):
 		""" Initializes the NodeOnlyDecoder.
 		Args:
 			in_channels (int): Number of input features per node.
@@ -36,8 +36,6 @@ class NodeOnlyDecoder(nn.Module):
 		"""
 		super().__init__()
 		self.in_channels = in_channels*2
-		if hidden_channels is None:
-			hidden_channels = [2048, 1024, 512]
 		self.hidden_channels = hidden_channels
 		self.dropout = dropout
 		self.dims = [self.in_channels] + self.hidden_channels + [1]
@@ -48,7 +46,7 @@ class NodeOnlyDecoder(nn.Module):
 		layers = []
 		for i in range(len(self.dims) - 2):
 			layers.append(nn.Linear(self.dims[i], self.dims[i + 1]))
-			layers.append(nn.BatchNorm1d(self.dims[i + 1]))
+			layers.append(nn.LayerNorm(self.dims[i + 1]))
 			layers.append(nn.ReLU())
 			if self.dropout > 0:
 				layers.append(nn.Dropout(p=self.dropout))
@@ -83,16 +81,16 @@ class Pool_SAGEConv(nn.Module):
 				torch.Tensor: Output node features after aggregation.
 	"""
 
-	def __init__(self, in_channels, out_channels, message_passing=True):
+	def __init__(self, in_channels, out_channels):
 		super().__init__()
 		
 		# Linear fully connected pooling
 		self.pool = nn.Linear(in_channels, in_channels)
-		self.BN_pool = nn.BatchNorm1d(in_channels)
+		self.LN_pool = nn.LayerNorm(in_channels)
 
 		# Final linear layer after aggregation
 		self.final_lin = nn.Linear(in_channels * 2, out_channels)
-		self.BN_final = nn.BatchNorm1d(out_channels)
+		self.LN_final = nn.LayerNorm(out_channels)
 
 		# Learnable parameter that controls how much the edge weight influences message aggregation
 		self.edge_weight_message_coefficient = nn.Parameter(torch.tensor(0.5))
@@ -105,7 +103,7 @@ class Pool_SAGEConv(nn.Module):
 
 		# Pool and activate neighbor messages
 		pooled = self.pool(edge_features)
-		pooled = self.BN_pool(pooled)
+		pooled = self.LN_pool(pooled)
 		pooled = ReLU(pooled)
 		
 		# Aggregate neighbor messages via max
@@ -114,16 +112,10 @@ class Pool_SAGEConv(nn.Module):
 		# Concatenate self-representation and aggregated neighbors
 		h = torch.cat([x, aggregate], dim=-1)
 		h = self.final_lin(h)
-		h = self.BN_final(h)
+		h = self.LN_final(h)
 		# Final transformation
 		return ReLU(h)
 		
-		
-	# def forward_without_message_pooling(self, x, edge_index, edge_weight):
-	# 	h = torch.cat([x, torch.zeros_like(x)], dim=-1)
-	# 	# Final transformation
-	# 	return ReLU(self.final_lin(h))
-
 
 class GraphSAGE(nn.Module):
 	"""
@@ -145,13 +137,8 @@ class GraphSAGE(nn.Module):
 		self.conv1 = Pool_SAGEConv(in_channels, hidden_channels)
 		self.conv2 = Pool_SAGEConv(hidden_channels, hidden_channels)
 
-		# Edge prediction head
-		self.edge_pred = nn.Linear(2*self.hidden_channels, 1)
-		self.edge_weight_pred = nn.Linear(2*self.hidden_channels, 1)
-		
 
-
-	def forward(self, x, supervision_edges, message_edges, message_edgewt=None):
+	def forward(self, x, message_edges, message_edgewt=None):
 		"""
 		Forward logic with message passing.
 		"""
@@ -164,51 +151,61 @@ class GraphSAGE(nn.Module):
 
 		x = self.conv2(x, message_edges, message_edgewt)
 		x = self.dropout(x)
-
-		# Predict edges
-		add = x[supervision_edges[0]] + x[supervision_edges[1]]
-		prod = x[supervision_edges[0]] * x[supervision_edges[1]]
-		edge_embeddings = torch.cat([add, prod], dim=-1)
-		edge_weights = ReLU(self.edge_weight_pred(edge_embeddings))
-		edge_predictor = self.edge_pred(edge_embeddings)
-		return edge_weights, edge_predictor
+		return x
 	
-class DualHeadModel(nn.Module):
+class DualLayerModel(nn.Module):
 	"""
-	Model with two heads: a GNN-based head and a node-only decoder head.
+	Model with two layers: a Node-Only Decoder and a Graph Neural Network.
 
 	Args:
 		in_channels (int): Number of input features per node.
 		hidden_channels (int): Number of hidden features per node.
 		dropout (float, optional): Dropout rate.
 	"""
-	def __init__(self, in_channels, hidden_channels, dropout=0.0, pred_head = None):
+	def __init__(self, in_channels, hidden_channels = [2048, 2048, 1024, 1024], dropout=0.0, gnn_dropout = 0.2):
 		super().__init__()
-		self.GNN = GraphSAGE(in_channels=in_channels, hidden_channels=hidden_channels, dropout=dropout)
-		self.NOD = NodeOnlyDecoder(in_channels=in_channels, dropout=dropout)
+		self.layer_norm_input = nn.LayerNorm(in_channels)
+		self.NOD = NodeOnlyDecoder(in_channels=in_channels, hidden_channels=hidden_channels, dropout=dropout)
+		self.GNN = GraphSAGE(in_channels=in_channels, hidden_channels=in_channels, dropout=dropout)
+		self.gnn_dropout = gnn_dropout
 
-		if pred_head == "gnn":
-			self.forward = self.forward_gnn
-		elif pred_head == "nod":
-			self.forward = self.forward_nod
-		else:
-			self.DualOutput = namedtuple("DualOutput", ["gnn", "nod"])
-			self.forward = self.forward_both
-
-	def forward_gnn(self, x, supervision_edges, message_edges, message_edgewt=None):
-		return self.GNN(x, supervision_edges, message_edges, message_edgewt)
-
-	def forward_nod(self, x, supervision_edges, message_edges=None, message_edgewt=None):
+	def forward(self, x, supervision_edges, message_edges, message_edgewt=None):
+		x = self.layer_norm_input(x)
+		if torch.rand(1) >= self.gnn_dropout:
+			x = self.GNN(x, message_edges, message_edgewt)
 		return self.NOD(x, supervision_edges)
-	
-	def forward_both(self, x, supervision_edges, message_edges, message_edgewt=None):
-		outputs = self.DualOutput(
-			gnn = self.GNN(x, supervision_edges, message_edges, message_edgewt),
-			nod = self.NOD(x, supervision_edges)
-		)
-		return outputs
 
 	
+class DecayScheduler:
+	def __init__(self, model, attr_name, initial_val, factor=0.8, cooldown=2, min_val=0.1):
+		"""
+		Simple scheduler that decays a dropout attribute by factor every epoch after cooldown.
+		
+		Args:
+			model: nn.Module with dropout attribute to modify.
+			attr_name: str, exact attribute name (e.g. 'gnn_dropout').
+			initial_val: float, starting dropout val.
+			factor: float, decay multiplier per epoch after cooldown.
+			cooldown: int, epochs to wait before starting decay.
+			min_val: float, minimum dropout val allowed.
+		"""
+		self.model = model
+		self.attr_name = attr_name
+		self.factor = factor
+		self.cooldown = cooldown
+		self.min_val = min_val
+		self.epoch = 0
+		self.current_val = initial_val
+		setattr(self.model, self.attr_name, self.current_val)
+
+	def step(self):
+		self.epoch += 1
+		if self.epoch > self.cooldown:
+			new_val = max(self.min_val, self.current_val * self.factor)
+			if new_val < self.current_val:
+				self.current_val = new_val
+				setattr(self.model, self.attr_name, self.current_val)
+				print(f"Parameter {self.attr_name} decayed to {self.current_val:.4f} at epoch {self.epoch}")
 
 	
 class EdgeSampler(torch.utils.data.IterableDataset):
@@ -242,6 +239,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			  max_neighbors = 30,
 			  frac_sample_from_unsampled=0.1,
 			  nbr_weight_intensity=1.0,
+				edge_dropout = 0.2,
 			  device=None,
 			  threads=1):  
 		super().__init__()
@@ -261,6 +259,9 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.num_supervision_edges = int(self.batch_size * self.supervision_fraction)
 		self.num_message_edges = self.batch_size - self.num_supervision_edges
 		self.threads = threads
+
+		assert (1 - self.centrality_fraction) >= self.supervision_fraction, "Supervision edges should always be sampled uniformly. The number of uniformly sampled edges in the batch should be at least as much as the number of supervision edges"
+
 
 		# Ensure node indices and edge_attributes are compatible with edge list  
 		if self.node_embeddings is not None and self.total_positive_nodes > self.node_embeddings.size(0):  
@@ -311,13 +312,15 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		# Node mask to track nodes in the batch
 		self.node_mask = torch.zeros(self.max_nodes, dtype=torch.bool, device=self.device)  
 		# Track unsampled edges
-		self.unsampled_edges = torch.ones(self.total_positive_edges, dtype=torch.bool, device = self.device)  
+		self.unsampled_edges = torch.ones(self.total_positive_edges, dtype=torch.bool, device = self.device)
 		# Tensor of ones for uniform random sampling
 		self.uniform_probs = torch.ones(self.total_positive_edges, device = self.device)  
 		# Masking edges sampled based on centrality
 		self.strata_mask_hubs = torch.ones(self.total_positive_edges, dtype=torch.bool, device = self.device)
 		# Indices of positive edges		
 		self.positive_edge_idx = torch.arange(self.total_positive_edges, device = self.device) 
+		# Track uniformly sampled edges
+		self.is_uniform_edge = torch.zeros(self.batch_size, dtype=torch.bool)
 		# Mask for supervision edges
 		self.supervision_edge_mask = torch.zeros(self.batch_size, dtype = torch.bool, device = self.device)
 		# Number of supervision edges positive and message edges
@@ -374,24 +377,26 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		Returns:
 			torch.Tensor: Indices of sampled positive edges for the batch (shape: [sample_size]).
 		"""
+		self.strata_mask_hubs.fill_(True)
+		self.is_uniform_edge.fill_(False)
 		centrality_batch_size = int(sample_size * self.centrality_fraction)
-		uniform_batch_size = sample_size - centrality_batch_size  
+		uniform_batch_size = sample_size - centrality_batch_size
+
+		# Uniform sampling
+		uniform_sampled_edges = torch.multinomial(self.uniform_probs, uniform_batch_size, replacement = False)
+		self.strata_mask_hubs[uniform_sampled_edges] = False
 
 		# Centrality-based sampling  
-		centrality_sampled_edges = torch.multinomial(self.edge_centrality_scores, centrality_batch_size, replacement=False)  
-		self.strata_mask_hubs[centrality_sampled_edges] = False  
+		centrality_sampled_indices = torch.multinomial(self.edge_centrality_scores[self.strata_mask_hubs], centrality_batch_size, replacement=False)
+		centrality_sampled_edges = self.positive_edge_idx[self.strata_mask_hubs][centrality_sampled_indices]
 
-		# Uniform sampling from the rest  
-		uniform_sampled_indices = torch.multinomial(self.uniform_probs[self.strata_mask_hubs], uniform_batch_size, replacement=False)  
-		uniform_sampled_edges = self.positive_edge_idx[self.strata_mask_hubs][uniform_sampled_indices]  
-		self.strata_mask_hubs.fill_(True) 
-
-		self.positive_batch_indices[:centrality_batch_size] = centrality_sampled_edges
-		self.positive_batch_indices[centrality_batch_size:sample_size] = uniform_sampled_edges
+		self.positive_batch_indices[:uniform_batch_size] = uniform_sampled_edges
+		self.is_uniform_edge[:uniform_batch_size] = True
+		self.positive_batch_indices[uniform_batch_size:sample_size] = centrality_sampled_edges
 		return self.positive_batch_indices  
 
 	def sample_edges_strata_total(self):  
-		sampled_edges = self.sample_edges_strata(self.batch_size)  
+		sampled_edges = self.sample_edges_strata(self.batch_size)
 		return sampled_edges  
 		
 	def sample_edges_strata_with_unsampled_tracking(self):  
@@ -430,9 +435,15 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			original_indices = unsampled_edge_indices[sampled_from_unsampled]
 			self.unsampled_edges[original_indices] = False
 
+			# Mark these edges as being uniformly sampled
+			self.is_uniform_edge[num_sample_from_total:self.batch_size] = True
+
 		else:
 			# Fill all unsampled edges
 			self.positive_batch_indices[num_sample_from_total:num_sample_from_total + num_unsampled] = unsampled_edge_indices
+
+			# Mark these edges as being uniformly sampled
+			self.is_uniform_edge[num_sample_from_total:num_sample_from_total + num_unsampled] = True
 
 			# Mark all unsampled edges as used
 			self.unsampled_edges.fill_(False) 
@@ -447,6 +458,9 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 				# Fill the remaining slots in the preallocated buffer
 				self.positive_batch_indices[-num_resample_from_total:] = self.positive_edge_idx[resampled_from_total]
+
+				# Mark these edges as being uniformly sampled
+				self.is_uniform_edge[-num_resample_from_total:] = True
 
 		return self.positive_batch_indices
 
@@ -473,8 +487,11 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		# Define supervision edges 
 		self.supervision_edge_mask.fill_(False)
 
-		# Sample supervision edges  
-		supervision_positive_idx = torch.multinomial(self.uniform_probs[:self.batch_size], self.num_supervision_edges, replacement=False)  
+		# Sample supervision edges
+		uniform_edges = self.is_uniform_edge.nonzero(as_tuple=False).view(-1)
+		if self.unsampled_edges.any():
+			uniform_edges = uniform_edges[torch.randperm(uniform_edges.size(0), device=uniform_edges.device)]
+		supervision_positive_idx = uniform_edges[:self.num_supervision_edges]
 		self.supervision_edge_mask[supervision_positive_idx] = True  
 
 		# Sample negative edges 

@@ -14,6 +14,22 @@ from optuna.pruners import HyperbandPruner
 from glob import glob
 import gc
 
+def generate_hidden_dims(depth, last_layer_size):
+	n_layers = depth - 1  # intermediate layers count (excluding first)
+	start_size = 2048
+
+	if n_layers == 0:
+		return []  # no intermediate layers, just input and last layer
+
+	decay_factor = (last_layer_size / start_size) ** (1 / n_layers)
+	sizes = []
+	for i in range(1, n_layers):
+		size = int(start_size * (decay_factor ** i))
+		sizes.append(size)
+	return sizes
+
+
+
 def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, max_epochs = 200, threads:int=1, dual_head:bool=False):
 	""" Run training for a single trial with the given parameters."""
 
@@ -24,9 +40,8 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	patience = 20
 	scheduler_factor = params['scheduler_factor']
 	nbr_wt_intensity = params['nbr_weight_intensity']
-	GNN_head_weight = params['GNN_head_weight']
-	NOD_head_weight = 1- GNN_head_weight
-	head_weights = [GNN_head_weight, NOD_head_weight]
+	hidden_channels = params['hidden_channels']
+	GNN_dropout_factor = params['GNN_dropout_factor']
 
 	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
 
@@ -35,19 +50,12 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	torch.cuda.empty_cache()
 
 	# Initialize model and optimizer
-	if dual_head:
-		model = utils.DualHeadModel(
+	model = utils.DualLayerModel(
 			in_channels=data_for_training[0]["input_channels"],
 			hidden_channels=hidden_channels,
 			dropout=dropout
 		).to(device)
-	else:
-		# Single head GNN model
-		model = utils.GraphSAGE(
-			in_channels=data_for_training[0]["input_channels"],
-			hidden_channels=hidden_channels,
-			dropout = dropout
-		).to(device)
+	
 	optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=weight_decay)
 	scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 		optimizer= optimizer,
@@ -57,6 +65,9 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		cooldown=2,
 		min_lr=1e-6
 	)
+
+	GNN_dropout_scheduler = utils.DecayScheduler(model, 'gnn_dropout', initial_val=0.5, factor=GNN_dropout_factor, cooldown=2, min_val=0.05)
+
 	# Training loop
 	best_val_loss = float('inf')
 	best_train_loss = float('inf')
@@ -203,13 +214,17 @@ if __name__ == "__main__":
 		best_val_loss = float('inf')
 		best_train_loss = float('inf')
 		early_stopping_epoch = 0
+		depth = trial.suggest_int("depth", 3, 5)
+		last_layer_size = trial.suggest_categorical("last_layer_size", [512, 1024])
+		hidden_channels = generate_hidden_dims(depth, last_layer_size) + [last_layer_size]
 		params = {
-			"centrality_fraction": trial.suggest_float("centrality_fraction", 0.1, 0.5, log=True),
-			"dropout": trial.suggest_float("dropout", 0.15, 0.35),
+			"centrality_fraction": trial.suggest_float("centrality_fraction", 0.2, 0.69, log=True),
+			"dropout": trial.suggest_float("dropout", 0.1, 0.35),
 			"weight_decay": trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True),
 			"scheduler_factor": trial.suggest_float("scheduler_factor", 0.1, 0.5),
-			"nbr_weight_intensity": trial.suggest_float("nbr_weight_intensity", 0.5, 2.0, log=True),
-			"GNN_head_weight": trial.suggest_float("GNN_head_weight", 0.3, 0.7, log=True)
+			"nbr_weight_intensity": trial.suggest_float("nbr_weight_intensity", 0.4, 2.5, log=True),
+			"GNN_dropout_factor": trial.suggest_float("GNN_dropout_factor", 0.1, 0.9, log=True),
+			"hidden_channels" : hidden_channels
 		}
 		for result in run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads, dual_head=args.dual_head):
 			epoch = result["epoch"]
