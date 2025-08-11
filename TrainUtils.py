@@ -177,35 +177,35 @@ class DualLayerModel(nn.Module):
 
 	
 class DecayScheduler:
-	def __init__(self, model, attr_name, initial_val, factor=0.8, cooldown=2, min_val=0.1):
+	def __init__(self, model, attr_name, initial_value, factor=0.8, cooldown=2, min_value=0.1):
 		"""
-		Simple scheduler that decays a dropout attribute by factor every epoch after cooldown.
+		Simple scheduler that decays a parameter by a factor every epoch after cooldown.
 		
 		Args:
-			model: nn.Module with dropout attribute to modify.
+			model: nn.Module with parameter to modify.
 			attr_name: str, exact attribute name (e.g. 'gnn_dropout').
-			initial_val: float, starting dropout val.
+			initial_value: float, starting value.
 			factor: float, decay multiplier per epoch after cooldown.
 			cooldown: int, epochs to wait before starting decay.
-			min_val: float, minimum dropout val allowed.
+			min_value: float, minimum dropout value allowed.
 		"""
 		self.model = model
 		self.attr_name = attr_name
 		self.factor = factor
 		self.cooldown = cooldown
-		self.min_val = min_val
+		self.min_value = min_value
 		self.epoch = 0
-		self.current_val = initial_val
-		setattr(self.model, self.attr_name, self.current_val)
+		self.current_value = initial_value
+		setattr(self.model, self.attr_name, self.current_value)
 
 	def step(self):
 		self.epoch += 1
 		if self.epoch > self.cooldown:
-			new_val = max(self.min_val, self.current_val * self.factor)
-			if new_val < self.current_val:
-				self.current_val = new_val
-				setattr(self.model, self.attr_name, self.current_val)
-				print(f"Parameter {self.attr_name} decayed to {self.current_val:.4f} at epoch {self.epoch}")
+			new_value = max(self.min_value, self.current_value * self.factor)
+			if new_value < self.current_value:
+				self.current_value = new_value
+				setattr(self.model, self.attr_name, self.current_value)
+				print(f"Parameter {self.attr_name} decayed to {self.current_value:.4f} at epoch {self.epoch}")
 
 	
 class EdgeSampler(torch.utils.data.IterableDataset):
@@ -828,7 +828,7 @@ def calculate_loss(model_output, data, head_weights = [0.5, 0.5]):
 		total_loss = total_loss + w * loss
 	return total_loss
 
-def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, head_weights = [0.5, 0.5], is_training=False):
+def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False):
 	"""
     Processes a single batch for training or validation.
 
@@ -855,7 +855,7 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	else:
 		conditional_backward = lambda loss: None  # No-op for validation
 
-	model_output = model(
+	edge_probability, edge_weight_pred = model(
 		data.node_features,
 		message_edges=data.message_edges,
 		supervision_edges=data.supervision_edges,
@@ -863,8 +863,9 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	)
 	
 	# Compute BCE and MSE losses
-
-	loss = calculate_loss(model_output, data, head_weights)
+	loss = bce_loss(edge_probability.squeeze(-1), data.supervision_labels, weight=data.supervision_importance) + mse_loss(edge_weight_pred.squeeze(-1), data.supervision_edgewts)
+	
+	# loss = calculate_loss(model_output, data, head_weights)
 	conditional_backward(loss)
 
 	if is_training:

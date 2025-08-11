@@ -30,11 +30,10 @@ def generate_hidden_dims(depth, last_layer_size):
 
 
 
-def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, max_epochs = 200, threads:int=1, dual_head:bool=False):
+def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, max_epochs = 200, threads:int=1):
 	""" Run training for a single trial with the given parameters."""
 
 	centrality_fraction = params['centrality_fraction']
-	hidden_channels = 1024
 	dropout = params['dropout']
 	weight_decay = params['weight_decay']
 	patience = 20
@@ -42,7 +41,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	nbr_wt_intensity = params['nbr_weight_intensity']
 	hidden_channels = params['hidden_channels']
 	GNN_dropout_factor = params['GNN_dropout_factor']
-
+	
 	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
 
 	del dataset
@@ -53,7 +52,8 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	model = utils.DualLayerModel(
 			in_channels=data_for_training[0]["input_channels"],
 			hidden_channels=hidden_channels,
-			dropout=dropout
+			dropout=dropout,
+			gnn_dropout=0.5
 		).to(device)
 	
 	optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=weight_decay)
@@ -66,7 +66,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		min_lr=1e-6
 	)
 
-	GNN_dropout_scheduler = utils.DecayScheduler(model, 'gnn_dropout', initial_val=0.5, factor=GNN_dropout_factor, cooldown=2, min_val=0.05)
+	GNN_dropout_scheduler = utils.DecayScheduler(model, 'gnn_dropout', initial_value=0.5, factor=GNN_dropout_factor, cooldown=2, min_value=0.05)
 
 	# Training loop
 	best_val_loss = float('inf')
@@ -85,19 +85,20 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 			model.train()
 			for batch in data["train_batch_loader"]:
 				train_batch_count += 1
-				total_train_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, head_weights=head_weights, is_training=True)
+				total_train_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=True)
 
 			# Validation
 			model.eval()
 			with torch.no_grad():
 				for batch in data["val_batch_loader"]:
 					val_batch_count += 1
-					total_val_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, head_weights=head_weights, is_training=False)
+					total_val_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=False)
 
 		# Average losses
 		average_train_loss = total_train_loss / train_batch_count
 		average_val_loss = total_val_loss / val_batch_count
 		scheduler.step(average_val_loss)
+		GNN_dropout_scheduler.step()
 
 		# Early stopping logic
 		if average_val_loss < best_val_loss:
@@ -114,7 +115,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		"average_val_loss": average_val_loss,
 		"best_val_loss": best_val_loss,
 		"best_train_loss": best_train_loss,
-		"early_stopping epoch": early_stopping_epoch,
+		"early_stopping_epoch": early_stopping_epoch,
 		"learning_rate": optimizer.param_groups[0]['lr'],
 		}
 		
@@ -149,16 +150,12 @@ if __name__ == "__main__":
 	parser.add_argument("--num_trials","-n",
 		type=int,
 		help="Number of trials to generate",
-		default=100
+		default=50
 	)
 	parser.add_argument("--params_best",
 		type=str,
 		help="Output File for best hyperparameters (json)",
 		default=None
-	)
-	parser.add_argument("--dual_head",
-		action="store_true",
-		help="Use dual head model for training (default: False)"
 	)
 	parser.add_argument("--journal_file",
 		type=str,
@@ -226,12 +223,12 @@ if __name__ == "__main__":
 			"GNN_dropout_factor": trial.suggest_float("GNN_dropout_factor", 0.1, 0.9, log=True),
 			"hidden_channels" : hidden_channels
 		}
-		for result in run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads, dual_head=args.dual_head):
+		for result in run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads):
 			epoch = result["epoch"]
 			average_val_loss = result["average_val_loss"]
 			best_val_loss = result["best_val_loss"]
 			best_train_loss = result["best_train_loss"]
-			early_stopping_epoch = result["early_stopping epoch"]
+			early_stopping_epoch = result["early_stopping_epoch"]
 			for key, value in result.items():
 				print(f"Epoch {epoch}: {key} = {value}")
 			trial.report(average_val_loss, step=epoch)
@@ -251,14 +248,15 @@ if __name__ == "__main__":
 		pruner=pruner
 	)
 
-	
 	study.enqueue_trial({
 	'centrality_fraction': 0.45589735003901094,
-	'dropout': 0.319782872298281,
-	'weight_decay': 0.00011011691973337221,
-	'scheduler_factor': 0.30738592097342027,
-	'nbr_weight_intensity': 1.9702720585607403,
-	'GNN_head_weight': 0.3133970264487372
+	'dropout': 0.16420606520470202,
+	'weight_decay': 0.0001626652992684521,
+	'scheduler_factor': 0.47550505803526766,
+	'nbr_weight_intensity': 1.445,
+	'GNN_dropout_factor': 0.2,
+	'depth' : 4,
+	'last_layer_size': 1024
 })
 	study.optimize(objective, n_trials=args.num_trials, callbacks=[early_stop_callback])
 	best_trial = study.best_trial
