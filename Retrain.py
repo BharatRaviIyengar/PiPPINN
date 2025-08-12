@@ -30,19 +30,13 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 	torch.cuda.empty_cache()
 
 	# Initialize model and optimizer
-	if dual_head:
-		model = utils.DualHeadModel(
+	model = utils.DualLayerModel(
 			in_channels=data_for_training[0]["input_channels"],
 			hidden_channels=hidden_channels,
-			dropout=dropout
+			dropout=dropout,
+			gnn_dropout=0.5
 		).to(device)
-	else:
-		# Single head GNN model
-		model = utils.GraphSAGE(
-			in_channels=data_for_training[0]["input_channels"],
-			hidden_channels=hidden_channels,
-			dropout = dropout
-		).to(device)
+	
 	optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=weight_decay)
 	scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 		optimizer= optimizer,
@@ -52,6 +46,9 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 		cooldown=2,
 		min_lr=1e-6
 	)
+
+	GNN_dropout_scheduler = utils.DecayScheduler(model, 'gnn_dropout', initial_value=0.5, factor=GNN_dropout_factor, cooldown=2, min_value=0.05)
+
 	# Training loop
 	best_val_loss = float('inf')
 	best_train_loss = float('inf')
@@ -69,23 +66,25 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 			model.train()
 			for batch in data["train_batch_loader"]:
 				train_batch_count += 1
-				total_train_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, head_weights=head_weights, is_training=True)
+				total_train_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=True)
 
 			# Validation
 			model.eval()
 			with torch.no_grad():
 				for batch in data["val_batch_loader"]:
 					val_batch_count += 1
-					total_val_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, head_weights=head_weights, is_training=False)
+					total_val_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=False)
 
 		# Average losses
 		average_train_loss = total_train_loss / train_batch_count
 		average_val_loss = total_val_loss / val_batch_count
 		scheduler.step(average_val_loss)
+		GNN_dropout_scheduler.step()
 
 		# Early stopping logic
 		if average_val_loss < best_val_loss:
 			best_val_loss = average_val_loss
+			best_train_loss = average_train_loss
 			epochs_without_improvement = 0
 			best_epoch = epoch
 			torch.save(model.state_dict(), model_outfile)
@@ -96,6 +95,8 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 		if epochs_without_improvement >= patience:
 			print(f"Early stopping triggered after {epoch + 1} epochs.")
 			break
+	
+	return {"best_val_loss" : best_val_loss, "best_train_loss" : best_train_loss, "best_epoch" : best_epoch}
 
 if __name__ == "__main__":
 
@@ -159,6 +160,11 @@ if __name__ == "__main__":
 
 	# Initialize the model with the best hyperparameters
 
-	run_training(params=best_params, dataset=input_data, batch_size=40000, num_batches=None, device=device, model_outfile= args.output, threads=args.threads, dual_head=True)
+	out = run_training(params=best_params, dataset=input_data, batch_size=40000, num_batches=None, device=device, model_outfile= args.output, threads=args.threads)
+
+	model_stats = f"{Path(args.output).with_suffix('')}_outstats.json"
+
+	with open(model_stats,"w") as f:
+		json.dump(out, f, indent=2)
 	
-	print(f"Retraining complete. Best model saved as {args.output}.")
+	print(f"Retraining complete. Best model saved as {args.output} and its loss stats in {model_stats}")
