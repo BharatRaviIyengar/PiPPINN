@@ -248,16 +248,6 @@ if __name__ == "__main__":
 		pruner=pruner
 	)
 
-	study.enqueue_trial({
-	'centrality_fraction': 0.45589735003901094,
-	'dropout': 0.16420606520470202,
-	'weight_decay': 0.0001626652992684521,
-	'scheduler_factor': 0.47550505803526766,
-	'nbr_weight_intensity': 1.445,
-	'GNN_dropout_factor': 0.2,
-	'depth' : 4,
-	'last_layer_size': 1024
-})
 	study.optimize(objective, n_trials=args.num_trials, callbacks=[early_stop_callback])
 	best_trial = study.best_trial
 	if study.best_trial.number == 0:
