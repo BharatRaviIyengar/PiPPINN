@@ -13,16 +13,14 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 	""" Run training for a single trial with the given parameters."""
 
 	centrality_fraction = params['centrality_fraction']
-	hidden_channels = 1024
 	dropout = params['dropout']
 	weight_decay = params['weight_decay']
 	patience = 20
 	scheduler_factor = params['scheduler_factor']
 	nbr_wt_intensity = params['nbr_weight_intensity']
-	GNN_head_weight = params['GNN_head_weight']
-	NOD_head_weight = 1- GNN_head_weight
-	head_weights = [GNN_head_weight, NOD_head_weight]
-
+	hidden_channels = params['hidden_channels']
+	GNN_dropout_factor = params['GNN_dropout_factor']
+	
 	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
 
 	del dataset
