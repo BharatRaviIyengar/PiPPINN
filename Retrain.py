@@ -9,7 +9,21 @@ from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 import gc
 
-def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_outfile, device:torch.device, max_epochs = 200, threads:int=1, dual_head:bool=False):
+def generate_hidden_dims(depth, last_layer_size):
+	n_layers = depth - 1  # intermediate layers count (excluding first)
+	start_size = 2048
+
+	if n_layers == 0:
+		return []  # no intermediate layers, just input and last layer
+
+	decay_factor = (last_layer_size / start_size) ** (1 / n_layers)
+	sizes = []
+	for i in range(1, n_layers):
+		size = int(start_size * (decay_factor ** i))
+		sizes.append(size)
+	return sizes
+
+def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_outfile, device:torch.device, max_epochs = 200, threads:int=1):
 	""" Run training for a single trial with the given parameters."""
 
 	centrality_fraction = params['centrality_fraction']
@@ -18,8 +32,9 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 	patience = 20
 	scheduler_factor = params['scheduler_factor']
 	nbr_wt_intensity = params['nbr_weight_intensity']
-	hidden_channels = params['hidden_channels']
 	GNN_dropout_factor = params['GNN_dropout_factor']
+
+	hidden_channels = generate_hidden_dims(params['depth'], params['last_layer_size']) + [params['last_layer_size']]
 	
 	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
 
@@ -51,7 +66,7 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 	best_val_loss = float('inf')
 	best_train_loss = float('inf')
 	epochs_without_improvement = 0
-	early_stopping_epoch = max_epochs
+	best_epoch = 0
 
 	for epoch in range(max_epochs):
 		total_train_loss = 0.0  # Reset total training loss for the epoch
