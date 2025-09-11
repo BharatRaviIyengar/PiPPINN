@@ -374,3 +374,17 @@ if __name__ == "__main__":
 	plt.grid()
 	plt.savefig("calibration_curves.svg")
 	plt.close()
+
+	# Save results to CSV
+	import csv
+	with open("evaluation_results.csv", mode='w', newline='') as file:
+		writer = csv.writer(file)
+		writer.writerow(["Metric", "NOD Model", "GNN Model"])
+		for key in results_NOD.keys():
+			if key == "CalibrationCurve":
+				continue
+			if key == "ConfusionMatrix":
+				metrics = ["TN", "FP", "FN", "TP"]
+				writer.writerow([metrics, *results_NOD[key].flatten(), *results_GNN[key].flatten()])
+			else:
+				writer.writerow([key, results_NOD[key], results_GNN[key]])
