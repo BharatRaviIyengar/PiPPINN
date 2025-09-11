@@ -50,7 +50,6 @@ class BatchLoader(IterableDataset):
 			negative_edges,
 			positive_edgewts,
 			batch_size,
-			num_batches = None,
 			coverage_fraction = 0.2,
 			device = torch.device('cuda'),
 			threads = 1,
