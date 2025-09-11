@@ -40,9 +40,9 @@ class SimpleDataset(Dataset):
 		super().__init__()
 		self.data = data
 	def __len__(self):
-		return 1
+		return self.data.shape[1]
 	def __getitem__(self, idx):
-		return idx, self.data[idx]
+		return idx, self.data[:, idx]
 
 class BatchLoader(IterableDataset):
 	def __init__(
@@ -329,7 +329,7 @@ if __name__ == "__main__":
 	torch.cuda.empty_cache()
 
 	GNN_loader = DataLoader(dataset, batch_size=None)
-	NOD_loader = DataLoader(SimpleDataset(dataset.all_edges), batch_size=262144, shuffle=False)
+	NOD_loader = DataLoader(SimpleDataset(dataset.all_edges.reshape(2, -1)), batch_size=80000, shuffle=False)
 
 	edge_prob_NOD = torch.zeros(dataset.all_edges.size(2), device=work_device)
 	pred_edgewts_NOD = torch.zeros_like(edge_prob_NOD)
@@ -339,8 +339,8 @@ if __name__ == "__main__":
 
 	for idx, batch in NOD_loader:
 		edge_predictor_NOD, pred_edgewts_NOD = NOD_wrapper(node_embeddings, batch)
-		edge_prob_NOD[idx] = torch.sigmoid(edge_predictor_NOD).view(-1)
-		pred_edgewts_NOD[idx] = pred_edgewts_NOD.view(-1)
+		edge_prob_NOD[idx] = torch.sigmoid(edge_predictor_NOD).squeeze(-1)
+		pred_edgewts_NOD[idx] = pred_edgewts_NOD.squeeze(-1)
 
 	for batch in GNN_loader:
 		batch = batch.to(work_device)
@@ -355,8 +355,8 @@ if __name__ == "__main__":
 		edge_predictions = torch.sigmoid(edge_predictor)
 
 		# Average predictions over multiple evaluations
-		edge_prob_GNN[batch.eval_edge_indices] = (edge_prob_GNN[batch.eval_edge_indices] + edge_predictions.view(-1))/2
-		pred_edgewts_GNN[batch.eval_edge_indices] = (pred_edgewts_GNN[batch.eval_edge_indices] + predicted_edgewts)/2
+		edge_prob_GNN[batch.eval_edge_indices] = (edge_prob_GNN[batch.eval_edge_indices] + edge_predictions.squeeze(-1))/2
+		pred_edgewts_GNN[batch.eval_edge_indices] = (pred_edgewts_GNN[batch.eval_edge_indices] + predicted_edgewts.squeeze(-1))/2
 
 	results_NOD = evaluate_predictions(
 		edge_prob = edge_prob_NOD,
