@@ -1,6 +1,6 @@
 import argparse as ap
 from pathlib import Path
-import sys
+import gc
 import torch
 import torch.nn as nn
 from torch.utils.data import IterableDataset, DataLoader
@@ -8,7 +8,7 @@ from torch_geometric import degree
 from torch_geometric.data import Data as PyG_data
 from max_nbr import max_nbr
 import json
-import TrainUtils as utils
+from TrainUtils import generate_negative_edges
 import numpy as np
 from sklearn.metrics import (
 	roc_auc_score, average_precision_score,
@@ -35,68 +35,80 @@ class GNNWrapper(nn.Module):
 		return self.model.NOD(x, supervision_edges)
 
 class BatchLoader(IterableDataset):
-	def __init__(self, data: PyG_data, batch_size, num_batches = None, coverage_fraction = 0.2, device = torch.device('cuda'), threads = 1, extra_samples = 30):
-		"""
-		Args:
-			data (torch_geometric.data.Data): Graph dataset containing:
-			 - positive and negative edge indices (edges)
-			 - node embeddings (node_embeddings)
-			 - labels that say whether the edge is positive or negative (edge_labels: bool)
-			 - edge weights (edge_wts)
-			batch_size (int): Number of datapoints per batch.
-			coverage_fraction (float): Fraction of unsampled datapoints to sample in each batch.
-		Returns:
-			a batch of prediction and message edges (all edges - prediction edges),
-			their attributes,
-			and node embeddings
-		"""
+	def __init__(
+			self,
+			positive_edges,
+			negative_edges,
+			positive_edgewts,
+			batch_size,
+			num_batches = None,
+			coverage_fraction = 0.2,
+			device = torch.device('cuda'),
+			threads = 1,
+			nbr_wt_intensity=1,
+			extra_samples = 30
+			):
 		super().__init__()
+		assert positive_edges.size() == negative_edges.size(), "This batch loader needs equal number of postive and negative edges"
 		self.device = device
-		self.data = data.to(device)
 		self.coverage_fraction = coverage_fraction
 		self.batch_size = batch_size
-		self.num_edges = data.edges.size(0)
-		self.unsampled = torch.ones(self.num_edges, dtype=torch.bool, device=device)
-		self.uniform_weights = torch.ones(self.num_edges, device = device)
-		self.sample_size_unsampled = int(coverage_fraction*batch_size)
+		self.nbr_weight_intensity = nbr_wt_intensity
+		self.threads = threads
+		self.max_neighbors = 30
+		self.extra_samples = extra_samples 
+
+		self.all_edges = torch.stack((positive_edges,negative_edges)).to(self.device)
+		self.num_edges = self.all_edges.size(1)
+		self.edge_idx = torch.arange(self.num_edges, device = self.device)
+		self.positive_edgewts = positive_edgewts.to(self.device)
+		self.unsampled = torch.ones((2,self.num_edges), dtype=torch.bool, device=device)
+		self.num_unsampled = self.unsampled.sum(dim=1)
+
+		self.uniform_weights = torch.ones((2,self.num_edges), device = device)
+		self.sample_size_unsampled = int(coverage_fraction * batch_size)
 		self.sample_size_total = self.batch_size - self.sample_size_unsampled
-		self.batch_mask = torch.zeros(self.num_edges, dtype=torch.bool, device=device)
-		self.edge_idx = torch.arange(self.num_edges)
-		self.sampling_fn = self.sample_with_unsampled_tracking
-		self.num_messages = self.data.edge_labels.sum() - self.batch_size
+		self.batch_mask = torch.zeros((2,self.num_edges), dtype=torch.bool, device=device)
+		
+		self.num_messages = self.num_edges - self.batch_size
 		self.bidirectional_message_edges = torch.zeros((2,self.num_messages*2), dtype = torch.long, device = self.device)
 		self.message_edgewts = torch.zeros(self.num_messages*2, dtype = torch.long, device = self.device)
-		self.max_neighbors = 30
-		self.final_message_mask = torch.zeros(self.num_message_edges*2, dtype = torch.bool, device = self.device)
-		self.threads = threads
-		self.num_unsampled = self.unsampled.sum()
+		self.pred_labels = torch.zeros((2*batch_size), device = self.device)
+		self.pred_edgewts = torch.zeros((2*batch_size), device = self.device)
 
-		self.extra_samples = extra_samples 
+		self.final_message_mask = torch.zeros(self.num_messages*2, dtype = torch.bool, device = self.device)
+		
+		self.sampling_fn = self.sample_with_unsampled_tracking
 
 	def sample_from_total(self):
 		self.batch_mask.fill_(False)
-		indices_total = torch.multinomial(self.uniform_weights, self.batch_size)
-		self.batch_mask[indices_total] = True
+		indices_total = torch.multinomial(self.uniform_weights, self.batch_size, replacement = False)
+		self.batch_mask.scatter_(1, indices_total, True)
 
 	def sample_with_unsampled_tracking(self):
 		self.batch_mask.fill_(False)
-		indices_total = torch.multinomial(self.uniform_weights, self.sample_size_total)
-		self.unsampled[indices_total] = False
-		self.batch_mask[indices_total] = True
+		indices_total = torch.multinomial(self.uniform_weights, self.sample_size_total, replacement = False)
+		self.unsampled.scatter_(1, indices_total, False)
+		self.batch_mask.scatter_(1, indices_total, True)
 
-		unsampled_indices = self.edge_idx[self.unsampled]
-		self.num_unsampled = self.unsampled.sum()
-		if self.num_unsampled > self.sample_size_unsampled:
-			sampled_from_unsampled = torch.multinomial(self.uniform_probs[self.unsampled_edges], self.sample_size_unsampled, replacement=False)
-			self.batch_mask[unsampled_indices[sampled_from_unsampled]] = True
+		self.num_unsampled = self.unsampled.sum(dim=1)
+		for i in range(1):
+			unsampled_indices = self.edge_idx[self.unsampled[i]]
+			if self.num_unsampled[i] > self.sample_size_unsampled:
+				sampled_from_unsampled = torch.multinomial(self.uniform_weights[0,:self.num_unsampled[i]], self.sample_size_unsampled, replacement=False)
+				self.batch_mask[i,unsampled_indices[sampled_from_unsampled]] = True
 
-		else:
-			self.batch_mask[unsampled_indices] = True
-			num_resample_from_total = self.sample_size_unsampled - self.num_unsampled
-			if num_resample_from_total > 0:
-				resampled_from_total = torch.multinomial(self.uniform_probs, num_resample_from_total, replacement=False)
-				self.batch_mask[resampled_from_total] = True
-
+			else:
+				self.batch_mask[i,unsampled_indices] = True
+				num_resample_from_total = self.sample_size_unsampled - self.num_unsampled[i]
+				if num_resample_from_total > 0:
+					available = ~self.batch_mask[i]
+					resampled_from_total = torch.multinomial(self.uniform_weights[0,available], num_resample_from_total, replacement=False)
+					global_available_idx = self.edge_idx[available]
+					resampled_from_total = global_available_idx[resampled_from_total]
+					self.batch_mask[i,resampled_from_total] = True
+					
+		if self.num_unsampled.sum() == 0:
 			self.sampling_fn = self.sample_from_total
 
 	def __iter__(self):
@@ -104,31 +116,29 @@ class BatchLoader(IterableDataset):
 	
 	def __next__(self):
 		self.sampling_fn()
-		pred_edges = self.data.edges[self.batch_mask]
-		message_mask = ~self.batch_mask & self.data.edge_labels
-		message_edges = self.data.edges[message_mask]
-		num_messages = message_mask.sum()
-		num_bidir_messages = 2 * num_messages
+		pred_edges = self.all_edges[self.batch_mask]
+		message_mask = ~self.batch_mask[0]
+		message_edges = self.all_edges[0,message_mask]
 
 		self.bidirectional_message_edges.zero_()
-		self.bidirectional_message_edges[:, :num_messages] = message_edges
-		self.bidirectional_message_edges[:, num_messages:num_bidir_messages] = message_edges.flip(0)
+		self.bidirectional_message_edges[:, :self.num_messages] = message_edges
+		self.bidirectional_message_edges[:, self.num_messages:] = message_edges.flip(0)
 
 		self.pred_edgewts.zero_()
-		self.message_edgewts.zero_()
+		# self.message_edgewts.zero_()
 
 		# Subset edge attributes if available  
-		pred_edgewts = self.data.edgewts[self.batch_mask]
-		message_edgewts = self.data.edgewts[message_mask]
+		self.pred_edgewts[:self.batch_size] = self.positive_edgewts[self.batch_mask[0]]
+		message_edgewts = self.all_edgewts[0,message_mask]
 		
-		self.message_edgewts[:num_messages] = message_edgewts
-		self.message_edgewts[num_messages:num_bidir_messages] = message_edgewts
+		self.message_edgewts[:self.num_messages] = message_edgewts
+		self.message_edgewts[self.num_messages:] = message_edgewts
 		
 		# Apply neighborhood restriction
 		
 		self.final_message_mask.fill_(False)
 
-		src, dst = self.bidirectional_message_edges[:num_bidir_messages]
+		src, dst = self.bidirectional_message_edges
 		
 		# Compute degrees for message nodes  
 		degrees = degree(src, num_nodes = src.max()+1)  
@@ -138,8 +148,7 @@ class BatchLoader(IterableDataset):
 		# Determine neighbor weights based on source and destination degrees
 		weights = deg_src / deg_dst 
 		# Augment neighbor weights with edge weights if available
-		if self.edge_attr is not None:
-			weights.mul_(self.message_edgewts)
+		weights.mul_(self.message_edgewts)
 
 		# Intensify or dampen neighbor weights
 		weights.pow_(self.nbr_weight_intensity)
@@ -149,23 +158,24 @@ class BatchLoader(IterableDataset):
 		# violator_dst_nodes = torch.unique(dst[violators_mask]) 
 		# nonviolator_indices = violators_mask.nonzero(as_tuple=False).view(-1)
 		# Mark non-violators as True in final_message_mask
-		self.final_message_mask[:num_bidir_messages][violators_mask] = True  
+		self.final_message_mask[violators_mask] = True  
 
-		restricted_violators = max_nbr(dst, weights, violators_mask, self.max_neighbors, nthreads=self.threads)
-
-		final_message_edges[:num_bidir_messages][restricted_violators] = True
+		self.final_message_mask |= max_nbr(dst, weights, violators_mask, self.max_neighbors, nthreads=self.threads)
 
 		final_message_edges = self.bidirectional_message_edges[:,self.final_message_mask]
+
+		self.pred_labels.zero_()
+		self.pred_labels[:self.batch_size] = 1.0
 
 		batch = PyG_data(
 			pred_edges = pred_edges,
 			pred_labels = (self.batch_mask & self.data.edge_labels).float(),
-			pred_edgewts = pred_edgewts,
+			pred_edgewts = self.pred_edgewts,
 			message_edges = final_message_edges,
 			message_edgewts = self.message_edgewts[self.final_message_mask],
 		)
 
-		if self.num_unsampled == 0:
+		if self.num_unsampled.sum() == 0:
 			if self.extra_samples == 0:
 				raise StopIteration
 			self.extra_samples -= 1
@@ -258,3 +268,29 @@ if __name__ == "__main__":
 	args = parser.parse_args()
 
 	gpu_yes = torch.cuda.is_available()
+
+	if gpu_yes:
+		work_device = torch.device('cuda')
+	else:
+		work_device = torch.device('cpu')
+
+	positive_data = torch.load(args.input,weights_only = False).to(work_device)
+	negative_edges = generate_negative_edges(positive_data,negative_positive_ratio=1)
+	node_embeddings = positive_data.x
+
+	dataset = BatchLoader(
+		positive_edges = positive_data.edge_index,
+		negative_edges = negative_edges,
+		positive_edgewts = positive_data.edge_attr,
+		batch_size= 20000,
+		threads=4,
+		nbr_wt_intensity=nbr_wt_intensity,
+		extra_samples=50,
+		device=work_device
+	)
+
+	del positive_data
+	gc.collect()
+	torch.cuda.empty_cache()
+
+	loader = DataLoader(dataset, batch_size=None)

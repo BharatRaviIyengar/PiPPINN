@@ -254,7 +254,9 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.total_positive_nodes = self.positive_edges.max().item() + 1  
 		self.supervision_fraction = supervision_fraction  
 		self.max_neighbors = max_neighbors  
-		self.frac_sample_from_unsampled = frac_sample_from_unsampled  
+		self.frac_sample_from_unsampled = frac_sample_from_unsampled
+		self.num_sample_from_total = int(self.batch_size * (1 - self.frac_sample_from_unsampled))
+		self.num_sample_from_unsampled = self.batch_size - self.num_sample_from_total
 		self.nbr_weight_intensity = nbr_weight_intensity
 		self.num_supervision_edges = int(self.batch_size * self.supervision_fraction)
 		self.num_message_edges = self.batch_size - self.num_supervision_edges
@@ -412,38 +414,36 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		Returns:
 			torch.Tensor: Indices of sampled positive edges for the batch.
 		"""
-		# Sample from total  
-		num_sample_from_total = int(self.batch_size * (1 - self.frac_sample_from_unsampled))  
-		sampled_from_total = self.sample_edges_strata(num_sample_from_total)  
+		# Sample from total    
+		sampled_from_total = self.sample_edges_strata(self.num_sample_from_total)  
 		self.unsampled_edges[sampled_from_total] = False  
 
 		# Sampling from unsampled   
 		num_unsampled = self.unsampled_edges.sum()
-		num_sample_from_unsampled = self.batch_size - num_sample_from_total
 
 		# Precompute unsampled edge subset and corresponding uniform probs
 		unsampled_edge_indices = self.positive_edge_idx[self.unsampled_edges]
 
-		if num_unsampled > num_sample_from_unsampled:
+		if num_unsampled > self.num_sample_from_unsampled:
 
-			sampled_from_unsampled = torch.multinomial(self.uniform_probs[self.unsampled_edges], num_sample_from_unsampled, replacement=False)
+			sampled_from_unsampled = torch.multinomial(self.uniform_probs[self.unsampled_edges], self.num_sample_from_unsampled, replacement=False)
 
 			# Fill the remaining slots in the preallocated buffer
-			self.positive_batch_indices[num_sample_from_total:self.batch_size] = unsampled_edge_indices[sampled_from_unsampled]
+			self.positive_batch_indices[self.num_sample_from_total:self.batch_size] = unsampled_edge_indices[sampled_from_unsampled]
 
 			# Track that these unsampled edges have now been used
 			original_indices = unsampled_edge_indices[sampled_from_unsampled]
 			self.unsampled_edges[original_indices] = False
 
 			# Mark these edges as being uniformly sampled
-			self.is_uniform_edge[num_sample_from_total:self.batch_size] = True
+			self.is_uniform_edge[self.num_sample_from_total:self.batch_size] = True
 
 		else:
 			# Fill all unsampled edges
-			self.positive_batch_indices[num_sample_from_total:num_sample_from_total + num_unsampled] = unsampled_edge_indices
+			self.positive_batch_indices[self.num_sample_from_total:self.num_sample_from_total + num_unsampled] = unsampled_edge_indices
 
 			# Mark these edges as being uniformly sampled
-			self.is_uniform_edge[num_sample_from_total:num_sample_from_total + num_unsampled] = True
+			self.is_uniform_edge[self.num_sample_from_total:self.num_sample_from_total + num_unsampled] = True
 
 			# Mark all unsampled edges as used
 			self.unsampled_edges.fill_(False) 
@@ -452,15 +452,17 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			self.sampling_fn = self.sample_edges_strata_total
 
 			# Resample remaining from total
-			num_resample_from_total = self.batch_size - (num_sample_from_total + num_unsampled)
+			num_resample_from_total = self.batch_size - (self.num_sample_from_total + num_unsampled)
 			if num_resample_from_total > 0:
+				self.uniform_probs[self.positive_batch_indices[:-num_resample_from_total]] = 0
 				resampled_from_total = torch.multinomial(self.uniform_probs, num_resample_from_total, replacement=False)
-
+				
 				# Fill the remaining slots in the preallocated buffer
 				self.positive_batch_indices[-num_resample_from_total:] = self.positive_edge_idx[resampled_from_total]
 
 				# Mark these edges as being uniformly sampled
 				self.is_uniform_edge[-num_resample_from_total:] = True
+				self.uniform_probs[self.positive_batch_indices[:-num_resample_from_total]] = 1
 
 		return self.positive_batch_indices
 
