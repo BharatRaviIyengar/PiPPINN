@@ -3,7 +3,7 @@ from pathlib import Path
 import gc
 import torch
 import torch.nn as nn
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import IterableDataset, DataLoader, Dataset
 from torch_geometric import degree
 from torch_geometric.data import Data as PyG_data
 from max_nbr import max_nbr
@@ -33,6 +33,15 @@ class GNNWrapper(nn.Module):
 		x = self.model.layer_norm_input(x)
 		x = self.model.GNN(x, message_edges, message_edgewt)
 		return self.model.NOD(x, supervision_edges)
+	
+class SimpleDataset(Dataset):
+	def __init__(self, data):
+		super().__init__()
+		self.data = data
+	def __len__(self):
+		return 1
+	def __getitem__(self, idx):
+		return idx, self.data[idx]
 
 class BatchLoader(IterableDataset):
 	def __init__(
@@ -45,7 +54,7 @@ class BatchLoader(IterableDataset):
 			coverage_fraction = 0.2,
 			device = torch.device('cuda'),
 			threads = 1,
-			nbr_wt_intensity=1,
+			nbr_wt_intensity=1.0,
 			extra_samples = 30
 			):
 		super().__init__()
@@ -73,8 +82,8 @@ class BatchLoader(IterableDataset):
 		self.num_messages = self.num_edges - self.batch_size
 		self.bidirectional_message_edges = torch.zeros((2,self.num_messages*2), dtype = torch.long, device = self.device)
 		self.message_edgewts = torch.zeros(self.num_messages*2, dtype = torch.long, device = self.device)
-		self.pred_labels = torch.zeros((2*batch_size), device = self.device)
-		self.pred_edgewts = torch.zeros((2*batch_size), device = self.device)
+		self.eval_labels = torch.zeros((2*batch_size), device = self.device)
+		self.eval_edgewts = torch.zeros((2*batch_size), device = self.device)
 
 		self.final_message_mask = torch.zeros(self.num_messages*2, dtype = torch.bool, device = self.device)
 		
@@ -116,7 +125,7 @@ class BatchLoader(IterableDataset):
 	
 	def __next__(self):
 		self.sampling_fn()
-		pred_edges = self.all_edges[self.batch_mask]
+		eval_edges = self.all_edges[self.batch_mask]
 		message_mask = ~self.batch_mask[0]
 		message_edges = self.all_edges[0,message_mask]
 
@@ -124,11 +133,11 @@ class BatchLoader(IterableDataset):
 		self.bidirectional_message_edges[:, :self.num_messages] = message_edges
 		self.bidirectional_message_edges[:, self.num_messages:] = message_edges.flip(0)
 
-		self.pred_edgewts.zero_()
+		self.eval_edgewts.zero_()
 		# self.message_edgewts.zero_()
 
 		# Subset edge attributes if available  
-		self.pred_edgewts[:self.batch_size] = self.positive_edgewts[self.batch_mask[0]]
+		self.eval_edgewts[:self.batch_size] = self.positive_edgewts[self.batch_mask[0]]
 		message_edgewts = self.all_edgewts[0,message_mask]
 		
 		self.message_edgewts[:self.num_messages] = message_edgewts
@@ -164,13 +173,14 @@ class BatchLoader(IterableDataset):
 
 		final_message_edges = self.bidirectional_message_edges[:,self.final_message_mask]
 
-		self.pred_labels.zero_()
-		self.pred_labels[:self.batch_size] = 1.0
+		self.eval_labels.zero_()
+		self.eval_labels[:self.batch_size] = 1.0
 
 		batch = PyG_data(
-			pred_edges = pred_edges,
-			pred_labels = (self.batch_mask & self.data.edge_labels).float(),
-			pred_edgewts = self.pred_edgewts,
+			eval_edges = eval_edges,
+			eval_labels = (self.batch_mask & self.data.edge_labels).float(),
+			eval_edgewts = self.eval_edgewts,
+			eval_edge_indices = (self.edge_idx[self.batch_mask] + torch.tensor([0, self.num_edges]).unsqueeze(-1)).flatten(),
 			message_edges = final_message_edges,
 			message_edgewts = self.message_edgewts[self.final_message_mask],
 		)
@@ -181,10 +191,6 @@ class BatchLoader(IterableDataset):
 			self.extra_samples -= 1
 
 		return batch
-
-		
-
-
 	
 def evaluate_predictions(edge_prob, edge_label, edgewt_pred, edgewt_actual, threshold=0.5, n_bins=10):
 	"""
@@ -275,22 +281,97 @@ if __name__ == "__main__":
 		work_device = torch.device('cpu')
 
 	positive_data = torch.load(args.input,weights_only = False).to(work_device)
-	negative_edges = generate_negative_edges(positive_data,negative_positive_ratio=1)
-	node_embeddings = positive_data.x
+	negative_edges = generate_negative_edges(positive_data,negative_positive_ratio=1, device=work_device)
+	node_embeddings = positive_data.x.to(work_device)
+
+	model = torch.load(args.model, map_location=work_device, weights_only=False)
+	NOD_wrapper = NodeOnlyWrapper(model).to(work_device)
+	GNN_wrapper = GNNWrapper(model).to(work_device)
+
 
 	dataset = BatchLoader(
 		positive_edges = positive_data.edge_index,
 		negative_edges = negative_edges,
 		positive_edgewts = positive_data.edge_attr,
-		batch_size= 20000,
-		threads=4,
-		nbr_wt_intensity=nbr_wt_intensity,
+		batch_size = 20000,
+		threads= args.threads,
+		nbr_wt_intensity = 0.9894467852701081,
 		extra_samples=50,
 		device=work_device
 	)
+
+	edge_labels = torch.zeros(dataset.all_edges.size(1), device=work_device)
+	edge_labels[:positive_data.edge_index.size(1)] = 1.0
+
+	edge_weights = torch.zeros(dataset.all_edges.size(1), device=work_device)
+	edge_weights[:positive_data.edge_index.size(1)] = positive_data.edge_attr
 
 	del positive_data
 	gc.collect()
 	torch.cuda.empty_cache()
 
-	loader = DataLoader(dataset, batch_size=None)
+	GNN_loader = DataLoader(dataset, batch_size=None)
+	NOD_loader = DataLoader(SimpleDataset(dataset.all_edges), batch_size=262144, shuffle=False)
+
+	edge_prob_NOD = torch.zeros(dataset.all_edges.size(1), device=work_device)
+	pred_edgewts_NOD = torch.zeros_like(edge_prob_NOD)
+
+	edge_prob_GNN = torch.zeros_like(edge_prob_NOD)
+	pred_edgewts_GNN = torch.zeros_like(edge_prob_NOD)
+
+	edge_labels = torch.zeros(dataset.all_edges.size(1), device=work_device)
+
+	for idx, batch in NOD_loader:
+		edge_predictor_NOD, pred_edgewts_NOD = NOD_wrapper(node_embeddings, batch)
+		edge_prob_NOD[idx] = torch.sigmoid(edge_predictor_NOD).view(-1)
+		pred_edgewts_NOD[idx] = pred_edgewts_NOD.view(-1)
+
+	for batch in GNN_loader:
+		batch = batch.to(work_device)
+		with torch.no_grad():
+			edge_predictor, predicted_edgewts = GNN_wrapper(
+				x = node_embeddings,
+				supervision_edges = batch.eval_edges,
+				message_edges = batch.message_edges,
+				message_edgewts = batch.message_edgewts
+				)
+			
+		edge_predictions = torch.sigmoid(edge_predictor)
+
+		# Average predictions over multiple evaluations
+		edge_prob_GNN[batch.eval_edge_indices] = (edge_prob_GNN[batch.eval_edge_indices] + edge_predictions.view(-1))/2
+		pred_edgewts_GNN[batch.eval_edge_indices] = (pred_edgewts_GNN[batch.eval_edge_indices] + predicted_edgewts)/2
+
+	results_NOD = evaluate_predictions(
+		edge_prob = edge_prob_NOD,
+		edge_label = edge_labels,
+		edgewt_pred = pred_edgewts_NOD,
+		edgewt_actual = edge_weights,
+		threshold=0.5,
+		n_bins=10
+	)
+
+	results_GNN = evaluate_predictions(
+		edge_prob = edge_prob_GNN,
+		edge_label = edge_labels,
+		edgewt_pred = pred_edgewts_GNN,
+		edgewt_actual = edge_weights,
+		threshold=0.5,
+		n_bins=10
+	)
+
+	# Plot calibration curves
+	import matplotlib.pyplot as plt
+	plt.figure(figsize=(8, 6))
+	prob_true_NOD, prob_pred_NOD = results_NOD["CalibrationCurve"]
+	prob_true_GNN, prob_pred_GNN = results_GNN["CalibrationCurve"]
+	plt.plot(prob_pred_NOD, prob_true_NOD, marker='x', label='NOD Model')
+	plt.plot(prob_pred_GNN, prob_true_GNN, marker='o', label='GNN Model')
+	plt.plot([0, 1], [0, 1], linestyle='--', color='gray', label='Perfect Calibration')
+	plt.xlabel('Mean Predicted Probability')
+	plt.ylabel('Fraction of Positives')
+	plt.title('Calibration Curves')
+	plt.legend()
+	plt.grid()
+	plt.savefig("calibration_curves.svg")
+	plt.close()
