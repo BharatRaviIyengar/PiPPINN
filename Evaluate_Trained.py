@@ -385,6 +385,6 @@ if __name__ == "__main__":
 				continue
 			if key == "ConfusionMatrix":
 				metrics = ["TN", "FP", "FN", "TP"]
-				writer.writerow([metrics, *results_NOD[key].flatten(), *results_GNN[key].flatten()])
+				writer.writerow(metrics + list(results_NOD[key].flatten()) + list(results_GNN[key].flatten()))
 			else:
 				writer.writerow([key, results_NOD[key], results_GNN[key]])
