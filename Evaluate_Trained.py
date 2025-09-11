@@ -4,11 +4,12 @@ import gc
 import torch
 import torch.nn as nn
 from torch.utils.data import IterableDataset, DataLoader, Dataset
-from torch_geometric import degree
+from torch_geometric.utils import degree
 from torch_geometric.data import Data as PyG_data
 from max_nbr import max_nbr
 import json
-from TrainUtils import generate_negative_edges
+from TrainUtils import generate_negative_edges, DualLayerModel
+from Retrain import generate_hidden_dims
 import numpy as np
 from sklearn.metrics import (
 	roc_auc_score, average_precision_score,
@@ -67,7 +68,7 @@ class BatchLoader(IterableDataset):
 		self.extra_samples = extra_samples 
 
 		self.all_edges = torch.stack((positive_edges,negative_edges)).to(self.device)
-		self.num_edges = self.all_edges.size(1)
+		self.num_edges = self.all_edges.size(2)
 		self.edge_idx = torch.arange(self.num_edges, device = self.device)
 		self.positive_edgewts = positive_edgewts.to(self.device)
 		self.unsampled = torch.ones((2,self.num_edges), dtype=torch.bool, device=device)
@@ -250,24 +251,25 @@ if __name__ == "__main__":
 		help="Path to the test positive graph (.pt).",
 		metavar="<path/file>"
 	)
-	parser.add_argument("--processed", "-p",
-		type=str,
-		help="Path to the processed input data (.pt)"
-	)
 	parser.add_argument("--model","-m",
 		type=str,
 		help="Path to the model file (.pt)",
 		required=True
 	)
-	parser.add_argument("--batch_size","-b",
-		type=int,
-		help="Batch size for model inference",
-		default=262144
-	)
 	parser.add_argument("--threads", "-t",
 		type=int,
 		help="Number of CPU threads to use",
 		default=1
+	)
+	parser.add_argument("--outdir", "-o",
+		type=str,
+		help="Output directory",
+		default="."
+	)
+	parser.add_argument("--hyperparams", "-p",
+		type=str,
+		help="Path to the hyperparameter file (.json)",
+		default=None
 	)
 
 	args = parser.parse_args()
@@ -279,11 +281,28 @@ if __name__ == "__main__":
 	else:
 		work_device = torch.device('cpu')
 
+	with open(args.hyperparams, "r") as f:
+		params = json.load(f)
+	
+
 	positive_data = torch.load(args.input,weights_only = False).to(work_device)
 	negative_edges = generate_negative_edges(positive_data,negative_positive_ratio=1, device=work_device)
 	node_embeddings = positive_data.x.to(work_device)
 
-	model = torch.load(args.model, map_location=work_device, weights_only=False)
+	model_state_dict = torch.load(args.model, map_location=work_device, weights_only=False)
+
+	hidden_dims = generate_hidden_dims(params['depth'], params['last_layer_size']) + [params['last_layer_size']]
+
+	model = DualLayerModel(
+		in_channels = node_embeddings.size(1),
+		hidden_channels=hidden_dims,
+		dropout=params["dropout"],
+		gnn_dropout=0.5,
+	).to(work_device)
+
+	model.load_state_dict(model_state_dict)
+	torch.save(model, f"{args.outdir}/PiPPINN_trained_full_model.pt")
+
 	NOD_wrapper = NodeOnlyWrapper(model).to(work_device)
 	GNN_wrapper = GNNWrapper(model).to(work_device)
 
@@ -294,15 +313,15 @@ if __name__ == "__main__":
 		positive_edgewts = positive_data.edge_attr,
 		batch_size = 20000,
 		threads= args.threads,
-		nbr_wt_intensity = 0.9894467852701081,
+		nbr_wt_intensity = params["nbr_weight_intensity"],
 		extra_samples=50,
 		device=work_device
 	)
 
-	edge_labels = torch.zeros(dataset.all_edges.size(1), device=work_device)
+	edge_labels = torch.zeros(dataset.all_edges.size(2), device=work_device)
 	edge_labels[:positive_data.edge_index.size(1)] = 1.0
 
-	edge_weights = torch.zeros(dataset.all_edges.size(1), device=work_device)
+	edge_weights = torch.zeros(dataset.all_edges.size(2), device=work_device)
 	edge_weights[:positive_data.edge_index.size(1)] = positive_data.edge_attr
 
 	del positive_data
@@ -312,13 +331,11 @@ if __name__ == "__main__":
 	GNN_loader = DataLoader(dataset, batch_size=None)
 	NOD_loader = DataLoader(SimpleDataset(dataset.all_edges), batch_size=262144, shuffle=False)
 
-	edge_prob_NOD = torch.zeros(dataset.all_edges.size(1), device=work_device)
+	edge_prob_NOD = torch.zeros(dataset.all_edges.size(2), device=work_device)
 	pred_edgewts_NOD = torch.zeros_like(edge_prob_NOD)
 
 	edge_prob_GNN = torch.zeros_like(edge_prob_NOD)
 	pred_edgewts_GNN = torch.zeros_like(edge_prob_NOD)
-
-	edge_labels = torch.zeros(dataset.all_edges.size(1), device=work_device)
 
 	for idx, batch in NOD_loader:
 		edge_predictor_NOD, pred_edgewts_NOD = NOD_wrapper(node_embeddings, batch)
@@ -372,12 +389,12 @@ if __name__ == "__main__":
 	plt.title('Calibration Curves')
 	plt.legend()
 	plt.grid()
-	plt.savefig("calibration_curves.svg")
+	plt.savefig(f"{args.outdir}calibration_curves.svg")
 	plt.close()
 
 	# Save results to CSV
 	import csv
-	with open("evaluation_results.csv", mode='w', newline='') as file:
+	with open(f"{args.outdir}/evaluation_results.csv", mode='w', newline='') as file:
 		writer = csv.writer(file)
 		writer.writerow(["Metric", "NOD Model", "GNN Model"])
 		for key in results_NOD.keys():
