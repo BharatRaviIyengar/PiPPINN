@@ -338,7 +338,7 @@ if __name__ == "__main__":
 	pred_edgewts_GNN = torch.zeros_like(edge_prob_NOD)
 
 	for idx, batch in NOD_loader:
-		edge_predictor_NOD, pred_edgewts_NOD = NOD_wrapper(node_embeddings, batch)
+		edge_predictor_NOD, pred_edgewts_NOD = NOD_wrapper(node_embeddings, batch.T)
 		edge_prob_NOD[idx] = torch.sigmoid(edge_predictor_NOD).squeeze(-1)
 		pred_edgewts_NOD[idx] = pred_edgewts_NOD.squeeze(-1)
 
