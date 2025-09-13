@@ -29,9 +29,9 @@ class GNNWrapper(nn.Module):
 	def __init__(self, model):
 		super().__init__()
 		self.model = model
-	def forward(self, x, supervision_edges, message_edges, message_edgewt=None):
+	def forward(self, x, supervision_edges, message_edges, message_edgewts=None):
 		x = self.model.layer_norm_input(x)
-		x = self.model.GNN(x, message_edges, message_edgewt)
+		x = self.model.GNN(x, message_edges, message_edgewts)
 		return self.model.NOD(x, supervision_edges)
 	
 class SimpleDataset(Dataset):
@@ -84,6 +84,7 @@ class BatchLoader(IterableDataset):
 		self.eval_edges = torch.zeros((2,2*batch_size), dtype = torch.long, device = self.device)
 		self.eval_labels = torch.zeros((2*batch_size), device = self.device)
 		self.eval_labels[:self.batch_size] = 1.0
+		self.eval_edge_indices = torch.zeros_like(self.eval_labels, dtype = torch.long, device = self.device)
 		self.eval_edgewts = torch.zeros((2*batch_size), device = self.device)
 
 		self.final_message_mask = torch.zeros(self.num_messages*2, dtype = torch.bool, device = self.device)
@@ -163,7 +164,6 @@ class BatchLoader(IterableDataset):
 
 		# Intensify or dampen neighbor weights
 		weights.pow_(self.nbr_weight_intensity)
-		print(weights)
 
 		# Identify violators (nodes with degree greater than max_neighbors)
 		violators_mask = deg_dst > self.max_neighbors  
@@ -176,11 +176,14 @@ class BatchLoader(IterableDataset):
 
 		final_message_edges = self.bidirectional_message_edges[:,self.final_message_mask]
 
+		self.eval_edge_indices[:self.batch_size] = self.edge_idx[self.batch_mask[0]]
+		self.eval_edge_indices[self.batch_size:] = self.edge_idx[self.batch_mask[1]] + self.num_edges
+
 		batch = PyG_data(
 			eval_edges = self.eval_edges,
-			eval_labels = (self.batch_mask & self.data.edge_labels).float(),
+			eval_labels = (self.eval_labels),
 			eval_edgewts = self.eval_edgewts,
-			eval_edge_indices = (self.edge_idx[self.batch_mask] + torch.tensor([0, self.num_edges]).unsqueeze(-1)).flatten(),
+			eval_edge_indices = self.eval_edge_indices,
 			message_edges = final_message_edges,
 			message_edgewts = self.message_edgewts[self.final_message_mask],
 		)
@@ -360,6 +363,7 @@ if __name__ == "__main__":
 		predicted_edgewts = predicted_edgewts.to('cpu')
 
 		# Average predictions over multiple evaluations
+		batch.eval_edge_indices = batch.eval_edge_indices.to('cpu')
 		edge_prob_GNN[batch.eval_edge_indices] = (edge_prob_GNN[batch.eval_edge_indices] + edge_predictions.squeeze(-1))/2
 		pred_edgewts_GNN[batch.eval_edge_indices] = (pred_edgewts_GNN[batch.eval_edge_indices] + predicted_edgewts.squeeze(-1))/2
 
