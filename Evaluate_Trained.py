@@ -8,8 +8,7 @@ from torch_geometric.utils import degree
 from torch_geometric.data import Data as PyG_data
 from max_nbr import max_nbr
 import json
-from TrainUtils import generate_negative_edges, DualLayerModel
-from Retrain import generate_hidden_dims
+from TrainUtils import generate_negative_edges
 import numpy as np
 from sklearn.metrics import (
 	roc_auc_score, average_precision_score,
@@ -81,8 +80,10 @@ class BatchLoader(IterableDataset):
 		
 		self.num_messages = self.num_edges - self.batch_size
 		self.bidirectional_message_edges = torch.zeros((2,self.num_messages*2), dtype = torch.long, device = self.device)
-		self.message_edgewts = torch.zeros(self.num_messages*2, dtype = torch.long, device = self.device)
+		self.message_edgewts = torch.zeros(self.num_messages*2, device = self.device)
+		self.eval_edges = torch.zeros((2,2*batch_size), dtype = torch.long, device = self.device)
 		self.eval_labels = torch.zeros((2*batch_size), device = self.device)
+		self.eval_labels[:self.batch_size] = 1.0
 		self.eval_edgewts = torch.zeros((2*batch_size), device = self.device)
 
 		self.final_message_mask = torch.zeros(self.num_messages*2, dtype = torch.bool, device = self.device)
@@ -101,7 +102,7 @@ class BatchLoader(IterableDataset):
 		self.batch_mask.scatter_(1, indices_total, True)
 
 		self.num_unsampled = self.unsampled.sum(dim=1)
-		for i in range(1):
+		for i in range(2):
 			unsampled_indices = self.edge_idx[self.unsampled[i]]
 			if self.num_unsampled[i] > self.sample_size_unsampled:
 				sampled_from_unsampled = torch.multinomial(self.uniform_weights[0,:self.num_unsampled[i]], self.sample_size_unsampled, replacement=False)
@@ -125,20 +126,21 @@ class BatchLoader(IterableDataset):
 	
 	def __next__(self):
 		self.sampling_fn()
-		eval_edges = self.all_edges[self.batch_mask]
+		self.eval_edges[:,:self.batch_size] = self.all_edges[0,:,self.batch_mask[0]]
+		self.eval_edges[:,self.batch_size:] = self.all_edges[1,:,self.batch_mask[1]]
 		message_mask = ~self.batch_mask[0]
-		message_edges = self.all_edges[0,message_mask]
+		message_edges = self.all_edges[0,:,message_mask]
 
-		self.bidirectional_message_edges.zero_()
+		# self.bidirectional_message_edges.zero_()
 		self.bidirectional_message_edges[:, :self.num_messages] = message_edges
 		self.bidirectional_message_edges[:, self.num_messages:] = message_edges.flip(0)
 
-		self.eval_edgewts.zero_()
+		# self.eval_edgewts.zero_()
 		# self.message_edgewts.zero_()
 
 		# Subset edge attributes if available  
 		self.eval_edgewts[:self.batch_size] = self.positive_edgewts[self.batch_mask[0]]
-		message_edgewts = self.all_edgewts[0,message_mask]
+		message_edgewts = self.positive_edgewts[message_mask]
 		
 		self.message_edgewts[:self.num_messages] = message_edgewts
 		self.message_edgewts[self.num_messages:] = message_edgewts
@@ -161,23 +163,21 @@ class BatchLoader(IterableDataset):
 
 		# Intensify or dampen neighbor weights
 		weights.pow_(self.nbr_weight_intensity)
+		print(weights)
 
 		# Identify violators (nodes with degree greater than max_neighbors)
 		violators_mask = deg_dst > self.max_neighbors  
 		# violator_dst_nodes = torch.unique(dst[violators_mask]) 
 		# nonviolator_indices = violators_mask.nonzero(as_tuple=False).view(-1)
 		# Mark non-violators as True in final_message_mask
-		self.final_message_mask[violators_mask] = True  
+		self.final_message_mask[~violators_mask] = True  
 
 		self.final_message_mask |= max_nbr(dst, weights, violators_mask, self.max_neighbors, nthreads=self.threads)
 
 		final_message_edges = self.bidirectional_message_edges[:,self.final_message_mask]
 
-		self.eval_labels.zero_()
-		self.eval_labels[:self.batch_size] = 1.0
-
 		batch = PyG_data(
-			eval_edges = eval_edges,
+			eval_edges = self.eval_edges,
 			eval_labels = (self.batch_mask & self.data.edge_labels).float(),
 			eval_edgewts = self.eval_edgewts,
 			eval_edge_indices = (self.edge_idx[self.batch_mask] + torch.tensor([0, self.num_edges]).unsqueeze(-1)).flatten(),
@@ -285,32 +285,34 @@ if __name__ == "__main__":
 		params = json.load(f)
 	
 
-	positive_data = torch.load(args.input,weights_only = False).to(work_device)
+	positive_data = torch.load(args.input,weights_only = False)
 	negative_edges = generate_negative_edges(positive_data,negative_positive_ratio=1, device=work_device)
 	node_embeddings = positive_data.x.to(work_device)
 
-	model_state_dict = torch.load(args.model, map_location=work_device, weights_only=False)
+	# model_state_dict = torch.load(args.model, map_location=work_device, weights_only=False)
 
-	hidden_dims = generate_hidden_dims(params['depth'], params['last_layer_size']) + [params['last_layer_size']]
+	# hidden_dims = generate_hidden_dims(params['depth'], params['last_layer_size']) + [params['last_layer_size']]
 
-	model = DualLayerModel(
-		in_channels = node_embeddings.size(1),
-		hidden_channels=hidden_dims,
-		dropout=params["dropout"],
-		gnn_dropout=0.5,
-	).to(work_device)
+	# model = DualLayerModel(
+	# 	in_channels = node_embeddings.size(1),
+	# 	hidden_channels=hidden_dims,
+	# 	dropout=params["dropout"],
+	# 	gnn_dropout=0.5,
+	# ).to(work_device)
 
-	model.load_state_dict(model_state_dict)
-	torch.save(model, f"{args.outdir}/PiPPINN_trained_full_model.pt")
+	# model.load_state_dict(model_state_dict)
+	# torch.save(model, f"{args.outdir}/PiPPINN_trained_full_model.pt")
+
+	model = torch.load(args.model, map_location=work_device, weights_only=False)
 
 	NOD_wrapper = NodeOnlyWrapper(model).to(work_device)
 	GNN_wrapper = GNNWrapper(model).to(work_device)
 
 
 	dataset = BatchLoader(
-		positive_edges = positive_data.edge_index,
+		positive_edges = positive_data.edge_index.to(work_device),
 		negative_edges = negative_edges,
-		positive_edgewts = positive_data.edge_attr,
+		positive_edgewts = positive_data.edge_attr.to(work_device),
 		batch_size = 20000,
 		threads= args.threads,
 		nbr_wt_intensity = params["nbr_weight_intensity"],
@@ -318,10 +320,10 @@ if __name__ == "__main__":
 		device=work_device
 	)
 
-	edge_labels = torch.zeros(dataset.all_edges.size(2), device=work_device)
+	edge_labels = torch.zeros(2*dataset.all_edges.size(2), device='cpu')
 	edge_labels[:positive_data.edge_index.size(1)] = 1.0
 
-	edge_weights = torch.zeros(dataset.all_edges.size(2), device=work_device)
+	edge_weights = torch.zeros(2*dataset.all_edges.size(2)).to('cpu')
 	edge_weights[:positive_data.edge_index.size(1)] = positive_data.edge_attr
 
 	del positive_data
@@ -329,18 +331,20 @@ if __name__ == "__main__":
 	torch.cuda.empty_cache()
 
 	GNN_loader = DataLoader(dataset, batch_size=None)
-	NOD_loader = DataLoader(SimpleDataset(dataset.all_edges.reshape(2, -1)), batch_size=80000, shuffle=False)
+	NOD_loader = DataLoader(SimpleDataset(dataset.all_edges.reshape(2, -1).to('cpu')), batch_size=80000, shuffle=False)
 
-	edge_prob_NOD = torch.zeros(dataset.all_edges.size(2), device=work_device)
-	pred_edgewts_NOD = torch.zeros_like(edge_prob_NOD)
+	edge_prob_NOD = torch.zeros(2*dataset.all_edges.size(2), device='cpu')
+	pred_edgewts_NOD = torch.zeros_like(edge_prob_NOD, device = 'cpu')
 
-	edge_prob_GNN = torch.zeros_like(edge_prob_NOD)
-	pred_edgewts_GNN = torch.zeros_like(edge_prob_NOD)
+	edge_prob_GNN = torch.zeros_like(edge_prob_NOD, device = 'cpu')
+	pred_edgewts_GNN = torch.zeros_like(edge_prob_NOD, device = 'cpu')
 
 	for idx, batch in NOD_loader:
-		edge_predictor_NOD, pred_edgewts_NOD = NOD_wrapper(node_embeddings, batch.T)
-		edge_prob_NOD[idx] = torch.sigmoid(edge_predictor_NOD).squeeze(-1)
-		pred_edgewts_NOD[idx] = pred_edgewts_NOD.squeeze(-1)
+		batch = batch.to(work_device)
+		with torch.no_grad():
+			edge_predictor, edgewts = NOD_wrapper(node_embeddings, batch.T)
+		edge_prob_NOD[idx] = torch.sigmoid(edge_predictor).squeeze(-1).to('cpu')
+		pred_edgewts_NOD[idx] = edgewts.squeeze(-1).to('cpu')
 
 	for batch in GNN_loader:
 		batch = batch.to(work_device)
@@ -352,7 +356,8 @@ if __name__ == "__main__":
 				message_edgewts = batch.message_edgewts
 				)
 			
-		edge_predictions = torch.sigmoid(edge_predictor)
+		edge_predictions = torch.sigmoid(edge_predictor).to('cpu')
+		predicted_edgewts = predicted_edgewts.to('cpu')
 
 		# Average predictions over multiple evaluations
 		edge_prob_GNN[batch.eval_edge_indices] = (edge_prob_GNN[batch.eval_edge_indices] + edge_predictions.squeeze(-1))/2
