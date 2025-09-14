@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.nn.functional import relu as ReLU, binary_cross_entropy_with_logits as bce_loss, mse_loss, softplus
+from torch.nn.functional import relu as ReLU, binary_cross_entropy_with_logits as bce_loss, mse_loss, softplus, normalize as Normalize
 from torch_geometric.data import Data
 from torch_geometric.utils import degree
 from torch_geometric.utils.map import map_index
@@ -40,8 +40,8 @@ class EdgeDecoder(nn.Module):
 		self.dropout = dropout
 		self.dims = [self.in_channels] + self.hidden_channels
 		self.edge_embedder = self.build_mlp()
-		self.edge_prob_head = nn.Linear(self.dims[-2], 1)
-		self.edge_wt_head = nn.Linear(self.dims[-2], 1)
+		self.edge_prob_head = nn.Linear(self.dims[-1], 1)
+		self.edge_wt_head = nn.Linear(self.dims[-1], 1)
 
 	def build_mlp(self):
 		layers = []
@@ -216,68 +216,69 @@ class DecayScheduler:
 				print(f"Parameter {self.attr_name} decayed to {self.current_value:.4f} at epoch {self.epoch}")
 
 def InfoNCE(edge_embeddings, edge_labels, temperature=0.1, batch_size=4000):
-    """
-    Memory-efficient InfoNCE contrastive loss for edge embeddings.
+	"""
+	Memory-efficient InfoNCE contrastive loss for edge embeddings.
 
-    Args:
-        edge_embeddings (torch.Tensor): Shape [num_edges, embedding_dim].
-        edge_labels (torch.Tensor): Binary labels (1=positive, 0=negative), shape [num_edges].
-        temperature (float): Scaling factor.
-        batch_size (int): Number of edges to process at a time.
+	Args:
+		edge_embeddings (torch.Tensor): Shape [num_edges, embedding_dim].
+		edge_labels (torch.Tensor): Binary labels (1=positive, 0=negative), shape [num_edges].
+		temperature (float): Scaling factor.
+		batch_size (int): Number of edges to process at a time.
 
-    Returns:
-        torch.Tensor: Scalar loss.
-    """
-    num_edges = edge_embeddings.size(0)
-    device = edge_embeddings.device
-    edge_labels = edge_labels.bool().to(device)
+	Returns:
+		torch.Tensor: Scalar loss.
+	"""
+	num_edges = edge_embeddings.size(0)
+	device = edge_embeddings.device
+	edge_labels = edge_labels.bool().to(device)
+	edge_embeddings = Normalize(edge_embeddings, p=2, dim=-1)
 
-    total_loss = 0.0
-    count = 0
+	total_loss = 0.0
+	count = 0
 
-    for start in range(0, num_edges, batch_size):
-        end = min(start + batch_size, num_edges)
-        batch_emb = edge_embeddings[start:end]  # [B, D]
+	for start in range(0, num_edges, batch_size):
+		end = min(start + batch_size, num_edges)
+		batch_emb = edge_embeddings[start:end]  # [B, D]
 
-        # Compute similarity of batch with all edges
-        sim = torch.matmul(batch_emb, edge_embeddings.T) / temperature  # [B, N]
+		# Compute similarity of batch with all edges
+		sim = torch.matmul(batch_emb, edge_embeddings.T) / temperature  # [B, N]
 
-        # Positive mask for current batch vs all edges
-        batch_labels = edge_labels[start:end].unsqueeze(1)  # [B, 1]
-        positive_mask = batch_labels & edge_labels.unsqueeze(0)  # [B, N]
+		# Positive mask for current batch vs all edges
+		batch_labels = edge_labels[start:end].unsqueeze(1)  # [B, 1]
+		positive_mask = batch_labels & edge_labels.unsqueeze(0)  # [B, N]
 
-        # Ignore self-similarity (optional)
-        if start == 0:  # only fill diagonal for first batch
-            diag_idx = torch.arange(end - start, device=device)
-            positive_mask[diag_idx, diag_idx] = False
+		# Ignore self-similarity (optional)
+		if start == 0:  # only fill diagonal for first batch
+			diag_idx = torch.arange(end - start, device=device)
+			positive_mask[diag_idx, diag_idx] = False
 
-        # Numerator: logsumexp over positives
-        numerator = torch.logsumexp(sim.masked_fill(~positive_mask, float('-inf')), dim=1)
-        # Denominator: logsumexp over all similarities
-        denominator = torch.logsumexp(sim, dim=1)
+		# Numerator: logsumexp over positives
+		numerator = torch.logsumexp(sim.masked_fill(~positive_mask, float('-inf')), dim=1)
+		# Denominator: logsumexp over all similarities
+		denominator = torch.logsumexp(sim, dim=1)
 
-        total_loss += (denominator - numerator).sum()
-        count += (end - start)
+		total_loss += (denominator - numerator).sum()
+		count += (end - start)
 
-    return total_loss / count
+	return total_loss / count
 
 class InfoNCEWrapper(nn.Module):
-    def __init__(self, temperature=0.1, batch_size=4000, learnable=True):
-        super().__init__()
-        self.batch_size = batch_size
-        if learnable:
-            self.temperature = nn.Parameter(torch.tensor(temperature))
-        else:
-            self.register_buffer("temperature", torch.tensor(temperature))
+	def __init__(self, temperature=0.1, batch_size=4000, learnable=True):
+		super().__init__()
+		self.batch_size = batch_size
+		if learnable:
+			self.temperature = nn.Parameter(torch.tensor(temperature))
+		else:
+			self.register_buffer("temperature", torch.tensor(temperature))
 
-    def forward(self, edge_embeddings, edge_labels):
-        temp = softplus(self.temperature)
-        # clamp temperature range
-        temp = torch.clamp(temp, min= 0.05, max=0.5)
-        return InfoNCE(edge_embeddings, edge_labels, temperature=temp, batch_size=self.batch_size)
+	def forward(self, edge_embeddings, edge_labels):
+		temp = softplus(self.temperature)
+		# clamp temperature range
+		temp = torch.clamp(temp, min= 0.05, max=0.5)
+		return InfoNCE(edge_embeddings, edge_labels, temperature=temp, batch_size=self.batch_size)
 
 
-
+contrastive_loss = InfoNCEWrapper(temperature=0.1, batch_size=4000, learnable=True)
 	
 class EdgeSampler(torch.utils.data.IterableDataset):
 	"""
@@ -485,7 +486,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		Returns:
 			torch.Tensor: Indices of sampled positive edges for the batch.
 		"""
-		# Sample from total    
+		# Sample from total	
 		sampled_from_total = self.sample_edges_strata(self.num_sample_from_total)  
 		self.unsampled_edges[sampled_from_total] = False  
 
@@ -682,16 +683,16 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 def subgraph_with_relabel(original_graph: Data, edge_mask: torch.Tensor) -> Data:
 	"""
-    Extracts a subgraph from the original graph using the provided edge mask,
-    relabels node indices to be contiguous, and returns a new Data object.
+	Extracts a subgraph from the original graph using the provided edge mask,
+	relabels node indices to be contiguous, and returns a new Data object.
 
-    Args:
-        original_graph (torch_geometric.data.Data): The input graph.
-        edge_mask (torch.Tensor): Boolean mask indicating which edges to include.
+	Args:
+		original_graph (torch_geometric.data.Data): The input graph.
+		edge_mask (torch.Tensor): Boolean mask indicating which edges to include.
 
-    Returns:
-        torch_geometric.data.Data: The relabeled subgraph.
-    """
+	Returns:
+		torch_geometric.data.Data: The relabeled subgraph.
+	"""
 	device = original_graph.edge_index.device
 	num_nodes = original_graph.x.size(0)
 
@@ -721,24 +722,24 @@ def subgraph_with_relabel(original_graph: Data, edge_mask: torch.Tensor) -> Data
 
 def bisect_data(graph: Data, second_edge_fraction=0.3, node_centrality=None, max_attempts=50, second_edge_fraction_pure=0.09):
 	"""
-    Splits a graph into two subgraphs based on edge centrality and node sampling.
+	Splits a graph into two subgraphs based on edge centrality and node sampling.
 
-    The second subgraph contains a specified fraction of edges, with a subset
-    being "pure" (both endpoints in the sampled node set). The function attempts
-    to match the desired edge counts within a tolerance.
+	The second subgraph contains a specified fraction of edges, with a subset
+	being "pure" (both endpoints in the sampled node set). The function attempts
+	to match the desired edge counts within a tolerance.
 
-    Args:
-        graph (torch_geometric.data.Data): Input graph.
-        second_edge_fraction (float): Fraction of edges for the second subgraph.
-        node_centrality (torch.Tensor, optional): Node centrality scores.
-        max_attempts (int): Maximum attempts to match edge counts.
-        second_edge_fraction_pure (float): Fraction of pure edges in the second subgraph.
+	Args:
+		graph (torch_geometric.data.Data): Input graph.
+		second_edge_fraction (float): Fraction of edges for the second subgraph.
+		node_centrality (torch.Tensor, optional): Node centrality scores.
+		max_attempts (int): Maximum attempts to match edge counts.
+		second_edge_fraction_pure (float): Fraction of pure edges in the second subgraph.
 
-    Returns:
-        tuple: (first_graph, second_graph)
-            first_graph (torch_geometric.data.Data): First subgraph.
-            second_graph (torch_geometric.data.Data): Second subgraph.
-    """
+	Returns:
+		tuple: (first_graph, second_graph)
+			first_graph (torch_geometric.data.Data): First subgraph.
+			second_graph (torch_geometric.data.Data): Second subgraph.
+	"""
 	device = graph.edge_index.device
 	num_nodes = graph.x.size(0)
 	num_edges = graph.edge_index.size(1)
@@ -810,18 +811,18 @@ def key_edges(node1, node2, total_nodes):
 # Generate negative edges 
 def generate_negative_edges(positive_graph: Data, negative_positive_ratio=2, device=None, max_batch_size=100000) -> torch.Tensor:
 	"""
-    Generates negative edges for a graph by sampling node pairs that do not exist
-    as positive edges and are not self-loops.
+	Generates negative edges for a graph by sampling node pairs that do not exist
+	as positive edges and are not self-loops.
 
-    Args:
-        positive_graph (torch_geometric.data.Data): Input graph with positive edges.
-        negative_positive_ratio (int): Ratio of negative to positive edges.
-        device (torch.device, optional): Device for computation.
-        max_batch_size (int): Maximum batch size for sampling.
+	Args:
+		positive_graph (torch_geometric.data.Data): Input graph with positive edges.
+		negative_positive_ratio (int): Ratio of negative to positive edges.
+		device (torch.device, optional): Device for computation.
+		max_batch_size (int): Maximum batch size for sampling.
 
-    Returns:
-        torch.Tensor: Negative edges (shape [2, num_negative_edges]).
-    """
+	Returns:
+		torch.Tensor: Negative edges (shape [2, num_negative_edges]).
+	"""
 	if device is None:
 		device = positive_graph.edge_index.device
 	else:
@@ -903,21 +904,21 @@ def calculate_loss(model_output, data, head_weights = [0.5, 0.5]):
 
 def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False):
 	"""
-    Processes a single batch for training or validation.
+	Processes a single batch for training or validation.
 
-    Moves data to the correct device, performs a forward pass, computes loss,
-    and (if training) performs backpropagation and optimizer step.
+	Moves data to the correct device, performs a forward pass, computes loss,
+	and (if training) performs backpropagation and optimizer step.
 
-    Args:
-        data (torch_geometric.data.Data): Batch data object.
-        model (nn.Module): The GraphSAGE model.
-        optimizer (torch.optim.Optimizer): Optimizer.
-        device (torch.device): Device for computation.
-        is_training (bool): If True, performs training steps.
+	Args:
+		data (torch_geometric.data.Data): Batch data object.
+		model (nn.Module): The GraphSAGE model.
+		optimizer (torch.optim.Optimizer): Optimizer.
+		device (torch.device): Device for computation.
+		is_training (bool): If True, performs training steps.
 
-    Returns:
-        float: Loss value for the batch.
-    """
+	Returns:
+		float: Loss value for the batch.
+	"""
 	# Move data to the correct device
 	data = data.to(device)
 
@@ -955,23 +956,23 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 
 def load_data(input_graphs_filenames, val_fraction, save_graphs_to=None, device=None):
 	"""
-    Loads graph data from disk, splits each graph into training and validation sets,
-    generates negative edges for both, and optionally saves the processed graphs.
+	Loads graph data from disk, splits each graph into training and validation sets,
+	generates negative edges for both, and optionally saves the processed graphs.
 
-    Args:
-        input_graphs_filenames (list of str): List of file paths to input graph data (.pt files).
-        val_fraction (float): Fraction of edges to use for validation split.
-        save_graphs_to (str, optional): Path to save processed graphs. If None, graphs are not saved.
-        device (torch.device, optional): Device to move tensors to. If None, uses the graph's device.
+	Args:
+		input_graphs_filenames (list of str): List of file paths to input graph data (.pt files).
+		val_fraction (float): Fraction of edges to use for validation split.
+		save_graphs_to (str, optional): Path to save processed graphs. If None, graphs are not saved.
+		device (torch.device, optional): Device to move tensors to. If None, uses the graph's device.
 
-    Returns:
-        list: List of dictionaries, each containing:
-            - "Data_name": Name of the graph (from filename stem).
-            - "Train": Training graph (torch_geometric.data.Data).
-            - "Train_Neg": Negative edges for training (torch.Tensor).
-            - "Val": Validation graph (torch_geometric.data.Data).
-            - "Val_Neg": Negative edges for validation (torch.Tensor).
-    """
+	Returns:
+		list: List of dictionaries, each containing:
+			- "Data_name": Name of the graph (from filename stem).
+			- "Train": Training graph (torch_geometric.data.Data).
+			- "Train_Neg": Negative edges for training (torch.Tensor).
+			- "Val": Validation graph (torch_geometric.data.Data).
+			- "Val_Neg": Negative edges for validation (torch.Tensor).
+	"""
 	data_to_save = dict() if save_graphs_to is not None else None
 	ingraphs = []
 	for files in input_graphs_filenames:
@@ -1015,18 +1016,18 @@ def load_data(input_graphs_filenames, val_fraction, save_graphs_to=None, device=
 
 def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, nbr_wt_intensity=1.0, device = None, threads=1):
 	"""
-    Generates training and validation batch loaders and samplers.
+	Generates training and validation batch loaders and samplers.
 
-    Args:
-        data (dict): Dictionary containing 'Train', 'Train_Neg', 'Val', 'Val_Neg' Data objects.
-        num_batches (int): Number of batches for training.
-        batch_size (int): Batch size for training.
-        centrality_fraction (float): Fraction of edges to sample by centrality.
-        device (torch.device, optional): Device for computation.
+	Args:
+		data (dict): Dictionary containing 'Train', 'Train_Neg', 'Val', 'Val_Neg' Data objects.
+		num_batches (int): Number of batches for training.
+		batch_size (int): Batch size for training.
+		centrality_fraction (float): Fraction of edges to sample by centrality.
+		device (torch.device, optional): Device for computation.
 
-    Returns:
-        dict: Contains train/val samplers, loaders, and input channel size.
-    """
+	Returns:
+		dict: Contains train/val samplers, loaders, and input channel size.
+	"""
 	# Create minibatch sampler for training set
 	if num_batches is None:
 		num_batches = data["Train"].edge_index.size(1)//int(batch_size*0.8) # type: ignore 
