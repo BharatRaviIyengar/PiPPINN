@@ -47,7 +47,7 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 			in_channels=data_for_training[0]["input_channels"],
 			hidden_channels=hidden_channels,
 			dropout=dropout,
-			gnn_dropout=0.5
+			network_skip=0.5
 		).to(device)
 	
 	optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=weight_decay)

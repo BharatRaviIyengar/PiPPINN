@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.nn.functional import relu as ReLU, binary_cross_entropy_with_logits as bce_loss, mse_loss
+from torch.nn.functional import relu as ReLU, binary_cross_entropy_with_logits as bce_loss, mse_loss, softplus
 from torch_geometric.data import Data
 from torch_geometric.utils import degree
 from torch_geometric.utils.map import map_index
@@ -10,7 +10,7 @@ from pathlib import Path
 from max_nbr import max_nbr
 from collections import namedtuple
 
-class NodeOnlyDecoder(nn.Module):
+class EdgeDecoder(nn.Module):
 	"""
 	Implements a simple decoder that predicts edges based on node features.
 
@@ -38,28 +38,29 @@ class NodeOnlyDecoder(nn.Module):
 		self.in_channels = in_channels*2
 		self.hidden_channels = hidden_channels
 		self.dropout = dropout
-		self.dims = [self.in_channels] + self.hidden_channels + [1]
-		self.edge_probability = self.generate_conv_layer()
-		self.edge_weight_pred = self.generate_conv_layer()
+		self.dims = [self.in_channels] + self.hidden_channels
+		self.edge_embedder = self.build_mlp()
+		self.edge_prob_head = nn.Linear(self.dims[-2], 1)
+		self.edge_wt_head = nn.Linear(self.dims[-2], 1)
 
-	def generate_conv_layer(self):
+	def build_mlp(self):
 		layers = []
-		for i in range(len(self.dims) - 2):
+		layers.append(nn.LayerNorm(self.dims[0]))
+		for i in range(len(self.dims) - 1):
 			layers.append(nn.Linear(self.dims[i], self.dims[i + 1]))
 			layers.append(nn.LayerNorm(self.dims[i + 1]))
 			layers.append(nn.ReLU())
-			if self.dropout > 0:
-				layers.append(nn.Dropout(p=self.dropout))
-		layers.append(nn.Linear(self.dims[-2], self.dims[-1]))
+			if self.dropout > 0 and i < len(self.dims) - 1:
+				layers.append(nn.Dropout(p=self.dropout))		
 		return nn.Sequential(*layers)
 
 	def forward(self, x, edge_index):
 		add = x[edge_index[0]] + x[edge_index[1]]
 		prod = x[edge_index[0]] * x[edge_index[1]]
-		edge_features = torch.cat([add, prod], dim=-1)
-		edge_probabilities = self.edge_probability(edge_features)
-		edge_weights = ReLU(self.edge_weight_pred(edge_features))
-		return edge_weights, edge_probabilities
+		edge_features = self.edge_embedder(torch.cat([add, prod], dim=-1))
+		edge_probabilities = self.edge_prob_head(edge_features)
+		edge_weights = ReLU(self.edge_wt_head(edge_features))
+		return edge_features, edge_probabilities, edge_weights
 
 
 class Pool_SAGEConv(nn.Module):
@@ -98,8 +99,8 @@ class Pool_SAGEConv(nn.Module):
 		
 	def forward(self, x, edge_index, edge_weight):
 		src, dst = edge_index
-
-		edge_features = x[src] * (1 + self.edge_weight_message_coefficient * edge_weight.unsqueeze(-1))
+		coeff = softplus(self.edge_weight_message_coefficient)
+		edge_features = x[src] * (1 + coeff * edge_weight.unsqueeze(-1))
 
 		# Pool and activate neighbor messages
 		pooled = self.pool(edge_features)
@@ -162,18 +163,25 @@ class DualLayerModel(nn.Module):
 		hidden_channels (int): Number of hidden features per node.
 		dropout (float, optional): Dropout rate.
 	"""
-	def __init__(self, in_channels, hidden_channels = [2048, 2048, 1024, 1024], dropout=0.0, gnn_dropout = 0.2):
+	def __init__(self, in_channels, hidden_channels = [2048, 2048, 1024, 1024], dropout=0.0, network_skip = 0.2):
 		super().__init__()
 		self.layer_norm_input = nn.LayerNorm(in_channels)
-		self.NOD = NodeOnlyDecoder(in_channels=in_channels, hidden_channels=hidden_channels, dropout=dropout)
+		self.node_mlp = nn.Sequential(
+			nn.Linear(in_channels, in_channels),
+			nn.LayerNorm(in_channels),
+			nn.ReLU(),
+			nn.Dropout(p=dropout),
+			nn.Linear(in_channels, in_channels),
+			nn.LayerNorm(in_channels),
+			nn.ReLU()
+		)
 		self.GNN = GraphSAGE(in_channels=in_channels, hidden_channels=in_channels, dropout=dropout)
-		self.gnn_dropout = gnn_dropout
+		self.network_skip = network_skip
+		self.edge_decoder = EdgeDecoder(in_channels=in_channels, hidden_channels=hidden_channels, dropout=dropout)
 
 	def forward(self, x, supervision_edges, message_edges, message_edgewt=None):
-		x = self.layer_norm_input(x)
-		if torch.rand(1) >= self.gnn_dropout:
-			x = self.GNN(x, message_edges, message_edgewt)
-		return self.NOD(x, supervision_edges)
+		x = self.GNN(x, message_edges, message_edgewt) if torch.rand(1) >= self.network_skip else self.node_mlp(x)
+		return self.edge_decoder(x, supervision_edges)
 
 	
 class DecayScheduler:
@@ -183,7 +191,7 @@ class DecayScheduler:
 		
 		Args:
 			model: nn.Module with parameter to modify.
-			attr_name: str, exact attribute name (e.g. 'gnn_dropout').
+			attr_name: str, exact attribute name (e.g. 'network_skip').
 			initial_value: float, starting value.
 			factor: float, decay multiplier per epoch after cooldown.
 			cooldown: int, epochs to wait before starting decay.
@@ -206,6 +214,69 @@ class DecayScheduler:
 				self.current_value = new_value
 				setattr(self.model, self.attr_name, self.current_value)
 				print(f"Parameter {self.attr_name} decayed to {self.current_value:.4f} at epoch {self.epoch}")
+
+def InfoNCE(edge_embeddings, edge_labels, temperature=0.1, batch_size=4000):
+    """
+    Memory-efficient InfoNCE contrastive loss for edge embeddings.
+
+    Args:
+        edge_embeddings (torch.Tensor): Shape [num_edges, embedding_dim].
+        edge_labels (torch.Tensor): Binary labels (1=positive, 0=negative), shape [num_edges].
+        temperature (float): Scaling factor.
+        batch_size (int): Number of edges to process at a time.
+
+    Returns:
+        torch.Tensor: Scalar loss.
+    """
+    num_edges = edge_embeddings.size(0)
+    device = edge_embeddings.device
+    edge_labels = edge_labels.bool().to(device)
+
+    total_loss = 0.0
+    count = 0
+
+    for start in range(0, num_edges, batch_size):
+        end = min(start + batch_size, num_edges)
+        batch_emb = edge_embeddings[start:end]  # [B, D]
+
+        # Compute similarity of batch with all edges
+        sim = torch.matmul(batch_emb, edge_embeddings.T) / temperature  # [B, N]
+
+        # Positive mask for current batch vs all edges
+        batch_labels = edge_labels[start:end].unsqueeze(1)  # [B, 1]
+        positive_mask = batch_labels & edge_labels.unsqueeze(0)  # [B, N]
+
+        # Ignore self-similarity (optional)
+        if start == 0:  # only fill diagonal for first batch
+            diag_idx = torch.arange(end - start, device=device)
+            positive_mask[diag_idx, diag_idx] = False
+
+        # Numerator: logsumexp over positives
+        numerator = torch.logsumexp(sim.masked_fill(~positive_mask, float('-inf')), dim=1)
+        # Denominator: logsumexp over all similarities
+        denominator = torch.logsumexp(sim, dim=1)
+
+        total_loss += (denominator - numerator).sum()
+        count += (end - start)
+
+    return total_loss / count
+
+class InfoNCEWrapper(nn.Module):
+    def __init__(self, temperature=0.1, batch_size=4000, learnable=True):
+        super().__init__()
+        self.batch_size = batch_size
+        if learnable:
+            self.temperature = nn.Parameter(torch.tensor(temperature))
+        else:
+            self.register_buffer("temperature", torch.tensor(temperature))
+
+    def forward(self, edge_embeddings, edge_labels):
+        temp = softplus(self.temperature)
+        # clamp temperature range
+        temp = torch.clamp(temp, min= 0.05, max=0.5)
+        return InfoNCE(edge_embeddings, edge_labels, temperature=temp, batch_size=self.batch_size)
+
+
 
 	
 class EdgeSampler(torch.utils.data.IterableDataset):
@@ -857,7 +928,7 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	else:
 		conditional_backward = lambda loss: None  # No-op for validation
 
-	edge_probability, edge_weight_pred = model(
+	edge_features, edge_probability, edge_weights = model(
 		data.node_features,
 		message_edges=data.message_edges,
 		supervision_edges=data.supervision_edges,
@@ -865,7 +936,13 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	)
 	
 	# Compute BCE and MSE losses
-	loss = bce_loss(edge_probability.squeeze(-1), data.supervision_labels, weight=data.supervision_importance) + mse_loss(edge_weight_pred.squeeze(-1), data.supervision_edgewts)
+
+	loss = (
+		bce_loss(edge_probability.squeeze(-1),data.supervision_labels,weight=data.supervision_importance) +
+		mse_loss(edge_weights.squeeze(-1), data.supervision_edgewts) +
+		contrastive_loss(edge_features, data.supervision_labels)
+		)
+	
 	
 	# loss = calculate_loss(model_output, data, head_weights)
 	conditional_backward(loss)

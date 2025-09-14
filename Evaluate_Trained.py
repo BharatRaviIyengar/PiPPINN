@@ -200,10 +200,11 @@ def evaluate_predictions(edge_prob, edge_label, edgewt_pred, edgewt_actual, thre
 	Unified evaluation for probabilistic edge prediction.
 
 	Args:
-		y_true (array): Ground truth labels (binary {0,1} or continuous values).
-		y_prob (array): Predicted probabilities or continuous outputs.
-		task (str): "binary" (classification) or "continuous" (regression).
-		threshold (float): Threshold for confusion matrix in binary task.
+		edge_label (torch.tensor): Ground truth labels (0,1).
+		edge_prob (torch.tensor): Predicted probabilities.
+		edgewt_actual (torch.tensor): Actual edge weights.
+		edgewt_pred (torch.tensor): Predicted edge weights.
+		threshold (float): Threshold for confusion matrix.
 		n_bins (int): Number of bins for calibration curve.
 
 	Returns:
@@ -211,8 +212,8 @@ def evaluate_predictions(edge_prob, edge_label, edgewt_pred, edgewt_actual, thre
 	"""
 	edge_label = edge_label.cpu().numpy()
 	edge_prob = edge_prob.cpu().numpy()
-	edgewt_actual = edge_label.cpu().numpy()
-	edgewt_pred = edge_prob.cpu().numpy()
+	edgewt_actual = edgewt_actual.cpu().numpy()
+	edgewt_pred = edgewt_pred.cpu().numpy()
 
 	results = {}
 
@@ -222,7 +223,7 @@ def evaluate_predictions(edge_prob, edge_label, edgewt_pred, edgewt_actual, thre
 	results["ConfusionMatrix"] = confusion_matrix(edge_label, y_pred)
 
 	# Probabilistic metrics
-	results["LogLoss"] = log_loss(edge_label, edge_prob, eps=1e-15)
+	results["LogLoss"] = log_loss(edge_label, edge_prob)
 	results["BrierScore"] = brier_score_loss(edge_label, edge_prob)
 
 	# Ranking metrics
@@ -367,6 +368,16 @@ if __name__ == "__main__":
 		edge_prob_GNN[batch.eval_edge_indices] = (edge_prob_GNN[batch.eval_edge_indices] + edge_predictions.squeeze(-1))/2
 		pred_edgewts_GNN[batch.eval_edge_indices] = (pred_edgewts_GNN[batch.eval_edge_indices] + predicted_edgewts.squeeze(-1))/2
 
+	torch.save({
+		"edge_prob_NOD": edge_prob_NOD,
+		"pred_edgewts_NOD": pred_edgewts_NOD,
+		"edge_prob_GNN": edge_prob_GNN,
+		"pred_edgewts_GNN": pred_edgewts_GNN,
+		"edge_labels": edge_labels,
+		"edge_weights": edge_weights
+	}, f"{args.outdir}/predictions.pt"
+	)
+
 	results_NOD = evaluate_predictions(
 		edge_prob = edge_prob_NOD,
 		edge_label = edge_labels,
@@ -385,6 +396,7 @@ if __name__ == "__main__":
 		n_bins=10
 	)
 
+	
 	# Plot calibration curves
 	import matplotlib.pyplot as plt
 	plt.figure(figsize=(8, 6))

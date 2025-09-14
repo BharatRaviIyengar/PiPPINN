@@ -40,7 +40,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	scheduler_factor = params['scheduler_factor']
 	nbr_wt_intensity = params['nbr_weight_intensity']
 	hidden_channels = params['hidden_channels']
-	GNN_dropout_factor = params['GNN_dropout_factor']
+	network_skip_factor = params['network_skip_factor']
 	
 	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
 
@@ -53,7 +53,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 			in_channels=data_for_training[0]["input_channels"],
 			hidden_channels=hidden_channels,
 			dropout=dropout,
-			gnn_dropout=0.5
+			network_skip=0.5
 		).to(device)
 	
 	optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=weight_decay)
@@ -66,7 +66,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		min_lr=1e-6
 	)
 
-	GNN_dropout_scheduler = utils.DecayScheduler(model, 'gnn_dropout', initial_value=0.5, factor=GNN_dropout_factor, cooldown=2, min_value=0.05)
+	network_skip_scheduler = utils.DecayScheduler(model, 'network_skip', initial_value=0.6, factor=network_skip_factor, cooldown=2, min_value=0.05)
 
 	# Training loop
 	best_val_loss = float('inf')
@@ -98,7 +98,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		average_train_loss = total_train_loss / train_batch_count
 		average_val_loss = total_val_loss / val_batch_count
 		scheduler.step(average_val_loss)
-		GNN_dropout_scheduler.step()
+		network_skip_scheduler.step()
 
 		# Early stopping logic
 		if average_val_loss < best_val_loss:
@@ -220,7 +220,7 @@ if __name__ == "__main__":
 			"weight_decay": trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True),
 			"scheduler_factor": trial.suggest_float("scheduler_factor", 0.1, 0.5),
 			"nbr_weight_intensity": trial.suggest_float("nbr_weight_intensity", 0.4, 2.5, log=True),
-			"GNN_dropout_factor": trial.suggest_float("GNN_dropout_factor", 0.1, 0.9, log=True),
+			"network_skip_factor": trial.suggest_float("network_skip_factor", 0.1, 0.9, log=True),
 			"hidden_channels" : hidden_channels
 		}
 		for result in run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads):
