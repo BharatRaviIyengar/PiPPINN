@@ -14,19 +14,16 @@ from optuna.pruners import HyperbandPruner
 from glob import glob
 import gc
 
-def generate_hidden_dims(depth, last_layer_size):
+def generate_hidden_dims(input_dim, depth, last_layer_size):
 	n_layers = depth - 1  # intermediate layers count (excluding first)
-	start_size = 2048
-
+	
 	if n_layers == 0:
 		return []  # no intermediate layers, just input and last layer
 
-	decay_factor = (last_layer_size / start_size) ** (1 / n_layers)
-	sizes = []
-	for i in range(1, n_layers):
-		size = int(start_size * (decay_factor ** i))
-		sizes.append(size)
-	return sizes
+	decay_factor = (last_layer_size / input_dim) ** (1 / n_layers)
+	hidden_dims = [int(input_dim * decay_factor ** i) for i in range(n_layers)]
+
+	return hidden_dims
 
 
 
@@ -200,6 +197,7 @@ if __name__ == "__main__":
 	print(f"Using device: {device}")
 
 	dataset = torch.load(args.training_data, weights_only = False)
+	input_channels = dataset[0]["Val"].x.size(1)
 
 	def early_stop_callback(study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
 		if len(study.trials) > 10:
@@ -213,7 +211,7 @@ if __name__ == "__main__":
 		early_stopping_epoch = 0
 		depth = trial.suggest_int("depth", 3, 5)
 		last_layer_size = trial.suggest_categorical("last_layer_size", [512, 1024])
-		hidden_channels = generate_hidden_dims(depth, last_layer_size) + [last_layer_size]
+		hidden_channels = generate_hidden_dims(input_channels, depth, last_layer_size) + [last_layer_size]
 		params = {
 			"centrality_fraction": trial.suggest_float("centrality_fraction", 0.2, 0.69, log=True),
 			"dropout": trial.suggest_float("dropout", 0.1, 0.35),
