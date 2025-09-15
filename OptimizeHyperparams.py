@@ -147,7 +147,7 @@ if __name__ == "__main__":
 	parser.add_argument("--num_trials","-n",
 		type=int,
 		help="Number of trials to generate",
-		default=50
+		default=40
 	)
 	parser.add_argument("--params_best",
 		type=str,
@@ -210,7 +210,7 @@ if __name__ == "__main__":
 		best_train_loss = float('inf')
 		early_stopping_epoch = 0
 		depth = trial.suggest_int("depth", 3, 5)
-		last_layer_size = trial.suggest_categorical("last_layer_size", [512, 1024])
+		last_layer_size = trial.suggest_categorical("last_layer_size", [768, 1024, 1536, 2048])
 		hidden_channels = generate_hidden_dims(input_channels, depth, last_layer_size) + [last_layer_size]
 		params = {
 			"centrality_fraction": trial.suggest_float("centrality_fraction", 0.2, 0.69, log=True),

@@ -278,7 +278,7 @@ class InfoNCEWrapper(nn.Module):
 		return InfoNCE(edge_embeddings, edge_labels, temperature=temp, batch_size=self.batch_size)
 
 
-contrastive_loss = InfoNCEWrapper(temperature=0.1, batch_size=4000, learnable=True)
+contrastive_loss = InfoNCEWrapper(temperature=0.1, batch_size=1000, learnable=True)
 	
 class EdgeSampler(torch.utils.data.IterableDataset):
 	"""
