@@ -215,13 +215,13 @@ class DecayScheduler:
 				setattr(self.model, self.attr_name, self.current_value)
 				print(f"Parameter {self.attr_name} decayed to {self.current_value:.4f} at epoch {self.epoch}")
 
-def InfoNCE(edge_embeddings, edge_labels, temperature=0.1, batch_size=4000):
+def BCE_contrastive_loss(edge_embeddings, num_positive_edges, temperature=0.1, batch_size=4000):
 	"""
 	Memory-efficient InfoNCE contrastive loss for edge embeddings.
 
 	Args:
 		edge_embeddings (torch.Tensor): Shape [num_edges, embedding_dim].
-		edge_labels (torch.Tensor): Binary labels (1=positive, 0=negative), shape [num_edges].
+		last_positive_idx: Last index of positive edges in the edge tensor. This function assumes that edges are ordered as [positive, negative]
 		temperature (float): Scaling factor.
 		batch_size (int): Number of edges to process at a time.
 
@@ -230,39 +230,29 @@ def InfoNCE(edge_embeddings, edge_labels, temperature=0.1, batch_size=4000):
 	"""
 	num_edges = edge_embeddings.size(0)
 	device = edge_embeddings.device
-	edge_labels = edge_labels.bool().to(device)
 	edge_embeddings = Normalize(edge_embeddings, p=2, dim=-1)
 
 	total_loss = 0.0
-	count = 0
 
-	for start in range(0, num_edges, batch_size):
-		end = min(start + batch_size, num_edges)
-		batch_emb = edge_embeddings[start:end]  # [B, D]
+	def calc_loss(begin,total,label:float):
+		updiagmask = torch.triu(torch.ones((batch_size, total), dtype = torch.bool, device=device))
+		labels = torch.full((batch_size, total), label)
+		loss = 0.0
+		for start in range(begin, total, batch_size):
+			end = min(start + batch_size, total)
+			actual_batch_size = end - start
+			mask = updiagmask[:actual_batch_size, :]
+			batch_emb = edge_embeddings[start:end]
+			sim = torch.matmul(batch_emb, edge_embeddings.T) / temperature
+			loss += bce_loss(sim[mask],labels[:mask.sum()])
+		return loss
 
-		# Compute similarity of batch with all edges
-		sim = torch.matmul(batch_emb, edge_embeddings.T) / temperature  # [B, N]
+	total_loss += calc_loss(0,num_positive_edges,1.0)
+	total_loss += calc_loss(num_positive_edges, num_edges, 0.0)
+	
+	return total_loss
 
-		# Positive mask for current batch vs all edges
-		batch_labels = edge_labels[start:end].unsqueeze(1)  # [B, 1]
-		positive_mask = batch_labels & edge_labels.unsqueeze(0)  # [B, N]
-
-		# Ignore self-similarity (optional)
-		if start == 0:  # only fill diagonal for first batch
-			diag_idx = torch.arange(end - start, device=device)
-			positive_mask[diag_idx, diag_idx] = False
-
-		# Numerator: logsumexp over positives
-		numerator = torch.logsumexp(sim.masked_fill(~positive_mask, float('-inf')), dim=1)
-		# Denominator: logsumexp over all similarities
-		denominator = torch.logsumexp(sim, dim=1)
-
-		total_loss += (denominator - numerator).sum()
-		count += (end - start)
-
-	return total_loss / count
-
-class InfoNCEWrapper(nn.Module):
+class ContrastiveLossWrapper(nn.Module):
 	def __init__(self, temperature=0.1, batch_size=4000, learnable=True):
 		super().__init__()
 		self.batch_size = batch_size
@@ -275,10 +265,10 @@ class InfoNCEWrapper(nn.Module):
 		temp = softplus(self.temperature)
 		# clamp temperature range
 		temp = torch.clamp(temp, min= 0.05, max=0.5)
-		return InfoNCE(edge_embeddings, edge_labels, temperature=temp, batch_size=self.batch_size)
+		return BCE_contrastive_loss(edge_embeddings, edge_labels, temperature=temp, batch_size=self.batch_size)
 
 
-contrastive_loss = InfoNCEWrapper(temperature=0.1, batch_size=1000, learnable=True)
+contrastive_loss = ContrastiveLossWrapper(temperature=0.1, batch_size=4000, learnable=True)
 	
 class EdgeSampler(torch.utils.data.IterableDataset):
 	"""
