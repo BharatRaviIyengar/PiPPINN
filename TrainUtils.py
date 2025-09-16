@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.nn.functional import relu as ReLU, binary_cross_entropy_with_logits as bce_loss, mse_loss, softplus, normalize as Normalize
+from torch.nn.functional import relu as ReLU, binary_cross_entropy_with_logits as bce_logit_loss, binary_cross_entropy as bce_loss, mse_loss, softplus, normalize as Normalize
 from torch_geometric.data import Data
 from torch_geometric.utils import degree
 from torch_geometric.utils.map import map_index
@@ -8,7 +8,7 @@ from torch_scatter import scatter_max
 from warnings import warn
 from pathlib import Path
 from max_nbr import max_nbr
-from collections import namedtuple
+
 
 class EdgeDecoder(nn.Module):
 	"""
@@ -215,14 +215,13 @@ class DecayScheduler:
 				setattr(self.model, self.attr_name, self.current_value)
 				print(f"Parameter {self.attr_name} decayed to {self.current_value:.4f} at epoch {self.epoch}")
 
-def BCE_contrastive_loss(edge_embeddings, num_positive_edges, temperature=0.1, batch_size=4000):
+def BCE_contrastive_loss(edge_embeddings, num_positive_edges, batch_size=4000):
 	"""
 	Memory-efficient InfoNCE contrastive loss for edge embeddings.
 
 	Args:
 		edge_embeddings (torch.Tensor): Shape [num_edges, embedding_dim].
-		last_positive_idx: Last index of positive edges in the edge tensor. This function assumes that edges are ordered as [positive, negative]
-		temperature (float): Scaling factor.
+		num_positive_edges: Last index of positive edges in the edge tensor. This function assumes that edges are ordered as [positive, negative]
 		batch_size (int): Number of edges to process at a time.
 
 	Returns:
@@ -232,44 +231,59 @@ def BCE_contrastive_loss(edge_embeddings, num_positive_edges, temperature=0.1, b
 	device = edge_embeddings.device
 	edge_embeddings = Normalize(edge_embeddings, p=2, dim=-1)
 
-	total_loss = 0.0
+	coordinates = torch.zeros((3,2,2), dtype=torch.long)
+	# Each coordinate slice has:
+	# [row_start, row_end
+	#  col_start, col_end]
 
-	def calc_loss(begin,total,label:float):
-		updiagmask = torch.triu(torch.ones((batch_size, total), dtype = torch.bool, device=device))
-		labels = torch.full((batch_size, total), label)
-		loss = 0.0
-		for start in range(begin, total, batch_size):
-			end = min(start + batch_size, total)
+	# positive edges vs positive edges
+	coordinates[0,:,1] = num_positive_edges 
+
+	# negative edges vs negative edges
+	coordinates[1,:,0] = num_positive_edges 
+	coordinates[1,:,1] = num_edges
+
+	# positive edges vs negative edges
+	coordinates[2,0,1] = num_positive_edges
+	coordinates[2,1,0] = num_positive_edges
+	coordinates[2,1,1] = num_edges
+
+	loss = 0.0
+
+	for slice in range(3):
+		row_begin = coordinates[slice,0,0]
+		row_end = coordinates[slice,0,1]
+		col_begin = coordinates[slice,1,0]
+		col_end   = coordinates[slice,1,1]
+
+		edge_emb_2 = edge_embeddings[col_begin:col_end]
+		num_columns = edge_emb_2.size(0)
+		mask = torch.ones((batch_size, num_columns), dtype = torch.bool, device=device)
+		label_val = 0.0
+		if slice < 2:
+			mask = torch.triu(mask)
+			label_val = 1.0
+		labels = torch.full((mask.sum().item(),), label_val, device=device)
+		for start in range(row_begin, row_end, batch_size):
+			end = min(start + batch_size, row_end)
 			actual_batch_size = end - start
-			mask = updiagmask[:actual_batch_size, :]
-			batch_emb = edge_embeddings[start:end]
-			sim = torch.matmul(batch_emb, edge_embeddings.T) / temperature
-			loss += bce_loss(sim[mask],labels[:mask.sum()])
-		return loss
+			mask_batch = mask[:actual_batch_size, :]
+			edge_emb_1 = edge_embeddings[start:end]
+			sim = (torch.matmul(edge_emb_1, edge_emb_2.T) + 1) / 2  # Scale cosine similarity to [0, 1]
+			loss += bce_loss(sim[mask_batch],labels[:mask_batch.sum()])
 
-	total_loss += calc_loss(0,num_positive_edges,1.0)
-	total_loss += calc_loss(num_positive_edges, num_edges, 0.0)
-	
-	return total_loss
+	return loss/num_edges
 
-class ContrastiveLossWrapper(nn.Module):
-	def __init__(self, temperature=0.1, batch_size=4000, learnable=True):
-		super().__init__()
+class BCE_ContrastiveLoss():
+	"""
+	Wrapper for the BCE_contrastive_loss function to be used as a loss module.
+	"""
+	def __init__(self, num_positive_edges = 12000, batch_size=4000):
 		self.batch_size = batch_size
-		if learnable:
-			self.temperature = nn.Parameter(torch.tensor(temperature))
-		else:
-			self.register_buffer("temperature", torch.tensor(temperature))
+		self.num_positive_edges = num_positive_edges
+	def __call__(self, edge_embeddings):
+		return BCE_contrastive_loss(edge_embeddings, self.num_positive_edges, self.batch_size)
 
-	def forward(self, edge_embeddings, edge_labels):
-		temp = softplus(self.temperature)
-		# clamp temperature range
-		temp = torch.clamp(temp, min= 0.05, max=0.5)
-		return BCE_contrastive_loss(edge_embeddings, edge_labels, temperature=temp, batch_size=self.batch_size)
-
-
-contrastive_loss = ContrastiveLossWrapper(temperature=0.1, batch_size=4000, learnable=True)
-	
 class EdgeSampler(torch.utils.data.IterableDataset):
 	"""
 	Samples minibatches of edges based on centrality or uniform probability.
@@ -301,7 +315,6 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			  max_neighbors = 30,
 			  frac_sample_from_unsampled=0.1,
 			  nbr_weight_intensity=1.0,
-				edge_dropout = 0.2,
 			  device=None,
 			  threads=1):  
 		super().__init__()
@@ -347,7 +360,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		if negative_edges is not None:  
 			self.negative_edges = negative_edges.to(self.device) 
 		else:  
-			self.negative_edges = generate_negative_edges(self.positive_graph,device=self.device).to(self.device)
+			self.negative_edges = generate_negative_edges(positive_graph,device=self.device).to(self.device)
 		
 		if negative_batch_size is None:  
 				self.negative_batch_size = int(self.batch_size*supervision_fraction)*2 # Twice the number of supervision edges  
@@ -854,43 +867,7 @@ def generate_negative_edges(positive_graph: Data, negative_positive_ratio=2, dev
 	# Return negative edges
 	return torch.stack([valid_src, valid_dst], dim=0)
 
-def normalize_values(values: torch.tensor, min_val=None, max_val=None):
-	"""
-	Normalize values to the range [0, 1].
-
-	Args:
-		values (torch.Tensor): Input tensor of values.
-		min_val (float, optional): Minimum value for normalization. If None, uses min of values.
-		max_val (float, optional): Maximum value for normalization. If None, uses max of values.
-
-	Returns:
-		torch.Tensor: Normalized values.
-	"""
-	if min_val is None:
-		min_val = values.min()
-	if max_val is None:
-		max_val = values.max()
-	return (values - min_val) / (max_val - min_val)
-
-def calculate_loss(model_output, data, head_weights = [0.5, 0.5]):
-	"""
-	Calculates the loss for the model output.
-
-	Args:
-		model_output (tuple): Output from the model containing edge probabilities and edge weights. DualHeadModel outputs two tuples of (edge_weights, edge_predictor) where the first tuple is for the GNN and the second is for the node-only decoder.
-		data (torch_geometric.data.Data): Data object containing supervision labels and importance.
-		head_weights (torch.Tensor): Weights for the heads in the model.
-	Returns:
-		torch.Tensor: Computed loss value.
-	"""
-	assert len(model_output) == len(head_weights), "Mismatch between model output and head weights length."
-	total_loss = torch.tensor(0.0, device=data.supervision_labels.device, requires_grad=True)
-
-	for i, w in enumerate(head_weights):
-		edge_probability, edge_weight_pred = model_output[i]
-		loss = bce_loss(edge_probability.squeeze(-1), data.supervision_labels, weight=data.supervision_importance) + mse_loss(edge_weight_pred.squeeze(-1), data.supervision_edgewts)
-		total_loss = total_loss + w * loss
-	return total_loss
+contrastive_loss = BCE_ContrastiveLoss()
 
 def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False):
 	"""
@@ -929,9 +906,9 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	# Compute BCE and MSE losses
 
 	loss = (
-		bce_loss(edge_probability.squeeze(-1),data.supervision_labels,weight=data.supervision_importance) +
+		bce_logit_loss(edge_probability.squeeze(-1),data.supervision_labels,weight=data.supervision_importance) +
 		mse_loss(edge_weights.squeeze(-1), data.supervision_edgewts) +
-		contrastive_loss(edge_features, data.supervision_labels)
+		contrastive_loss(edge_features) # should be defined using BCE_ContrastiveLoss wrapper
 		)
 	
 	

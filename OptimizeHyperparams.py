@@ -41,6 +41,8 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	
 	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
 
+	utils.contrastive_loss.num_positive_edges = data_for_training[0]["train_sampler"].num_supervision_edges
+
 	del dataset
 	gc.collect()
 	torch.cuda.empty_cache()
