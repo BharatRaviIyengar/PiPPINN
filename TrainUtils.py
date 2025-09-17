@@ -272,9 +272,10 @@ def BCE_contrastive_loss(edge_embeddings, num_positive_edges, batch_size=4000):
 			edge_emb_1 = edge_embeddings[start:end]
 			sim = torch.matmul(edge_emb_1, edge_emb_2.T)
 			sim = ((sim + 1)/2).clamp(min=0.0, max=1.0)	# Scale cosine similarity to [0,1]
-			loss += bce_loss(sim[mask_batch],labels[:mask_batch.sum()])
+			num_pairs = mask_batch.sum()
+			loss += bce_loss(sim[mask_batch],labels[:num_pairs])/num_pairs
 
-	return loss/num_edges
+	return loss
 
 class BCE_ContrastiveLoss():
 	"""
