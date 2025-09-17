@@ -60,7 +60,7 @@ class EdgeDecoder(nn.Module):
 		edge_features = self.edge_embedder(torch.cat([add, prod], dim=-1))
 		edge_probabilities = self.edge_prob_head(edge_features)
 		edge_weights = ReLU(self.edge_wt_head(edge_features))
-		return edge_features, edge_probabilities, edge_weights
+		return edge_probabilities, edge_weights
 
 
 class Pool_SAGEConv(nn.Module):
@@ -286,6 +286,31 @@ class BCE_ContrastiveLoss():
 		self.num_positive_edges = num_positive_edges
 	def __call__(self, edge_embeddings):
 		return BCE_contrastive_loss(edge_embeddings, self.num_positive_edges, self.batch_size)
+
+def hinge_loss(margin: float, positive_logits, negative_logits):
+	loss_margin = torch.relu(margin - positive_logits).mean() + torch.relu(margin + negative_logits).mean()
+	return loss_margin
+
+def total_entropy(logits):
+	log_p = -softplus(-logits)
+	log_1mp = -softplus(logits)
+	p = torch.exp(log_p)
+	entropy = -(p * log_p + (1 - p) * log_1mp).mean()
+	return entropy
+
+class Margin_and_Entropy():
+	def __init__(self, num_positive_edges = 12000, margin = 0.5, margin_loss_coef = 0.05, entropy_coef = 0.005):
+		self.num_positive_edges = num_positive_edges
+		self.margin = margin
+		self.margin_loss_coef = margin_loss_coef
+		self.entropy_coef = entropy_coef
+	def __call__(self, logits):
+		positive_logits = logits[:self.num_positive_edges]
+		negative_logits = logits[self.num_positive_edges:]
+		loss_margin = hinge_loss(self.margin, positive_logits, negative_logits)
+		entropy = total_entropy(logits)
+		return self.margin_loss_coef * loss_margin - self.entropy_coef * entropy
+
 
 class EdgeSampler(torch.utils.data.IterableDataset):
 	"""
@@ -870,7 +895,39 @@ def generate_negative_edges(positive_graph: Data, negative_positive_ratio=2, dev
 	# Return negative edges
 	return torch.stack([valid_src, valid_dst], dim=0)
 
-contrastive_loss = BCE_ContrastiveLoss()
+ME_loss = Margin_and_Entropy()
+
+def auc_score(preds: torch.Tensor, labels: torch.Tensor):
+    """
+    Compute ROC-AUC score for binary classification.
+    
+    Args:
+        preds: torch.Tensor of predicted probabilities or logits, shape [N]
+        labels: torch.Tensor of ground-truth labels (0 or 1), shape [N]
+    
+    Returns:
+        auc: float scalar
+    """
+    # If logits, convert to probabilities
+    if preds.min() < 0 or preds.max() > 1:
+        preds = torch.sigmoid(preds)
+    
+    labels = labels.float()
+    
+    # Sort by predictions descending
+    sorted_preds, idx = torch.sort(preds, descending=True)
+    sorted_labels = labels[idx]
+    
+    # Cumulative sums of positives and negatives
+    tp = torch.cumsum(sorted_labels, dim=0)
+    fp = torch.cumsum(1 - sorted_labels, dim=0)
+    
+    tp_rate = tp / tp[-1]  # TPR
+    fp_rate = fp / fp[-1]  # FPR
+    
+    # Compute AUC using trapezoid rule
+    auc = torch.trapz(tp_rate, fp_rate).item()
+    return auc
 
 def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False):
 	"""
@@ -899,21 +956,21 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	else:
 		conditional_backward = lambda loss: None  # No-op for validation
 
-	edge_features, edge_probability, edge_weights = model(
+	edge_probability, edge_weights = model(
 		data.node_features,
 		message_edges=data.message_edges,
 		supervision_edges=data.supervision_edges,
 		message_edgewt = data.message_edgewts
 	)
-	
-	# Compute BCE and MSE losses
+	edge_probability = edge_probability.squeeze(-1)
 
-	loss = (
-		bce_logit_loss(edge_probability.squeeze(-1),data.supervision_labels,weight=data.supervision_importance) +
-		mse_loss(edge_weights.squeeze(-1), data.supervision_edgewts) +
-		contrastive_loss(edge_features) # should be defined using BCE_ContrastiveLoss wrapper
-		)
-	
+	# Compute losses
+
+	bce_edge_classification_loss = bce_logit_loss(edge_probability,data.supervision_labels,weight=data.supervision_importance)
+	mse_edge_weight_loss = mse_loss(edge_weights.squeeze(-1), data.supervision_edgewts)
+	margin_and_entropy_loss = ME_loss(edge_probability)
+
+	loss = bce_edge_classification_loss + mse_edge_weight_loss + margin_and_entropy_loss
 	
 	# loss = calculate_loss(model_output, data, head_weights)
 	conditional_backward(loss)

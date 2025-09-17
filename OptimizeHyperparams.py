@@ -25,8 +25,6 @@ def generate_hidden_dims(input_dim, depth, last_layer_size):
 
 	return hidden_dims
 
-
-
 def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, max_epochs = 200, threads:int=1):
 	""" Run training for a single trial with the given parameters."""
 
@@ -41,8 +39,12 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	
 	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
 
-	utils.contrastive_loss.num_positive_edges = data_for_training[0]["train_sampler"].num_supervision_edges
-	utils.contrastive_loss.batch_size = 1000
+	utils.ME_loss.num_positive_edges = data_for_training[0]["train_sampler"].num_supervision_edges
+	utils.ME_loss.margin = params['margin']
+	utils.ME_loss.margin_loss_coef = params['margin_loss_coef']
+	utils.ME_loss.entropy_coef = params['entropy_coef']
+
+
 	del dataset
 	gc.collect()
 	torch.cuda.empty_cache()
@@ -221,6 +223,9 @@ if __name__ == "__main__":
 			"scheduler_factor": trial.suggest_float("scheduler_factor", 0.1, 0.5),
 			"nbr_weight_intensity": trial.suggest_float("nbr_weight_intensity", 0.4, 2.5, log=True),
 			"network_skip_factor": trial.suggest_float("network_skip_factor", 0.1, 0.9, log=True),
+			"margin": trial.suggest_float("margin", 0.1, 1.0, log=True),
+			"margin_loss_coef": trial.suggest_float("margin_loss_coef", 0.01, 0.1, log=True),
+			"entropy_coef": trial.suggest_float("entropy_coef", 0.001, 0.01, log=True),
 			"hidden_channels" : hidden_channels
 		}
 		for result in run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads):
