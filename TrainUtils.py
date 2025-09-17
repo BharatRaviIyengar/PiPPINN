@@ -262,6 +262,7 @@ def BCE_contrastive_loss(edge_embeddings, num_positive_edges, batch_size=4000):
 		label_val = 0.0
 		if slice < 2:
 			mask = torch.triu(mask)
+			mask.fill_diagonal_(False)
 			label_val = 1.0
 		labels = torch.full((mask.sum().item(),), label_val, device=device)
 		for start in range(row_begin, row_end, batch_size):
@@ -269,7 +270,8 @@ def BCE_contrastive_loss(edge_embeddings, num_positive_edges, batch_size=4000):
 			actual_batch_size = end - start
 			mask_batch = mask[:actual_batch_size, :]
 			edge_emb_1 = edge_embeddings[start:end]
-			sim = (torch.matmul(edge_emb_1, edge_emb_2.T) + 1) / 2  # Scale cosine similarity to [0, 1]
+			sim = torch.matmul(edge_emb_1, edge_emb_2.T)
+			sim = ((sim + 1)/2).clamp(min=0.0, max=1.0)	# Scale cosine similarity to [0,1]
 			loss += bce_loss(sim[mask_batch],labels[:mask_batch.sum()])
 
 	return loss/num_edges
