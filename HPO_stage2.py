@@ -59,10 +59,10 @@ def analyze_study_refined_simple(study: optuna.study.Study, topk: int = 20, cv_t
 				}
 		elif isinstance(dist, optuna.distributions.CategoricalDistribution):
 			ptype = "categorical"
-			values = [t.params[p] for t in best_trials]
-			enqueued_params[p] = max(set(values), key=values.count)
-			if cvs[i] > cv_thresh and param_importance.get(p, 0) > importance_thresh:
-				new_ranges[p] = {"choices": param_types[p].choices, "type": ptype}
+			unique_values = set(values[i])
+			enqueued_params[p] = max(unique_values, key=values[i].count)
+			if len(unique_values)>1 and param_importance.get(p, 0) > importance_thresh:
+				new_ranges[p] = {"choices": unique_values, "type": ptype}
 
 	return AnalysisResult(param_importance, enqueued_params, new_ranges)
 
