@@ -1,11 +1,6 @@
 import numpy as np
 import optuna
 from collections import namedtuple
-import OptimizeHyperparameters as ohp
-
-import numpy as np
-import optuna
-from collections import namedtuple
 
 AnalysisResult = namedtuple("AnalysisResult",
 	["param_names", "param_importance", "params_to_sample", "enqueued_params", "new_ranges"])
@@ -22,7 +17,8 @@ def analyze_study_refined_simple(study: optuna.study.Study, topk: int = 20, cv_t
 	AnalysisResult namedtuple
 	"""
 	# 1. Get top-k trials
-	best_trials = sorted(study.trials, key=lambda t: t.value)[:topk]
+	completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+	best_trials = sorted(completed_trials, key=lambda t: t.value)[:topk]
 	param_names = list(best_trials[0].params.keys())
 	param_types = best_trials[0].distributions
 	n_params = len(param_names)
@@ -35,35 +31,32 @@ def analyze_study_refined_simple(study: optuna.study.Study, topk: int = 20, cv_t
 
 	new_ranges = {}
 	enqueued_params = {}
-	for i, p in enumerate(param_names):
-		dist = param_types[p]
-		if isinstance(dist, (optuna.distributions.FloatDistribution, optuna.distributions.IntDistribution)):
-			is_int = isinstance(dist, optuna.distributions.IntDistribution)
-			islog = dist.log
-			
-			if islog:
-				median_val = np.exp(np.log(values[i]))
-			else:
-				median_val = np.median(values[i])
-			if is_int:
-				median_val = int(median_val)
-			
-			enqueued_params[p] = median_val
-
-			if cvs[i] > cv_thresh and param_importance.get(p, 0) > importance_thresh:
-				new_ranges[p] = {
-				"min": float(values[i].min()),
-				"max": float(values[i].max()),
-				"log": islog,
-				"type": "int" if is_int else "float"
-				}
-		elif isinstance(dist, optuna.distributions.CategoricalDistribution):
-			ptype = "categorical"
-			unique_values = set(values[i])
-			enqueued_params[p] = max(unique_values, key=values[i].count)
-			if len(unique_values)>1 and param_importance.get(p, 0) > importance_thresh:
-				new_ranges[p] = {"choices": unique_values, "type": ptype}
-
-	return AnalysisResult(param_importance, enqueued_params, new_ranges)
+for i, p in enumerate(param_names):
+	dist = param_types[p]
+	if isinstance(dist, (optuna.distributions.FloatDistribution, optuna.distributions.IntDistribution)):
+		is_int = isinstance(dist, optuna.distributions.IntDistribution)
+		islog = dist.log	
+		if islog:
+			median_val = np.exp(np.median(np.log(values[i])))
+		else:
+			median_val = np.median(values[i])
+		if is_int:
+			median_val = int(median_val)
+		
+		enqueued_params[p] = median_val
+		if cvs[i] > cv_thresh and param_importance.get(p, 0) > importance_thresh:
+			new_ranges[p] = {
+			"min": float(values[i].min()),
+			"max": float(values[i].max()),
+			"log": islog,
+			"type": "int" if is_int else "float"
+			}
+	elif isinstance(dist, optuna.distributions.CategoricalDistribution):
+		ptype = "categorical"
+		unique, counts = np.unique(values[i], return_counts=True)
+		enqueued_params[p] = unique[np.argmax(counts)]
+		if len(unique_values)>1 and param_importance.get(p, 0) > importance_thresh:
+			new_ranges[p] = {"choices": unique_values, "type": ptype}
+return AnalysisResult(param_importance, enqueued_params, new_ranges)
 
 
