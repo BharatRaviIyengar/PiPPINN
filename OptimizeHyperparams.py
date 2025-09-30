@@ -69,9 +69,15 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 
 	network_skip_scheduler = utils.DecayScheduler(model, 'network_skip', initial_value=0.6, factor=network_skip_factor, cooldown=2, min_value=0.05)
 
+	total_val_samples = sum([(data["val_sampler"].num_supervision_edges + data["val_sampler"].num_negative_edges)*data["val_sampler"].num_batches for data in data_for_training])
+
+	preds_buf = torch.zeros(total_val_samples, dtype=torch.float32)
+	labels_buf = torch.zeros(total_val_samples, dtype=torch.int8)
+
 	# Training loop
 	best_val_loss = float('inf')
 	best_train_loss = float('inf')
+	best_auc = 0.0
 	epochs_without_improvement = 0
 	early_stopping_epoch = max_epochs
 
@@ -80,33 +86,41 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		total_val_loss = 0.0  # Reset total validation loss for the epoch
 		val_batch_count = 0
 		train_batch_count = 0
-		
+		fill_idx = 0
+
 		for data in data_for_training:
 			# Training
 			model.train()
 			for batch in data["train_batch_loader"]:
 				train_batch_count += 1
-				total_train_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=True)
+				train_loss = utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=True, return_output=False)
+				total_train_loss += train_loss # type: ignore
 
 			# Validation
 			model.eval()
 			with torch.no_grad():
 				for batch in data["val_batch_loader"]:
 					val_batch_count += 1
-					total_val_loss += utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=False)
+					val_loss, edge_prob, edge_labels = utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=False, return_output=True) # type: ignore
+					total_val_loss += val_loss
+					n = edge_prob.size(0)
+					preds_buf[fill_idx:fill_idx+n] = edge_prob.cpu()
+					labels_buf[fill_idx:fill_idx+n] = edge_labels.cpu()
+					fill_idx += n
 
 		# Average losses
 		average_train_loss = total_train_loss / train_batch_count
 		average_val_loss = total_val_loss / val_batch_count
 		scheduler.step(average_val_loss)
 		network_skip_scheduler.step()
-
+		auc = utils.auc_score(labels_buf, preds_buf)
 		# Early stopping logic
 		if average_val_loss < best_val_loss:
 			best_val_loss = average_val_loss
 			best_train_loss = average_train_loss
 			epochs_without_improvement = 0
 			early_stopping_epoch = epoch + 1
+			best_auc = auc
 		else:
 			epochs_without_improvement += 1
 		
@@ -118,6 +132,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		"best_train_loss": best_train_loss,
 		"early_stopping_epoch": early_stopping_epoch,
 		"learning_rate": optimizer.param_groups[0]['lr'],
+		"best_auc": best_auc
 		}
 		
 		if epochs_without_improvement >= patience:
@@ -213,6 +228,7 @@ if __name__ == "__main__":
 		best_val_loss = float('inf')
 		best_train_loss = float('inf')
 		early_stopping_epoch = 0
+		best_auc = 0.0
 		depth = trial.suggest_int("depth", 3, 5)
 		last_layer_size = trial.suggest_categorical("last_layer_size", [768, 1024, 1536, 2048])
 		hidden_channels = generate_hidden_dims(input_channels, depth, last_layer_size) + [last_layer_size]
@@ -234,6 +250,7 @@ if __name__ == "__main__":
 			best_val_loss = result["best_val_loss"]
 			best_train_loss = result["best_train_loss"]
 			early_stopping_epoch = result["early_stopping_epoch"]
+			best_auc = result["best_auc"]
 			for key, value in result.items():
 				print(f"Epoch {epoch}: {key} = {value}")
 			trial.report(average_val_loss, step=epoch)
@@ -242,6 +259,7 @@ if __name__ == "__main__":
 			
 		trial.set_user_attr("early_stopping_epoch", early_stopping_epoch)
 		trial.set_user_attr("best_train_loss", best_train_loss)
+		trial.set_user_attr("best_auc", best_auc)
 		return best_val_loss
 	
 	study = optuna.create_study(

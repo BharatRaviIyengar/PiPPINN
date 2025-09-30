@@ -929,7 +929,7 @@ def auc_score(preds: torch.Tensor, labels: torch.Tensor):
     auc = torch.trapz(tp_rate, fp_rate).item()
     return auc
 
-def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False):
+def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False, return_output=False):
 	"""
 	Processes a single batch for training or validation.
 
@@ -978,7 +978,10 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	if is_training:
 		optimizer.step()
 
-	return loss.item()
+	if return_output:
+		return loss.item(), edge_probability.detach(), data.supervision_labels.detach()
+	else:
+		return loss.item()
 
 
 def load_data(input_graphs_filenames, val_fraction, save_graphs_to=None, device=None):
