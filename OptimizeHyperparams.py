@@ -213,12 +213,7 @@ if __name__ == "__main__":
 	parser.add_argument("--num_trials","-n",
 		type=int,
 		help="Number of trials to generate",
-		default=40
-	)
-	parser.add_argument("--params_best",
-		type=str,
-		help="Output File for best hyperparameters (json)",
-		default=None
+		default=50
 	)
 	parser.add_argument("--journal_file",
 		type=str,
@@ -348,11 +343,3 @@ if __name__ == "__main__":
 		study.enqueue_trial(params)
 
 	study.optimize(objective, n_trials=args.num_trials)
-	best_trial = study.best_trial
-	if study.best_trial.number == 0:
-		with open(args.params_best, "w") as f:
-			json.dump({
-				"params": best_trial.params,
-				"value": best_trial.value,
-				"user_attrs": best_trial.user_attrs
-			}, f, indent=2)
