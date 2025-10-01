@@ -159,7 +159,7 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 				best_epoch = epoch
 				pre_best_losses.append(average_val_loss)
 				best_auc = auc
-				best_network_skip = model.network_skip.item()
+				best_network_skip = model.network_skip
 			else:
 				epochs_without_improvement += 1
 				post_best_losses.append(average_val_loss)

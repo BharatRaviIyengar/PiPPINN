@@ -9,6 +9,7 @@ from optuna.samplers import TPESampler
 from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 from optuna.pruners import HyperbandPruner
+from collections import deque
 
 
 from glob import glob
@@ -32,15 +33,15 @@ def choose_best_trials(study:optuna.Study, topk:int=30):
 		best_index = losses.index(trial.value)
 		pre_stability = ((torch.tensor(losses[best_index-5:best_index]) - trial.value)**2).mean().item() if best_index >=5 else float('-inf')
 		post_stability = ((torch.tensor(losses[best_index+1:best_index+6]) - trial.value)**2).mean().item()
-		return 0.25*pre_stability + post_stability	
+		return 0.25*pre_stability/trial.value + post_stability/trial.value
 	def get_epoch_penalty(trial:optuna.trial.FrozenTrial):
 		min_netskip = 0.05
 		losses = list(trial.intermediate_values.values())
 		best_index = losses.index(trial.value)
 		best_epoch = best_index + 1
 		n_decays = best_epoch // 3 # cooldown of 2 epochs, so decay happens every 3 epochs
-		best_network_skip = (0.6 * (trial.params['network_skip_factor'] ** n_decays))
-		if best_network_skip > min_netskip or best_epoch < 10:
+		network_skip_at_best_loss = (0.6 * (trial.params['network_skip_factor'] ** n_decays))
+		if network_skip_at_best_loss > min_netskip or best_epoch < 10:
 			epoch_penalty = float('inf')
 		else:
 			epoch_penalty = best_epoch/200
@@ -94,7 +95,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		min_lr=1e-6
 	)
 
-	network_skip_scheduler = utils.DecayScheduler(model, 'network_skip', initial_value=0.6, factor=network_skip_factor, cooldown=2, min_value=0.05)
+	network_skip_scheduler = utils.DecayScheduler(model, 'network_skip', initial_value=0.6, factor=network_skip_factor, cooldown=2, min_value=0.001)
 
 	total_val_samples = sum([(data["val_sampler"].num_supervision_edges + data["val_sampler"].num_negative_edges)*data["val_sampler"].num_batches for data in data_for_training])
 
@@ -104,9 +105,14 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	# Training loop
 	best_val_loss = float('inf')
 	best_train_loss = float('inf')
-	best_auc = 0.0
+	auc_at_best_loss = 0.0
 	epochs_without_improvement = 0
-	early_stopping_epoch = max_epochs
+	best_loss_epoch = max_epochs
+	pre_best_losses = deque(maxlen=6)
+	post_best_losses = deque(maxlen=5)
+	network_skip_at_best_loss = 0.6
+	best_auc = 0.0
+	best_auc_epoch = max_epochs
 
 	for epoch in range(max_epochs):
 		total_train_loss = 0.0  # Reset total training loss for the epoch
@@ -141,15 +147,27 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		scheduler.step(average_val_loss)
 		network_skip_scheduler.step()
 		auc = utils.auc_score(labels_buf, preds_buf)
+		if auc > best_auc:
+			best_auc = auc
+			best_auc_epoch = epoch + 1
 		# Early stopping logic
 		if average_val_loss < best_val_loss:
 			best_val_loss = average_val_loss
 			best_train_loss = average_train_loss
 			epochs_without_improvement = 0
-			early_stopping_epoch = epoch + 1
-			best_auc = auc
+			pre_best_losses.append(average_val_loss)
+			best_loss_epoch = epoch + 1
+			auc_at_best_loss = auc
+			network_skip_at_best_loss = model.network_skip
 		else:
 			epochs_without_improvement += 1
+			post_best_losses.append(average_val_loss)
+
+		pre_stability = ((torch.tensor(pre_best_losses)[:-1] - best_val_loss)**2).mean().item()/best_val_loss
+		post_stability = ((torch.tensor(post_best_losses) - best_val_loss)**2).mean().item()/best_val_loss
+
+		pre_best_losses.clear()
+		post_best_losses.clear()
 		
 		yield {
 		"epoch": epoch + 1,
@@ -157,9 +175,14 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		"average_val_loss": average_val_loss,
 		"best_val_loss": best_val_loss,
 		"best_train_loss": best_train_loss,
-		"early_stopping_epoch": early_stopping_epoch,
+		"best_loss_epoch": best_loss_epoch,
 		"learning_rate": optimizer.param_groups[0]['lr'],
-		"best_auc": best_auc
+		"auc_at_best_loss": auc_at_best_loss,
+		"network_skip_at_best_loss": network_skip_at_best_loss,
+		"pre_stability": pre_stability,
+		"post_stability": post_stability,
+		"best_auc": best_auc,
+		"best_auc_epoch": best_auc_epoch
 		}
 		
 		if epochs_without_improvement >= patience:
@@ -255,17 +278,23 @@ if __name__ == "__main__":
 	dataset = torch.load(args.training_data, weights_only = False)
 	input_channels = dataset[0]["Val"].x.size(1)
 
-	def early_stop_callback(study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
-		if len(study.trials) > 10:
-			recent = [t.value for t in study.trials[-10:] if t.value is not None]
-			if max(recent) - min(recent) < 1e-4:
-				raise optuna.exceptions.OptunaError("Stopping: Converged")
+	# def early_stop_callback(study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
+	# 	if len(study.trials) > 10:
+	# 		recent = [t.value for t in study.trials[-10:] if t.value is not None]
+	# 		if max(recent) - min(recent) < 1e-4:
+	# 			raise optuna.exceptions.OptunaError("Stopping: Converged")
 
 	def objective(trial):
 		best_val_loss = float('inf')
 		best_train_loss = float('inf')
-		early_stopping_epoch = 0
+		best_loss_epoch = 0
+		auc_at_best_loss = 0.0
 		best_auc = 0.0
+		best_auc_epoch = 0
+		network_skip_at_best_loss = 0.6
+		pre_stability = float('inf')
+		post_stability = float('inf')
+		composite_score = float('inf')
 		depth = trial.suggest_categorical("depth", [4, 5])
 		last_layer_size = trial.suggest_categorical("last_layer_size", [768, 1024, 1536, 2048])
 		hidden_channels = generate_hidden_dims(input_channels, depth, last_layer_size) + [last_layer_size]
@@ -286,17 +315,26 @@ if __name__ == "__main__":
 			average_val_loss = result["average_val_loss"]
 			best_val_loss = result["best_val_loss"]
 			best_train_loss = result["best_train_loss"]
-			early_stopping_epoch = result["early_stopping_epoch"]
-			best_auc = result["best_auc"]
-			for key, value in result.items():
-				print(f"Epoch {epoch}: {key} = {value}")
+			best_loss_epoch = result["best_loss_epoch"]
+			auc_at_best_loss = result["auc_at_best_loss"]
+			network_skip_at_best_loss = result["network_skip_at_best_loss"]
+			pre_stability = result["pre_stability"]
+			post_stability = result["post_stability"]
+			composite_score = best_val_loss * (0.25*pre_stability + post_stability) * (best_loss_epoch/200 if best_loss_epoch >=10 and network_skip_at_best_loss <=0.05 else float('inf'))
 			trial.report(average_val_loss, step=epoch)
 			if trial.should_prune():
 				raise optuna.TrialPruned()
 			
-		trial.set_user_attr("early_stopping_epoch", early_stopping_epoch)
+		trial.set_user_attr("best_loss_epoch", best_loss_epoch)
 		trial.set_user_attr("best_train_loss", best_train_loss)
+		trial.set_user_attr("auc_at_best_loss", auc_at_best_loss)
+		trial.set_user_attr("network_skip_at_best_loss", network_skip_at_best_loss)
+		trial.set_user_attr("pre_stability", pre_stability)
+		trial.set_user_attr("post_stability", post_stability)
 		trial.set_user_attr("best_auc", best_auc)
+		trial.set_user_attr("best_auc_epoch", best_auc_epoch)
+		trial.set_user_attr("composite_score", composite_score)
+
 		return best_val_loss
 	
 	study = optuna.create_study(
@@ -308,7 +346,11 @@ if __name__ == "__main__":
 		pruner=pruner
 	)
 
-	study.optimize(objective, n_trials=args.num_trials, callbacks=[early_stop_callback])
+	for trial in best_trials:
+		params = trial.params
+		study.enqueue_trial(params)
+
+	study.optimize(objective, n_trials=args.num_trials)
 	best_trial = study.best_trial
 	if study.best_trial.number == 0:
 		with open(args.params_best, "w") as f:
