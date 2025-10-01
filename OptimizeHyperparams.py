@@ -25,6 +25,33 @@ def generate_hidden_dims(input_dim, depth, last_layer_size):
 
 	return hidden_dims
 
+def choose_best_trials(study:optuna.Study, topk:int=30):
+	completed_trials = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
+	def get_stability(trial:optuna.trial.FrozenTrial):
+		losses = list(trial.intermediate_values.values())
+		best_index = losses.index(trial.value)
+		pre_stability = ((torch.tensor(losses[best_index-5:best_index]) - trial.value)**2).mean().item() if best_index >=5 else float('-inf')
+		post_stability = ((torch.tensor(losses[best_index+1:best_index+6]) - trial.value)**2).mean().item()
+		return 0.25*pre_stability + post_stability	
+	def get_epoch_penalty(trial:optuna.trial.FrozenTrial):
+		min_netskip = 0.05
+		losses = list(trial.intermediate_values.values())
+		best_index = losses.index(trial.value)
+		best_epoch = best_index + 1
+		n_decays = best_epoch // 3 # cooldown of 2 epochs, so decay happens every 3 epochs
+		best_network_skip = (0.6 * (trial.params['network_skip_factor'] ** n_decays))
+		if best_network_skip > min_netskip or best_epoch < 10:
+			epoch_penalty = float('inf')
+		else:
+			epoch_penalty = best_epoch/200
+		return epoch_penalty
+	def composite_score(trial: optuna.trial.FrozenTrial):
+		val_loss = trial.value
+		stability = get_stability(trial)
+		return val_loss *stability* get_epoch_penalty(trial)	
+	best_trials = sorted(completed_trials, key=composite_score)[:topk]
+	return best_trials
+
 def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, max_epochs = 200, threads:int=1):
 	""" Run training for a single trial with the given parameters."""
 
@@ -199,12 +226,22 @@ if __name__ == "__main__":
 		print("GPU not available: Quitting")
 		sys.exit(0)
 
-	if args.journal_file is not None:
-			journal_file = args.journal_file
-	else:
-			journal_file = f"{Path(__file__).parent.resolve()}/OptunaJournal.log"
 
-	storage = JournalStorage(JournalFileBackend(journal_file))
+	# if args.journal_file is not None:
+	# 	journal_file = args.journal_file
+	# else:
+	# 	journal_file = f"{Path(__file__).parent.resolve()}/OptunaJournal.log"
+
+	storage = JournalStorage(JournalFileBackend(args.journal_file))
+	study = optuna.load_study(study_name="PiPPINN_HPO",storage=storage)
+	best_trials = choose_best_trials(study)
+
+	best_trials = [x for x in best_trials if x.params["depth"] > 3]
+
+	new_study_file = f"{Path(args.journal_file).with_suffix('')}_from_BestTrials.log"
+
+	storage = JournalStorage(JournalFileBackend(new_study_file))
+
 	pruner = HyperbandPruner(min_resource=15, reduction_factor=3)
 	sampler = TPESampler(seed=SEED, multivariate=True)
 
@@ -229,7 +266,7 @@ if __name__ == "__main__":
 		best_train_loss = float('inf')
 		early_stopping_epoch = 0
 		best_auc = 0.0
-		depth = trial.suggest_int("depth", 3, 5)
+		depth = trial.suggest_categorical("depth", [4, 5])
 		last_layer_size = trial.suggest_categorical("last_layer_size", [768, 1024, 1536, 2048])
 		hidden_channels = generate_hidden_dims(input_channels, depth, last_layer_size) + [last_layer_size]
 		params = {
