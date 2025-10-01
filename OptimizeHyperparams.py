@@ -1,7 +1,6 @@
 import argparse as ap
 from pathlib import Path
 import sys
-from time import time
 import torch
 import TrainUtils as utils
 import optuna, json
@@ -11,8 +10,6 @@ from optuna.storages.journal import JournalFileBackend
 from optuna.pruners import HyperbandPruner
 from collections import deque
 
-
-from glob import glob
 import gc
 
 def generate_hidden_dims(input_dim, depth, last_layer_size):
