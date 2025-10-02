@@ -110,7 +110,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	# Training loop
 	best_val_loss = float('inf')
 	best_train_loss = float('inf')
-	auc_at_best_loss = 0.0
+	auc_at_best_loss = float('-inf')
 	epochs_without_improvement = 0
 	best_loss_epoch = max_epochs
 	pre_best_losses = deque(maxlen=6)
@@ -290,8 +290,8 @@ if __name__ == "__main__":
 		best_val_loss = float('inf')
 		best_train_loss = float('inf')
 		best_loss_epoch = 0
-		auc_at_best_loss = 0.0
-		best_auc = 0.0
+		auc_at_best_loss = float('-inf')
+		best_auc = float('-inf')
 		best_auc_epoch = 0
 		network_skip_at_best_loss = 0.6
 		pre_stability = float('inf')
@@ -322,6 +322,8 @@ if __name__ == "__main__":
 			network_skip_at_best_loss = result["network_skip_at_best_loss"]
 			pre_stability = result["pre_stability"]
 			post_stability = result["post_stability"]
+			best_auc = result["best_auc"]
+			best_auc_epoch = result["best_auc_epoch"]
 			composite_score = best_val_loss * (0.25*pre_stability + post_stability) * (best_loss_epoch/200 if best_loss_epoch >=10 and network_skip_at_best_loss <=0.05 else float('inf'))
 			trial.report(average_val_loss, step=epoch)
 			if trial.should_prune():
