@@ -26,12 +26,14 @@ def generate_hidden_dims(depth, last_layer_size):
 
 def choose_best_trials(study:optuna.Study, topk:int=30):
 	completed_trials = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
+	
 	def get_stability(trial:optuna.trial.FrozenTrial):
 		losses = list(trial.intermediate_values.values())
 		best_index = losses.index(trial.value)
 		pre_stability = ((torch.tensor(losses[best_index-5:best_index]) - trial.value)**2).mean().item() if best_index >=5 else float('-inf')
 		post_stability = ((torch.tensor(losses[best_index+1:best_index+6]) - trial.value)**2).mean().item()
 		return 0.25*pre_stability + post_stability	
+	
 	def get_epoch_penalty(trial:optuna.trial.FrozenTrial):
 		min_netskip = 0.05
 		losses = list(trial.intermediate_values.values())
@@ -44,10 +46,12 @@ def choose_best_trials(study:optuna.Study, topk:int=30):
 		else:
 			epoch_penalty = best_epoch/200
 		return epoch_penalty
+	
 	def composite_score(trial: optuna.trial.FrozenTrial):
 		val_loss = trial.value
 		stability = get_stability(trial)
 		return val_loss *stability* get_epoch_penalty(trial)	
+	
 	best_trials = sorted(completed_trials, key=composite_score)[:topk]
 	return best_trials
 
@@ -65,12 +69,13 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 
 	hidden_channels = generate_hidden_dims(params['depth'], params['last_layer_size']) + [params['last_layer_size']]
 
+	
+	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
+
 	utils.ME_loss.num_positive_edges = data_for_training[0]["train_sampler"].num_supervision_edges
 	utils.ME_loss.margin = params['margin']
 	utils.ME_loss.margin_loss_coef = params['margin_loss_coef']
 	utils.ME_loss.entropy_coef = params['entropy_coef']
-	
-	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
 
 	del dataset
 	gc.collect()

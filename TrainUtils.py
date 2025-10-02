@@ -898,36 +898,38 @@ def generate_negative_edges(positive_graph: Data, negative_positive_ratio=2, dev
 ME_loss = Margin_and_Entropy()
 
 def auc_score(preds: torch.Tensor, labels: torch.Tensor):
-    """
-    Compute ROC-AUC score for binary classification.
-    
-    Args:
-        preds: torch.Tensor of predicted probabilities or logits, shape [N]
-        labels: torch.Tensor of ground-truth labels (0 or 1), shape [N]
-    
-    Returns:
-        auc: float scalar
-    """
-    # If logits, convert to probabilities
-    if preds.min() < 0 or preds.max() > 1:
-        preds = torch.sigmoid(preds)
-    
-    labels = labels.float()
-    
-    # Sort by predictions descending
-    sorted_preds, idx = torch.sort(preds, descending=True)
-    sorted_labels = labels[idx]
-    
-    # Cumulative sums of positives and negatives
-    tp = torch.cumsum(sorted_labels, dim=0)
-    fp = torch.cumsum(1 - sorted_labels, dim=0)
-    
-    tp_rate = tp / tp[-1]  # TPR
-    fp_rate = fp / fp[-1]  # FPR
-    
-    # Compute AUC using trapezoid rule
-    auc = torch.trapz(tp_rate, fp_rate).item()
-    return auc
+	"""
+	Compute ROC-AUC score for binary classification.
+	
+	Args:
+		preds: torch.Tensor of predicted probabilities or logits, shape [N]
+		labels: torch.Tensor (float) of ground-truth labels (0 or 1), shape [N]
+	
+	Returns:
+		auc: float scalar
+	"""
+	
+	
+	# Sort by predictions descending
+	sorted_preds, idx = torch.sort(preds, descending=True)
+	sorted_labels = labels[idx]
+
+	tpr = torch.zeros(labels.size(0)+1, dtype=torch.float)
+	fpr = torch.zeros(labels.size(0)+1, dtype=torch.float)
+
+	total_pos = labels.sum()
+	total_neg = labels.size(0) - total_pos
+	
+	# Cumulative sums of positives and negatives
+	tpr[1:] = torch.cumsum(sorted_labels, dim=0)
+	fpr[1:] = torch.cumsum(1 - sorted_labels, dim=0)
+	
+	tpr /= total_pos  # TPR
+	fpr /= total_neg  # FPR
+	
+	# Compute AUC using trapezoid rule
+	auc = torch.trapz(tpr, fpr).item()
+	return auc
 
 def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False, return_output=False):
 	"""

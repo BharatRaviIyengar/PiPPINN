@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 import torch
 import TrainUtils as utils
-import optuna, json
+import optuna
 from optuna.samplers import TPESampler
 from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
@@ -25,12 +25,16 @@ def generate_hidden_dims(input_dim, depth, last_layer_size):
 
 def choose_best_trials(study:optuna.Study, topk:int=30):
 	completed_trials = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
+
 	def get_stability(trial:optuna.trial.FrozenTrial):
 		losses = list(trial.intermediate_values.values())
 		best_index = losses.index(trial.value)
+
 		pre_stability = ((torch.tensor(losses[best_index-5:best_index]) - trial.value)**2).mean().item() if best_index >=5 else float('-inf')
 		post_stability = ((torch.tensor(losses[best_index+1:best_index+6]) - trial.value)**2).mean().item()
+
 		return 0.25*pre_stability/trial.value + post_stability/trial.value
+	
 	def get_epoch_penalty(trial:optuna.trial.FrozenTrial):
 		min_netskip = 0.05
 		losses = list(trial.intermediate_values.values())
@@ -38,15 +42,19 @@ def choose_best_trials(study:optuna.Study, topk:int=30):
 		best_epoch = best_index + 1
 		n_decays = best_epoch // 3 # cooldown of 2 epochs, so decay happens every 3 epochs
 		network_skip_at_best_loss = (0.6 * (trial.params['network_skip_factor'] ** n_decays))
+
 		if network_skip_at_best_loss > min_netskip or best_epoch < 10:
 			epoch_penalty = float('inf')
 		else:
 			epoch_penalty = best_epoch/200
+		
 		return epoch_penalty
+	
 	def composite_score(trial: optuna.trial.FrozenTrial):
 		val_loss = trial.value
 		stability = get_stability(trial)
-		return val_loss *stability* get_epoch_penalty(trial)	
+		return val_loss *stability* get_epoch_penalty(trial)
+	
 	best_trials = sorted(completed_trials, key=composite_score)[:topk]
 	return best_trials
 
@@ -108,7 +116,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	pre_best_losses = deque(maxlen=6)
 	post_best_losses = deque(maxlen=5)
 	network_skip_at_best_loss = 0.6
-	best_auc = 0.0
+	best_auc = float('-inf')
 	best_auc_epoch = max_epochs
 
 	for epoch in range(max_epochs):
@@ -143,10 +151,12 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		average_val_loss = total_val_loss / val_batch_count
 		scheduler.step(average_val_loss)
 		network_skip_scheduler.step()
-		auc = utils.auc_score(labels_buf, preds_buf)
+		auc = utils.auc_score(preds_buf, labels_buf)
+
 		if auc > best_auc:
 			best_auc = auc
 			best_auc_epoch = epoch + 1
+		
 		# Early stopping logic
 		if average_val_loss < best_val_loss:
 			best_val_loss = average_val_loss
@@ -338,8 +348,10 @@ if __name__ == "__main__":
 		pruner=pruner
 	)
 
-	for trial in best_trials:
-		params = trial.params
-		study.enqueue_trial(params)
+	if not study.user_attrs.get("enqueued", False):
+		for trial in best_trials:
+			params = trial.params
+			study.enqueue_trial(params)
+		study.set_user_attr("enqueued", True)
 
 	study.optimize(objective, n_trials=args.num_trials)
