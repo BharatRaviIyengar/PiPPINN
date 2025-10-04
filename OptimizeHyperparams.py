@@ -113,8 +113,6 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	auc_at_best_loss = float('-inf')
 	epochs_without_improvement = 0
 	best_loss_epoch = max_epochs
-	pre_best_losses = deque(maxlen=6)
-	post_best_losses = deque(maxlen=5)
 	network_skip_at_best_loss = 0.6
 	best_auc = float('-inf')
 	best_auc_epoch = max_epochs
@@ -142,8 +140,8 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 					val_loss, edge_prob, edge_labels = utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=False, return_output=True) # type: ignore
 					total_val_loss += val_loss
 					n = edge_prob.size(0)
-					preds_buf[fill_idx:fill_idx+n] = edge_prob.cpu()
-					labels_buf[fill_idx:fill_idx+n] = edge_labels.cpu()
+					preds_buf[fill_idx:fill_idx+n] = edge_prob
+					labels_buf[fill_idx:fill_idx+n] = edge_labels
 					fill_idx += n
 
 		# Average losses
@@ -162,20 +160,12 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 			best_val_loss = average_val_loss
 			best_train_loss = average_train_loss
 			epochs_without_improvement = 0
-			pre_best_losses.append(average_val_loss)
 			best_loss_epoch = epoch + 1
 			auc_at_best_loss = auc
 			network_skip_at_best_loss = model.network_skip
 		else:
 			epochs_without_improvement += 1
-			post_best_losses.append(average_val_loss)
-
-		pre_stability = ((torch.tensor(pre_best_losses)[:-1] - best_val_loss)**2).mean().item()/best_val_loss
-		post_stability = ((torch.tensor(post_best_losses) - best_val_loss)**2).mean().item()/best_val_loss
-
-		pre_best_losses.clear()
-		post_best_losses.clear()
-		
+	
 		yield {
 		"epoch": epoch + 1,
 		"average_train_loss": average_train_loss,
@@ -186,8 +176,6 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		"learning_rate": optimizer.param_groups[0]['lr'],
 		"auc_at_best_loss": auc_at_best_loss,
 		"network_skip_at_best_loss": network_skip_at_best_loss,
-		"pre_stability": pre_stability,
-		"post_stability": post_stability,
 		"best_auc": best_auc,
 		"best_auc_epoch": best_auc_epoch
 		}
@@ -293,9 +281,7 @@ if __name__ == "__main__":
 		auc_at_best_loss = float('-inf')
 		best_auc = float('-inf')
 		best_auc_epoch = 0
-		network_skip_at_best_loss = 0.6
-		pre_stability = float('inf')
-		post_stability = float('inf')
+		network_skip_at_best_loss = 0.0
 		composite_score = float('inf')
 		depth = trial.suggest_categorical("depth", [4, 5])
 		last_layer_size = trial.suggest_categorical("last_layer_size", [768, 1024, 1536, 2048])
@@ -320,11 +306,8 @@ if __name__ == "__main__":
 			best_loss_epoch = result["best_loss_epoch"]
 			auc_at_best_loss = result["auc_at_best_loss"]
 			network_skip_at_best_loss = result["network_skip_at_best_loss"]
-			pre_stability = result["pre_stability"]
-			post_stability = result["post_stability"]
 			best_auc = result["best_auc"]
 			best_auc_epoch = result["best_auc_epoch"]
-			composite_score = best_val_loss * (0.25*pre_stability + post_stability) * (best_loss_epoch/200 if best_loss_epoch >=10 and network_skip_at_best_loss <=0.05 else float('inf'))
 			trial.report(average_val_loss, step=epoch)
 			if trial.should_prune():
 				raise optuna.TrialPruned()
@@ -333,8 +316,6 @@ if __name__ == "__main__":
 		trial.set_user_attr("best_train_loss", best_train_loss)
 		trial.set_user_attr("auc_at_best_loss", auc_at_best_loss)
 		trial.set_user_attr("network_skip_at_best_loss", network_skip_at_best_loss)
-		trial.set_user_attr("pre_stability", pre_stability)
-		trial.set_user_attr("post_stability", post_stability)
 		trial.set_user_attr("best_auc", best_auc)
 		trial.set_user_attr("best_auc_epoch", best_auc_epoch)
 		trial.set_user_attr("composite_score", composite_score)

@@ -981,7 +981,7 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 		optimizer.step()
 
 	if return_output:
-		return loss.item(), edge_probability.detach(), data.supervision_labels.detach()
+		return loss.item(), edge_probability.detach().cpu(), data.supervision_labels.detach().cpu()
 	else:
 		return loss.item()
 

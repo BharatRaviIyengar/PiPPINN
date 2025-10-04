@@ -39,9 +39,8 @@ def choose_best_trials(study:optuna.Study, topk:int=30):
 		losses = list(trial.intermediate_values.values())
 		best_index = losses.index(trial.value)
 		best_epoch = best_index + 1
-		n_decays = best_epoch // 3 # cooldown of 2 epochs, so decay happens every 3 epochs
-		best_network_skip = (0.6 * (trial.params['network_skip_factor'] ** n_decays))
-		if best_network_skip > min_netskip or best_epoch < 10:
+		best_network_skip = trial.user_attrs["network_skip_at_best_loss"]
+		if best_network_skip > min_netskip or best_epoch < 5:
 			epoch_penalty = float('inf')
 		else:
 			epoch_penalty = best_epoch/200
@@ -106,21 +105,24 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 
 	preds_buf = torch.zeros(total_val_samples, dtype=torch.float32)
 	labels_buf = torch.zeros(total_val_samples, dtype=torch.int8)
-	best_auc = 0.0
 
 	# Training loop
 	pre_best_losses = deque(maxlen=6)
 	post_best_losses = deque(maxlen=5)
 
-	training_stats = [{"best_val_loss" : float('inf'), "best_train_loss" : float('inf'), "best_epoch": 0, "best_auc": 0.0, "pre_stability": float('inf'), "post_stability": float('inf'), "network_skip": 1.0} for _ in range(runs)]
+	training_stats = []
 
 	for run in range(runs):
 		best_val_loss = float('inf')
 		best_train_loss = float('inf')
+		auc_at_best_loss = float('-inf')
 		epochs_without_improvement = 0
-		best_epoch = 0
-		pre_best_losses.clear()
-		post_best_losses.clear()
+		best_loss_epoch = max_epochs
+		network_skip_at_best_loss = 0.6
+		best_auc = float('-inf')
+		best_auc_epoch = max_epochs
+		pre_stability = float('inf')
+		post_stability = float('inf')
 
 		for epoch in range(max_epochs):
 			total_train_loss = 0.0  # Reset total training loss for the epoch
@@ -156,15 +158,21 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 			network_skip_scheduler.step()
 			auc = utils.auc_score(labels_buf, preds_buf)
 
+			if auc > best_auc:
+				best_auc = auc
+				best_auc_epoch = epoch + 1
+
 			# Early stopping logic
-			if average_val_loss < best_val_loss or epoch < min_epochs:
+			if average_val_loss < best_val_loss:
 				best_val_loss = average_val_loss
 				best_train_loss = average_train_loss
 				epochs_without_improvement = 0
-				best_epoch = epoch
+				best_loss_epoch = epoch + 1
+				auc_at_best_loss = auc
+				network_skip_at_best_loss = model.network_skip
+				pre_best_losses.extend(post_best_losses)
 				pre_best_losses.append(average_val_loss)
-				best_auc = auc
-				best_network_skip = model.network_skip
+				post_best_losses.clear()
 			else:
 				epochs_without_improvement += 1
 				post_best_losses.append(average_val_loss)
@@ -173,20 +181,22 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 			if epochs_without_improvement >= patience:
 				print(f"Early stopping triggered after {epoch + 1} epochs.")
 				break
-			
-			pre_stability = ((torch.tensor(pre_best_losses)[:-1] - best_val_loss)**2).mean().item()
-			post_stability = ((torch.tensor(post_best_losses) - best_val_loss)**2).mean().item()
 
-			training_stats[run] = {
-				"best_val_loss": best_val_loss,
-				"best_train_loss": best_train_loss,
-				"best_epoch": best_epoch + 1,
-				"best_auc": best_auc,
-				"pre_stability": pre_stability,
-				"post_stability": post_stability,
-				"network_skip": best_network_skip
-			}
-	
+		pre_stability = ((torch.tensor(pre_best_losses)[:-1] - best_val_loss)**2).mean().item()
+		post_stability = ((torch.tensor(post_best_losses) - best_val_loss)**2).mean().item()
+
+		training_stats.append({
+			"best_val_loss": best_val_loss,
+			"best_train_loss": best_train_loss,
+			"best_loss_epoch": best_loss_epoch,
+			"pre_stability": pre_stability,
+			"post_stability": post_stability,
+			"auc_at_best_loss": auc_at_best_loss,
+			"network_skip_at_best_loss": network_skip_at_best_loss,
+			"best_auc": best_auc,
+			"best_auc_epoch": best_auc_epoch,
+		})
+
 	return training_stats
 
 if __name__ == "__main__":
