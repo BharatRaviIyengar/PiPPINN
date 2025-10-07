@@ -24,34 +24,56 @@ def generate_hidden_dims(depth, last_layer_size):
 		sizes.append(size)
 	return sizes
 
-def choose_best_trials(study:optuna.Study, topk:int=30):
+def choose_best_trials(study:optuna.Study, topk:int=5):
 	completed_trials = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
-	
-	def get_stability(trial:optuna.trial.FrozenTrial):
+
+	def get_trial_scores(trial:optuna.trial.FrozenTrial):
+		best_loss = trial.value
+		best_loss_epoch = trial.user_attrs["best_loss_epoch"] - 1
+		network_skip_at_best_loss = trial.user_attrs["network_skip_at_best_loss"]
+		auc_at_best_loss = trial.user_attrs["auc_at_best_loss"]
+		best_auc = trial.user_attrs["best_auc"]
+		best_auc_epoch = trial.user_attrs["best_auc_epoch"] - 1 
+		min_desired_netskip = 0.007
+		min_possible_netskip = 0.001
+		max_epochs = 200
+
 		losses = list(trial.intermediate_values.values())
-		best_index = losses.index(trial.value)
-		pre_stability = ((torch.tensor(losses[best_index-5:best_index]) - trial.value)**2).mean().item() if best_index >=5 else float('-inf')
-		post_stability = ((torch.tensor(losses[best_index+1:best_index+6]) - trial.value)**2).mean().item()
-		return 0.25*pre_stability + post_stability	
-	
-	def get_epoch_penalty(trial:optuna.trial.FrozenTrial):
-		min_netskip = 0.05
-		losses = list(trial.intermediate_values.values())
-		best_index = losses.index(trial.value)
-		best_epoch = best_index + 1
-		best_network_skip = trial.user_attrs["network_skip_at_best_loss"]
-		if best_network_skip > min_netskip or best_epoch < 5:
-			epoch_penalty = float('inf')
-		else:
-			epoch_penalty = best_epoch/200
-		return epoch_penalty
-	
-	def composite_score(trial: optuna.trial.FrozenTrial):
-		val_loss = trial.value
-		stability = get_stability(trial)
-		return val_loss *stability* get_epoch_penalty(trial)	
-	
-	best_trials = sorted(completed_trials, key=composite_score)[:topk]
+
+		if best_loss_epoch <= 5 or network_skip_at_best_loss < min_desired_netskip:
+			return float('inf')
+
+		# Stability calculation
+		pre_stability = ((torch.tensor(losses[best_loss_epoch-5:best_loss_epoch])/best_loss - 1)**2).mean().item()
+		post_stability = ((torch.tensor(losses[best_loss_epoch+1:best_loss_epoch+6])/best_loss - 1)**2).mean().item()
+
+		stability = 0.25*pre_stability + 0.75*post_stability
+
+		# AUC-related scores
+		auc_gap = abs(best_auc - auc_at_best_loss)
+		auc_penalty_loss = ((1 - auc_at_best_loss) * 10) ** 2
+		auc_penalty_best = ((1 - best_auc) * 10) ** 2
+
+		# Epoch & timing normalization ---
+		epoch_penalty = min(best_loss_epoch / max_epochs, 1.0)
+		if network_skip_at_best_loss > min_desired_netskip:
+				epoch_penalty *= network_skip_at_best_loss/min_desired_netskip  
+		
+		auc_gap_correction = 1 + auc_gap / (best_auc + 1e-6)
+		auc_timing_penalty = min(abs(best_auc_epoch - best_loss_epoch) / max_epochs, 1.0)
+		auc_timing_penalty *= auc_gap_correction  # smaller if AUCs are close
+
+		composite_score = (
+				1.0 * best_loss +
+				1.0 * auc_penalty_loss +
+				0.3 * stability +
+				0.2 * epoch_penalty +
+				0.3 * auc_timing_penalty + 
+				0.5 * auc_penalty_best
+			)
+		return composite_score
+
+	best_trials = sorted(completed_trials, key=get_trial_scores)[:topk]
 	return best_trials
 
 def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_outfile, device:torch.device, max_epochs = 200, threads:int=1, runs=1):
