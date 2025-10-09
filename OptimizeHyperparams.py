@@ -186,7 +186,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 
 if __name__ == "__main__":
 
-	parser = ap.ArgumentParser(description="GraphSAGE model for edge detection")
+	parser = ap.ArgumentParser(description="Optimize hyperparameters for PiPPINN using Optuna")
 
 	parser.add_argument("--threads", "-t",
 		type=int,

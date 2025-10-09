@@ -9,6 +9,8 @@ from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 import gc
 from collections import deque
+import pickle
+from copy import deepcopy
 
 def generate_hidden_dims(depth, last_layer_size):
 	n_layers = depth - 1  # intermediate layers count (excluding first)
@@ -24,25 +26,22 @@ def generate_hidden_dims(depth, last_layer_size):
 		sizes.append(size)
 	return sizes
 
-def choose_best_trials(study:optuna.Study, topk:int=5):
-	completed_trials = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
+def get_trial_scores(trial:optuna.trial.FrozenTrial):
+	best_loss = trial.value
+	best_loss_epoch = trial.user_attrs["best_loss_epoch"] - 1
+	network_skip_at_best_loss = trial.user_attrs["network_skip_at_best_loss"]
+	auc_at_best_loss = trial.user_attrs["auc_at_best_loss"]
+	best_auc = trial.user_attrs["best_auc"]
+	best_auc_epoch = trial.user_attrs["best_auc_epoch"] - 1 
+	min_desired_netskip = 0.007
+	max_epochs = 200
 
-	def get_trial_scores(trial:optuna.trial.FrozenTrial):
-		best_loss = trial.value
-		best_loss_epoch = trial.user_attrs["best_loss_epoch"] - 1
-		network_skip_at_best_loss = trial.user_attrs["network_skip_at_best_loss"]
-		auc_at_best_loss = trial.user_attrs["auc_at_best_loss"]
-		best_auc = trial.user_attrs["best_auc"]
-		best_auc_epoch = trial.user_attrs["best_auc_epoch"] - 1 
-		min_desired_netskip = 0.007
-		min_possible_netskip = 0.001
-		max_epochs = 200
+	losses = list(trial.intermediate_values.values())
 
-		losses = list(trial.intermediate_values.values())
-
-		if best_loss_epoch <= 5 or network_skip_at_best_loss < min_desired_netskip:
-			return float('inf')
-
+	if best_loss_epoch <= 5 or network_skip_at_best_loss > min_desired_netskip:
+		composite_score = float('inf')
+		auc_penalty_best = epoch_penalty = auc_timing_penalty = stability = auc_penalty_loss = float('nan')
+	else:
 		# Stability calculation
 		pre_stability = ((torch.tensor(losses[best_loss_epoch-5:best_loss_epoch])/best_loss - 1)**2).mean().item()
 		post_stability = ((torch.tensor(losses[best_loss_epoch+1:best_loss_epoch+6])/best_loss - 1)**2).mean().item()
@@ -71,9 +70,12 @@ def choose_best_trials(study:optuna.Study, topk:int=5):
 				0.3 * auc_timing_penalty + 
 				0.5 * auc_penalty_best
 			)
-		return composite_score
+	return {"composite_score": composite_score, "best_loss": best_loss, "auc_penalty_loss": auc_penalty_loss, "stability": stability, "epoch_penalty": epoch_penalty, "auc_timing_penalty": auc_timing_penalty, "auc_penalty_best": auc_penalty_best}
+	
+def choose_best_trials(study:optuna.Study, topk:int=5):
+	scored_trials = [(trial, get_trial_scores(trial)) for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
 
-	best_trials = sorted(completed_trials, key=get_trial_scores)[:topk]
+	best_trials = [(t, scores) for t, scores in sorted(scored_trials, key=lambda x: x[1]["composite_score"])[:topk]]
 	return best_trials
 
 def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_outfile, device:torch.device, max_epochs = 200, threads:int=1, runs=1):
@@ -86,7 +88,6 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 	scheduler_factor = params['scheduler_factor']
 	nbr_wt_intensity = params['nbr_weight_intensity']
 	network_skip_factor = params['network_skip_factor']
-	min_epochs = 10
 
 	hidden_channels = generate_hidden_dims(params['depth'], params['last_layer_size']) + [params['last_layer_size']]
 
@@ -128,14 +129,19 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 	preds_buf = torch.zeros(total_val_samples, dtype=torch.float32)
 	labels_buf = torch.zeros(total_val_samples, dtype=torch.int8)
 
-	# Training loop
 	pre_best_losses = deque(maxlen=6)
 	post_best_losses = deque(maxlen=5)
 
 	training_stats = []
 
+	
+	min_desired_netskip = 0.007
+	best_model_score = float('inf')
+
 	for run in range(runs):
+		best_val_score = float('inf')
 		best_val_loss = float('inf')
+		best_auc_penalty = float('inf')
 		best_train_loss = float('inf')
 		auc_at_best_loss = float('-inf')
 		epochs_without_improvement = 0
@@ -145,6 +151,8 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 		best_auc_epoch = max_epochs
 		pre_stability = float('inf')
 		post_stability = float('inf')
+		best_model = None
+		best_composite_score = float('inf')
 
 		for epoch in range(max_epochs):
 			total_train_loss = 0.0  # Reset total training loss for the epoch
@@ -152,6 +160,7 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 			val_batch_count = 0
 			train_batch_count = 0
 			fill_idx = 0
+			
 
 			for data in data_for_training:
 				# Training
@@ -176,17 +185,23 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 			# Average losses
 			average_train_loss = total_train_loss / train_batch_count
 			average_val_loss = total_val_loss / val_batch_count
-			scheduler.step(average_val_loss)
-			network_skip_scheduler.step()
+			post_best_losses.append(average_val_loss)
+			
 			auc = utils.auc_score(labels_buf, preds_buf)
+			auc_penalty = ((1 - auc) * 10) ** 2
 
+			combined_score = average_val_loss + auc_penalty
+						
 			if auc > best_auc:
 				best_auc = auc
 				best_auc_epoch = epoch + 1
+				best_auc_penalty = auc_penalty
+
 
 			# Early stopping logic
-			if average_val_loss < best_val_loss:
+			if combined_score < best_val_score:
 				best_val_loss = average_val_loss
+				best_val_score = combined_score
 				best_train_loss = average_train_loss
 				epochs_without_improvement = 0
 				best_loss_epoch = epoch + 1
@@ -195,17 +210,44 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 				pre_best_losses.extend(post_best_losses)
 				pre_best_losses.append(average_val_loss)
 				post_best_losses.clear()
+
+				## Save best model based on composite score
+				if best_loss_epoch > 5 and network_skip_at_best_loss <= min_desired_netskip:
+					with torch.no_grad():
+						best_model = deepcopy(model).to('cpu')
+
 			else:
 				epochs_without_improvement += 1
-				post_best_losses.append(average_val_loss)
-			
+				
+			scheduler.step(average_val_loss)
+			network_skip_scheduler.step()
 
 			if epochs_without_improvement >= patience:
 				print(f"Early stopping triggered after {epoch + 1} epochs.")
 				break
 
-		pre_stability = ((torch.tensor(pre_best_losses)[:-1] - best_val_loss)**2).mean().item()
+		# AUC related penalties
+		auc_gap = abs(best_auc - auc_at_best_loss)
+		auc_gap_correction = 1 + auc_gap / (best_auc + 1e-6)
+		auc_timing_penalty = min(abs(best_auc_epoch - best_loss_epoch) / max_epochs, 1.0)
+		auc_timing_penalty *= auc_gap_correction
+
+		# Epoch penalty
+		epoch_penalty = min(best_loss_epoch / max_epochs, 1.0)
+		if network_skip_at_best_loss > min_desired_netskip:
+			epoch_penalty *= network_skip_at_best_loss/min_desired_netskip
+
+		# Final stability calculation
+		pre_stability = ((torch.tensor(pre_best_losses)[:-1] - best_val_loss)**2).mean().item() if len(pre_best_losses) >= 5 else float('inf')
 		post_stability = ((torch.tensor(post_best_losses) - best_val_loss)**2).mean().item()
+
+		stability = 0.25*pre_stability + 0.75*post_stability
+
+		overall_composite_score = best_val_score + 0.3*stability + 0.2*epoch_penalty + 0.3*auc_timing_penalty + 0.5*best_auc_penalty
+
+		if best_model is not None and overall_composite_score < best_model_score:
+			best_model_score = overall_composite_score
+			torch.save(best_model, model_outfile)
 
 		training_stats.append({
 			"best_val_loss": best_val_loss,
@@ -217,13 +259,14 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 			"network_skip_at_best_loss": network_skip_at_best_loss,
 			"best_auc": best_auc,
 			"best_auc_epoch": best_auc_epoch,
+			"best_composite_score": best_composite_score,
 		})
 
 	return training_stats
 
 if __name__ == "__main__":
 
-	parser = ap.ArgumentParser(description="GraphSAGE model for edge detection")
+	parser = ap.ArgumentParser(description="Retrain the PiPPINN model using the best hyperparameters from a previous Optuna HPO study.")
 
 	parser.add_argument("--input_data", "-i",
 		type=str, required=True,
@@ -235,10 +278,23 @@ if __name__ == "__main__":
 		help="Path to the trials file",
 		metavar="<path/file>"
 	)
-	parser.add_argument("--output", "-o",
+	parser.add_argument("--runs", "-r",
+		type=int, default=5,
+		help="Number of training runs to perform per trial"
+	)
+	parser.add_argument("--num_trial", "-n",
+		type=int, default=0,
+		choices=range(0,5),
+		help="Trial number to use for retraining (0 for best trial)"
+	)
+	parser.add_argument("--outdir", "-o",
 		type=str, default=None,
-		help="Path to the trained GNN (.pt)",
+		help="output directory to save the trained model and stats (defaults to the trials file directory)",
 		metavar="<path/file>"
+	)
+	parser.add_argument("--prefix",
+		type=str, default="PiPPINN_retrained",
+		help="Prefix for the output model and stats files",
 	)
 	parser.add_argument("--threads", "-t",
 		type=int,
@@ -255,39 +311,34 @@ if __name__ == "__main__":
 		parser.print_help() # Print the help message
 		sys.exit(1)
 
-	storage = JournalStorage(JournalFileBackend(args.trials))
-
-	study = optuna.load_study(
-		study_name="PiPPINN_HPO",
-		storage=storage
-	)
-
 	if args.threads > 1:
 		torch.set_num_threads(args.threads)
 	if gpu_yes:
 		device = torch.device("cuda")
 	else:
-		device = torch.device("cpu")
+		print("Cannot train without a GPU. Exiting.")
+		sys.exit(1)
 
 	input_data = torch.load(args.input_data, weights_only=False)
 
-	best_params = study.best_trial.params
+	if args.outdir is None:
+		args.outdir = str(Path(args.trials).parent)
 
-	best_params_file = Path(args.output).parent.joinpath("Best_Params.json")
+	best_trials_file = Path(args.outdir).joinpath("BestTrials.pkl")
+	model_outfile = Path(args.outdir).joinpath(f"{args.prefix}_trial{args.num_trial}.pt")
+	model_stats_file = Path(args.outdir).joinpath(f"{args.prefix}_trial{args.num_trial}_outstats.json")
+	try:
+		best_trials = pickle.load(open(best_trials_file,"rb"))
+	except FileNotFoundError:
+		storage = JournalStorage(JournalFileBackend(args.trials))
+		study = optuna.load_study(study_name="PiPPINN_HPO",storage=storage)
+		best_trials = choose_best_trials(study, topk=5)
+		pickle.dump(best_trials, open(best_trials_file,"wb"))
 
-	with open(best_params_file,"w") as f:
-		json.dump(best_params, f, indent=2)
+	best_params = best_trials[args.num_trial][0].params
 
-	# Retrain the model with the best hyperparameters
-	print("Retraining the model with the best hyperparameters...")
+	model_stats = run_training(params=best_params, dataset=input_data, batch_size=40000, num_batches=None, device=device, model_outfile= model_outfile, threads=args.threads)
 
-	# Initialize the model with the best hyperparameters
-
-	out = run_training(params=best_params, dataset=input_data, batch_size=40000, num_batches=None, device=device, model_outfile= args.output, threads=args.threads)
-
-	model_stats = f"{Path(args.output).with_suffix('')}_outstats.json"
-
-	with open(model_stats,"w") as f:
-		json.dump(out, f, indent=2)
+	with open(model_stats_file,"w") as f:
+		json.dump(model_stats, f, indent=2)
 	
-	print(f"Retraining complete. Best model saved as {args.output} and its loss stats in {model_stats}")
