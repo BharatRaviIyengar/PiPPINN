@@ -12,19 +12,16 @@ from collections import deque
 import pickle
 from copy import deepcopy
 
-def generate_hidden_dims(depth, last_layer_size):
+def generate_hidden_dims(input_dim, depth, last_layer_size):
 	n_layers = depth - 1  # intermediate layers count (excluding first)
-	start_size = 2048
-
+	
 	if n_layers == 0:
 		return []  # no intermediate layers, just input and last layer
 
-	decay_factor = (last_layer_size / start_size) ** (1 / n_layers)
-	sizes = []
-	for i in range(1, n_layers):
-		size = int(start_size * (decay_factor ** i))
-		sizes.append(size)
-	return sizes
+	decay_factor = (last_layer_size / input_dim) ** (1 / n_layers)
+	hidden_dims = [int(input_dim * decay_factor ** i) for i in range(n_layers)]
+
+	return hidden_dims
 
 def get_trial_scores(trial:optuna.trial.FrozenTrial):
 	best_loss = trial.value
@@ -89,40 +86,17 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 	nbr_wt_intensity = params['nbr_weight_intensity']
 	network_skip_factor = params['network_skip_factor']
 
-	hidden_channels = generate_hidden_dims(params['depth'], params['last_layer_size']) + [params['last_layer_size']]
+	input_channels = dataset[0]["Val"].x.size(1)
 
-	
+	hidden_channels = generate_hidden_dims(input_channels, params['depth'], params['last_layer_size']) + [params['last_layer_size']]
+
 	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
 
 	utils.ME_loss.num_positive_edges = data_for_training[0]["train_sampler"].num_supervision_edges
 	utils.ME_loss.margin = params['margin']
 	utils.ME_loss.margin_loss_coef = params['margin_loss_coef']
 	utils.ME_loss.entropy_coef = params['entropy_coef']
-
-	del dataset
-	gc.collect()
-	torch.cuda.empty_cache()
-
-	# Initialize model and optimizer
-	model = utils.DualLayerModel(
-			in_channels=data_for_training[0]["input_channels"],
-			hidden_channels=hidden_channels,
-			dropout=dropout,
-			network_skip=0.5
-		).to(device)
-	
-	optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=weight_decay)
-	scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-		optimizer= optimizer,
-		mode='min',
-		factor=scheduler_factor,
-		patience=10,
-		cooldown=2,
-		min_lr=1e-6
-	)
-
 	min_network_skip = 0.001
-	network_skip_scheduler = utils.DecayScheduler(model, 'network_skip', initial_value=0.6, factor=network_skip_factor, cooldown=2, min_value=min_network_skip)
 
 	total_val_samples = sum([(data["val_sampler"].num_supervision_edges + data["val_sampler"].num_negative_edges)*data["val_sampler"].num_batches for data in data_for_training])
 
@@ -131,14 +105,35 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 
 	pre_best_losses = deque(maxlen=6)
 	post_best_losses = deque(maxlen=5)
-
-	training_stats = []
-
-	
 	min_desired_netskip = 0.007
 	best_model_score = float('inf')
+	training_stats = []
+
+
+	del dataset
+	gc.collect()
+	torch.cuda.empty_cache()
 
 	for run in range(runs):
+			# Initialize model and optimizer
+		model = utils.DualLayerModel(
+			in_channels=data_for_training[0]["input_channels"],
+			hidden_channels=hidden_channels,
+			dropout=dropout,
+			network_skip=0.5
+		).to(device)
+	
+		optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=weight_decay)
+		scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+			optimizer= optimizer,
+			mode='min',
+			factor=scheduler_factor,
+			patience=10,
+			cooldown=2,
+			min_lr=1e-6
+		)	
+		network_skip_scheduler = utils.DecayScheduler(model, 'network_skip', initial_value=0.6, factor=network_skip_factor, cooldown=2, min_value=min_network_skip)
+		
 		best_val_score = float('inf')
 		best_val_loss = float('inf')
 		best_auc_penalty = float('inf')
@@ -152,7 +147,6 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 		pre_stability = float('inf')
 		post_stability = float('inf')
 		best_model = None
-		best_composite_score = float('inf')
 
 		for epoch in range(max_epochs):
 			total_train_loss = 0.0  # Reset total training loss for the epoch
@@ -187,10 +181,12 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 			average_val_loss = total_val_loss / val_batch_count
 			post_best_losses.append(average_val_loss)
 			
-			auc = utils.auc_score(labels_buf, preds_buf)
+			auc = utils.auc_score(preds_buf, labels_buf)
 			auc_penalty = ((1 - auc) * 10) ** 2
 
 			combined_score = average_val_loss + auc_penalty
+
+			print(f"Run {run+1}, Epoch {epoch+1:03d}: Train Loss: {average_train_loss:.4f}, Val Loss: {average_val_loss:.4f}, AUC: {auc:.4f}, Combined Score: {combined_score:.4f}, Network Skip: {model.network_skip:.4f}")
 						
 			if auc > best_auc:
 				best_auc = auc
@@ -199,7 +195,7 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 
 
 			# Early stopping logic
-			if combined_score < best_val_score:
+			if average_val_loss < best_val_loss:
 				best_val_loss = average_val_loss
 				best_val_score = combined_score
 				best_train_loss = average_train_loss
@@ -259,7 +255,7 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 			"network_skip_at_best_loss": network_skip_at_best_loss,
 			"best_auc": best_auc,
 			"best_auc_epoch": best_auc_epoch,
-			"best_composite_score": best_composite_score,
+			"best_val_score": best_val_score,
 		})
 
 	return training_stats
@@ -279,7 +275,7 @@ if __name__ == "__main__":
 		metavar="<path/file>"
 	)
 	parser.add_argument("--runs", "-r",
-		type=int, default=5,
+		type=int, default=10,
 		help="Number of training runs to perform per trial"
 	)
 	parser.add_argument("--num_trial", "-n",
@@ -337,7 +333,7 @@ if __name__ == "__main__":
 
 	best_params = best_trials[args.num_trial][0].params
 
-	model_stats = run_training(params=best_params, dataset=input_data, batch_size=40000, num_batches=None, device=device, model_outfile= model_outfile, threads=args.threads)
+	model_stats = run_training(params=best_params, dataset=input_data, batch_size=40000, num_batches=None, device=device, model_outfile= model_outfile, threads=args.threads, runs=args.runs)
 
 	with open(model_stats_file,"w") as f:
 		json.dump(model_stats, f, indent=2)
