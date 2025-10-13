@@ -195,7 +195,7 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 
 
 			# Early stopping logic
-			if average_val_loss < best_val_loss:
+			if combined_score < best_val_score:
 				best_val_loss = average_val_loss
 				best_val_score = combined_score
 				best_train_loss = average_train_loss
