@@ -201,6 +201,7 @@ class DecayScheduler:
 		self.attr_name = attr_name
 		self.factor = factor
 		self.cooldown = cooldown
+		self.cooldown_counter = 0
 		self.min_value = min_value
 		self.epoch = 0
 		self.current_value = initial_value
@@ -208,8 +209,10 @@ class DecayScheduler:
 
 	def step(self):
 		self.epoch += 1
-		if self.epoch > self.cooldown:
+		self.cooldown_counter += 1
+		if self.cooldown_counter > self.cooldown:
 			new_value = max(self.min_value, self.current_value * self.factor)
+			self.cooldown_counter = 0
 			if new_value < self.current_value:
 				self.current_value = new_value
 				setattr(self.model, self.attr_name, self.current_value)
