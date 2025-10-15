@@ -9,6 +9,7 @@ from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 from optuna.pruners import HyperbandPruner
 from collections import deque
+import math
 
 import gc
 
@@ -74,8 +75,8 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 
 	# Training loop
 	best_composite_score = float('inf')
-	loss_at_best_score = float('inf')
-	best_train_loss = float('inf')
+	val_loss_at_best_score = float('inf')
+	train_loss_at_best_score = float('inf')
 	auc_at_best_score = float('-inf')
 	epochs_without_improvement = 0
 	best_score_epoch = max_epochs
@@ -124,15 +125,15 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		# Early stopping logic
 		if epochs_since_curriculum_completed > 2:
 			auc = utils.auc_score(preds_buf, labels_buf)
-			auc_penalty = torch.sigmoid(20*(0.9-auc))
+			auc_penalty = 1 / (1 + math.exp(-20*(0.9 - auc)))
 			composite_score = average_val_loss*(1 + auc_penalty)
 			if auc > best_auc:
 				best_auc = auc
 				best_auc_epoch = epoch + 1
 			if best_composite_score > composite_score:
 				best_composite_score = composite_score
-				loss_at_best_score = average_val_loss
-				best_train_loss = average_train_loss
+				val_loss_at_best_score = average_val_loss
+				train_loss_at_best_score = average_train_loss
 				epochs_without_improvement = 0
 				best_score_epoch = epoch + 1
 				auc_at_best_score = auc
@@ -145,15 +146,16 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 			"epochs_since_curriculum_completed": epochs_since_curriculum_completed,
 			"average_train_loss": average_train_loss,
 			"average_val_loss": average_val_loss,
-			"loss_at_best_score": loss_at_best_score,
-			"best_train_loss": best_train_loss,
+			"val_loss_at_best_score": val_loss_at_best_score,
+			"train_loss_at_best_score": train_loss_at_best_score,
 			"best_score_epoch": best_score_epoch,
 			"learning_rate": optimizer.param_groups[0]['lr'],
 			"auc_at_best_score": auc_at_best_score,
 			"network_skip_at_best_score": network_skip_at_best_score,
 			"best_auc": best_auc,
 			"best_auc_epoch": best_auc_epoch,
-			"composite_score": composite_score
+			"composite_score": composite_score,
+			"best_composite_score": best_composite_score
 			}
 
 		# Step the schedulers
@@ -255,15 +257,18 @@ if __name__ == "__main__":
 	# 			raise optuna.exceptions.OptunaError("Stopping: Converged")
 
 	def objective(trial):
-		best_val_loss = float('inf')
-		best_train_loss = float('inf')
+		val_loss_at_best_score = float('inf')
+		train_loss_at_best_score = float('inf')
+		composite_score = float('inf')
+		best_composite_score = float('inf')
+		epoch_since_curriculum_completed = 0
 		best_score_epoch = 0
 		auc_at_best_score = float('-inf')
 		best_auc = float('-inf')
 		best_auc_epoch = 0
 		network_skip_at_best_score = 0.0
 		composite_score = float('inf')
-		depth = trial.suggest_categorical("depth", [4, 5])
+		depth = trial.suggest_categorical("depth", [3, 4, 5])
 		last_layer_size = trial.suggest_categorical("last_layer_size", [768, 1024, 1536, 2048])
 		hidden_channels = generate_hidden_dims(input_channels, depth, last_layer_size) + [last_layer_size]
 		params = {
@@ -272,35 +277,46 @@ if __name__ == "__main__":
 			"weight_decay": trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True),
 			"scheduler_factor": trial.suggest_float("scheduler_factor", 0.1, 0.5),
 			"nbr_weight_intensity": trial.suggest_float("nbr_weight_intensity", 0.4, 2.5, log=True),
-			"network_skip_factor": trial.suggest_float("network_skip_factor", 0.1, 0.9, log=True),
+			"network_skip_factor": trial.suggest_float("network_skip_factor", 0.1, 0.9),
 			"margin": trial.suggest_float("margin", 0.1, 1.0),
 			"margin_loss_coef": trial.suggest_float("margin_loss_coef", 0.01, 0.1, log=True),
 			"entropy_coef": trial.suggest_float("entropy_coef", 0.001, 0.01, log=True),
 			"hidden_channels" : hidden_channels
 		}
-		for result in run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads):
-			epoch = result["epoch"]
-			average_val_loss = result["average_val_loss"]
-			best_val_loss = result["best_val_loss"]
-			best_train_loss = result["best_train_loss"]
-			best_score_epoch = result["best_score_epoch"]
-			auc_at_best_score = result["auc_at_best_score"]
-			network_skip_at_best_score = result["network_skip_at_best_score"]
-			best_auc = result["best_auc"]
-			best_auc_epoch = result["best_auc_epoch"]
-			trial.report(average_val_loss, step=epoch)
-			if trial.should_prune():
+		try:
+			for result in run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads):
+				epoch = result["epoch"]
+				composite_score = result["composite_score"]
+				val_loss_at_best_score = result["val_loss_at_best_score"]
+				train_loss_at_best_score = result["train_loss_at_best_score"]
+				best_score_epoch = result["best_score_epoch"]
+				auc_at_best_score = result["auc_at_best_score"]
+				network_skip_at_best_score = result["network_skip_at_best_score"]
+				best_auc = result["best_auc"]
+				best_auc_epoch = result["best_auc_epoch"]
+				epoch_since_curriculum_completed = result["epochs_since_curriculum_completed"]
+				best_composite_score = result["best_composite_score"]
+				trial.report(composite_score, step=epoch)
+				if trial.should_prune():
+					raise optuna.TrialPruned()
+				
+			trial.set_user_attr("best_score_epoch", best_score_epoch)
+			trial.set_user_attr("train_loss_at_best_score", train_loss_at_best_score)
+			trial.set_user_attr("val_loss_at_best_score", val_loss_at_best_score)
+			trial.set_user_attr("auc_at_best_score", auc_at_best_score)
+			trial.set_user_attr("network_skip_at_best_score", network_skip_at_best_score)
+			trial.set_user_attr("epoch_since_curriculum_completed", epoch_since_curriculum_completed)
+			trial.set_user_attr("best_auc", best_auc)
+			trial.set_user_attr("best_auc_epoch", best_auc_epoch)
+		except RuntimeError as e:
+			if "out of memory" in str(e):
+				print("CUDA OOM encountered, pruning trial")
+				torch.cuda.empty_cache()
 				raise optuna.TrialPruned()
-			
-		trial.set_user_attr("best_score_epoch", best_score_epoch)
-		trial.set_user_attr("best_train_loss", best_train_loss)
-		trial.set_user_attr("auc_at_best_score", auc_at_best_score)
-		trial.set_user_attr("network_skip_at_best_score", network_skip_at_best_score)
-		trial.set_user_attr("best_auc", best_auc)
-		trial.set_user_attr("best_auc_epoch", best_auc_epoch)
-		trial.set_user_attr("composite_score", composite_score)
+			else:
+				raise
 
-		return best_val_loss
+		return best_composite_score
 	
 	study = optuna.create_study(
 		study_name="PiPPINN_HPO",
