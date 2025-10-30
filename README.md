@@ -1,6 +1,6 @@
-# PPI-GNN
+# PiPPINN
 
-PPI-GNN is a framework for protein-protein interaction (PPI) prediction using Graph Neural Networks (GNNs). This repository provides a pipeline to encode protein sequences, construct graphs suitable for PyTorch Geometric, and train a custom GNN model to predict interactions.
+PiPPINN is a framework for protein-protein interaction (PPI) prediction using Graph Neural Networks (GNNs). This repository provides a pipeline to encode protein sequences, construct graphs suitable for PyTorch Geometric, and train a custom GNN model to predict interactions.
 
 ## Table of Contents
 
@@ -26,10 +26,20 @@ This project is designed for in silico evolution of proteins towards structure a
 - **Customizable training pipeline** with negative edge sampling, batching, and split configuration.
 - **PyTorch and PyTorch Geometric** powered.
 
-## Installation
-### **Installation Guide for PPI-GNN**
+## Highlights
+- GNN training pipeline (GraphSAGE / Pool_SAGEConv variants).
+- Edge sampling with stratified sampling and unsampled tracking (EdgeSampler).
+- Curriculum learning support to enable training with and without graph-based predictions.
+- Optuna-based HPO orchestration with JournalStorage for distributed runs.
+- Surrogate-based HPO helpers (RandomForest) to leverage prior results.
+- Final inference model is under development and will be published to a public model repo (e.g., Hugging Face).
 
-This guide provides step-by-step instructions to set up the environment and install all necessary dependencies for the **PPI-GNN** project.
+---
+
+## Installation
+### **Installation Guide for PiPPINN**
+
+This guide provides step-by-step instructions to set up the environment and install all necessary dependencies for the **PiPPINN** project.
 
 ---
 
@@ -50,8 +60,8 @@ Before proceeding, ensure the following are installed on your system:
 ### **2. Clone the Repository**
 Clone the repository to your local machine:
 ```bash
-git clone https://github.com/your-repo/PPI-GNN.git
-cd PPI-GNN
+git clone https://github.com/your-repo/PiPPINN.git
+cd PiPPINN
 ```
 
 ---
@@ -152,8 +162,25 @@ deactivate
 ---
 
 ### **Conclusion**
-You are now ready to use the **PPI-GNN** project. If you encounter any issues, feel free to reach out or consult the documentation.
+You are now ready to use the **PiPPINN** project. If you encounter any issues, feel free to reach out or consult the documentation.
+
 ## Pipeline
+
+### Key files
+- `TrainUtils.py` — core models, EdgeSampler, Decoders, training and batch utilities.
+- `OptimizeHyperparams.py` — Optuna study controller, objective wrapper, surrogate support.
+  - Create study with sampler and pruner:
+    ```py
+    sampler = TPESampler(seed=SEED, multivariate=True)
+    pruner = HyperbandPruner(...)
+    study = optuna.create_study(study_name=..., direction="minimize", sampler=sampler, pruner=pruner, storage=JournalStorage(JournalFileBackend(journal_file)), load_if_exists=True)
+    ```
+  - For distributed runs, ensure every worker uses the same `journal_file`, `study_name`, and search-space code.
+  - To resume: pass `load_if_exists=True` and run `study.optimize(objective, n_trials=ADDITIONAL_TRIALS)`.
+- `Retrain.py` — small retrain helper.
+- `Evaluate_Trained.py` — batch loader / evaluation.
+
+---
 
 ### 1. Protein Encoding
 
@@ -187,15 +214,31 @@ python Generate_PyG_Graph_Data.py --node-embeddings <output_embeddings.pt> --edg
 
 Train a GraphSAGE-based GNN on your constructed graph.
 
-**Script:** `TrainGNN.py`
+#### 3.21 Hyperparameter optimization (HPO)
+- HPO controller: `OptimizeHyperparams.py`.
+- Supports Optuna with `JournalStorage` + `JournalFileBackend` for distributed workers.
+- Recommended setup for distributed Bayesian HPO:
+```py
+from optuna.samplers import TPESampler
+from optuna.pruners import HyperbandPruner
+from optuna.storages import JournalStorage
+from optuna.storages.journal import JournalFileBackend
 
-**Usage:**
-```bash
-python TrainGNN.py --input <graph.pt> --epochs 50 --output <trained_model.pt>
+sampler = TPESampler(seed=SEED, multivariate=True)
+pruner = HyperbandPruner(min_resource=15, reduction_factor=3)
+storage = JournalStorage(JournalFileBackend("/shared/optuna_journal.log"))
+study = optuna.create_study(study_name="PiPPINN_HPO", direction="minimize",
+                            sampler=sampler, pruner=pruner, storage=storage, load_if_exists=True)
+study.optimize(objective, n_trials=NUM_TRIALS)
 ```
-- `--input/-i`: PyG graph file.
-- `--epochs/-e`: Number of training epochs.
-- `--output/-o`: Output model file.
+
+  #### 3.1 Train / Retrain
+- For fine-tuning or retraining a saved model, use `Retrain.py`:
+```bash
+python Retrain.py --input_data <graph.pt> --parameters <best_params.json> --output <retrained_model.pt>
+```
+
+### Perform predictions
 
 ## Usage
 

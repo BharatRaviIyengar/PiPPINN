@@ -116,7 +116,78 @@ class Pool_SAGEConv(nn.Module):
 		h = self.LN_final(h)
 		# Final transformation
 		return ReLU(h)
+	
+class Pool_SAGE_deep(nn.Module):
+	"""
+	Defines a deeper GraphSAGE model with pooling-based convolutions.
+	"""
+
+	def __init__(self, in_channels, hidden_channels, dropout=0.0):
+		"""
+		Args:
+			in_channels (int): Number of input features per node.
+			hidden_channels (int): Number of hidden features per node.
+			dropout (float): Dropout rate.
+		"""
+		super().__init__()
 		
+		self.pool = nn.Linear(in_channels, in_channels)
+		self.LN_pool = nn.LayerNorm(in_channels)
+		self.in_channels = in_channels
+		self.hidden_channels = hidden_channels
+		self.dropout = dropout
+		self.dims = [self.in_channels] + self.hidden_channels
+		self.final_transform = self.build_mlp()
+
+		self.edge_weight_message_coefficient = nn.Parameter(torch.tensor(0.5))
+		self.aggregate_coefficient_1 = nn.Parameter(torch.tensor(0.25))
+		self.aggregate_coefficient_2 = nn.Parameter(torch.tensor(0.25))
+
+	def build_mlp(self):
+		layers = []
+		layers.append(nn.LayerNorm(self.dims[0]))
+		for i in range(len(self.dims) - 1):
+			layers.append(nn.Linear(self.dims[i], self.dims[i + 1]))
+			layers.append(nn.LayerNorm(self.dims[i + 1]))
+			layers.append(nn.ReLU())
+			if self.dropout > 0 and i < len(self.dims) - 1:
+				layers.append(nn.Dropout(p=self.dropout))		
+		return nn.Sequential(*layers)
+	
+	def GNN_layer(self, x, message_edges, message_edgewt):
+		src, dst = message_edges
+		coeff = softplus(self.edge_weight_message_coefficient)
+		edge_features = x[src] * (1 + coeff * message_edgewt.unsqueeze(-1))
+		
+		# Pool and activate neighbor messages
+		pooled = self.pool(edge_features)
+		pooled = self.LN_pool(pooled)
+		pooled = ReLU(pooled)
+		
+		# Aggregate neighbor messages via max
+		aggregate, _ = scatter_max(pooled, dst, dim=0, dim_size=x.size(0))
+
+		# Merge with self-representation
+		c1 = softplus(self.aggregate_coefficient_1)
+		c2 = softplus(self.aggregate_coefficient_2)
+		h = x + c1 * (aggregate * x) + c2 * aggregate
+		h = self.final_transform(h)
+		return h
+	
+	def forward(self, x, message_edges, message_edgewt=None):
+		"""
+		Forward logic with message passing.
+		"""
+		if message_edgewt is None:
+			message_edgewt = torch.ones(message_edges.size(1), device=message_edges.device)
+
+		# Perform message passing through multiple layers
+		x = self.GNN_layer(x, message_edges, message_edgewt)
+		x = self.GNN_layer(x, message_edges, message_edgewt)
+		return x
+	
+
+
 
 class GraphSAGE(nn.Module):
 	"""
@@ -347,7 +418,12 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			  frac_sample_from_unsampled=0.1,
 			  nbr_weight_intensity=1.0,
 			  device=None,
-			  threads=1):  
+			  threads=1,
+				soft_negative_labels=False,
+				max_neg_edge_centrality=None,
+				negative_label_hardness=1,
+				uniform_supervision_weights = False
+				):  
 		super().__init__()
 		self.device = device if device is not None else positive_graph.edge_index.device
 		self.positive_edges = positive_graph.edge_index.to(self.device)
@@ -367,6 +443,8 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.num_supervision_edges = int(self.batch_size * self.supervision_fraction)
 		self.num_message_edges = self.batch_size - self.num_supervision_edges
 		self.threads = threads
+		self.uniform_supervision_weights = uniform_supervision_weights
+		self.soft_negative_labels = soft_negative_labels
 
 		assert (1 - self.centrality_fraction) >= self.supervision_fraction, "Supervision edges should always be sampled uniformly. The number of uniformly sampled edges in the batch should be at least as much as the number of supervision edges"
 
@@ -394,11 +472,15 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			self.negative_edges = generate_negative_edges(positive_graph,device=self.device).to(self.device)
 		
 		if negative_batch_size is None:  
-				self.negative_batch_size = int(self.batch_size*supervision_fraction)*2 # Twice the number of supervision edges  
+				self.negative_batch_size = self.num_supervision_edges*2 # Twice the number of supervision edges  
 		else:  
 			self.negative_batch_size = negative_batch_size  
 		
 		self.num_negative_edges = self.negative_edges.size(1) 
+
+		if self.soft_negative_labels:
+			self.max_neg_edge_centrality = max_neg_edge_centrality if max_neg_edge_centrality is not None else self.get_edge_centrality(self.negative_edges).max().item()
+			self.negative_label_hardness = negative_label_hardness
 
 		# Define sampling method for negative edges  
 		if self.negative_batch_size >= self.num_negative_edges:  
@@ -459,12 +541,21 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		elif self.centrality_fraction == 1.0:
 			self.sampling_fn = self.sample_edges_basic  
 		else:  
-			self.sampling_fn = self.sample_edges_strata_with_unsampled_tracking  
+			self.sampling_fn = self.sample_edges_strata_with_unsampled_tracking
+
+		if uniform_supervision_weights:
+			self.supervision_importance[:self.num_supervision_edges] = 1/self.num_supervision_edges
+			self.supervision_importance[self.num_supervision_edges:] = 1/self.negative_batch_size
 		
 
 	def get_edge_centrality(self,edge_list):  
 		return self.centrality[edge_list[0]] + self.centrality[edge_list[1]]  
-
+	
+	def generate_soft_negative_labels(self, edge_centrality, min_centrality=2, max_centrality = None, hardness=1):
+		max_centrality = edge_centrality.max() if max_centrality is None else max_centrality
+		negative_probs = 0.5 * ((max_centrality - edge_centrality) / (max_centrality - min_centrality + 1e-8)) ** hardness
+		return negative_probs.clamp(min=0.0, max=0.5)
+	
 	def sample_edges_basic(self):  
 		return torch.multinomial(self.uniform_probs, self.batch_size, replacement=False) 
 	
@@ -618,17 +709,20 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		# Add negative edges
 		self.batch_edges[:, -self.negative_batch_size:] = negative_batch_edges
 
-		self.supervision_importance.zero_()
-		# Learning weights for negative edges (high score negatives between hubs)  
-		self.supervision_importance[self.num_supervision_edges:] = (self.centrality[negative_batch_edges[0]] + self.centrality[negative_batch_edges[1]])/self.negative_wt_scaling
+		if self.soft_negative_labels:
+			negative_edge_centrality = self.get_edge_centrality(negative_batch_edges)
+			self.supervision_labels[self.num_supervision_edges:] = self.generate_soft_negative_labels(negative_edge_centrality, max_centrality=self.max_neg_edge_centrality, hardness=self.negative_label_hardness)
 
-		# Learning weights for positive edges (high score positives between peripheral nodes)  
-		self.supervision_importance[:self.num_supervision_edges] = (1/torch.log2(self.edge_centrality_scores[self.positive_batch_indices[self.supervision_edge_mask]]))/self.positive_wt_scaling
-		
-		
+		if not self.soft_negative_labels and not self.uniform_supervision_weights:
+				# Learning weights for negative edges (high score negatives between hubs)  
+				self.supervision_importance[self.num_supervision_edges:] = (self.centrality[negative_batch_edges[0]] + self.centrality[negative_batch_edges[1]])/self.negative_wt_scaling
+
+				# Learning weights for positive edges (high score positives between peripheral nodes)  
+				self.supervision_importance[:self.num_supervision_edges] = (1/torch.log2(self.edge_centrality_scores[self.positive_batch_indices[self.supervision_edge_mask]]))/self.positive_wt_scaling
+			
 		# Relabel batch edges #  
 		
-		self.node_mask.fill_(False)  
+		self.node_mask.fill_(False)
 		self.node_mask[self.batch_edges.flatten()] = True  
 		nodes_in_batch = self.node_mask.nonzero(as_tuple=False).view(-1)
 
