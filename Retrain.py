@@ -11,6 +11,7 @@ import gc
 from collections import deque
 import pickle
 from copy import deepcopy
+import math
 
 def generate_hidden_dims(input_dim, depth, last_layer_size):
 	n_layers = depth - 1  # intermediate layers count (excluding first)
@@ -25,17 +26,17 @@ def generate_hidden_dims(input_dim, depth, last_layer_size):
 
 def get_trial_stability(trial:optuna.trial.FrozenTrial, radius:int=5):
 	best_score = trial.value
-	best_score_epoch = trial.user_attrs["best_score_epoch"] - 1
 	max_epochs = 200
 	scores = list(trial.intermediate_values.values())
+	best_score_epoch = next(i for (i,v) in enumerate(scores) if v == best_score)
 	startindex = max(0, best_score_epoch - radius)
 	endindex = min(max_epochs, best_score_epoch + radius + 1)
 	stability = (torch.tensor(scores[startindex:endindex]) - best_score)**2
 	return stability.mean().item()
 	
 	
-def choose_best_trials(study:optuna.Study, λ = 10, topk:int=5):
-	scored_trials = [(trial, trial.value + λ*get_trial_stability(trial)) for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
+def choose_best_trials(study:optuna.Study, stability_coefficient = 50, topk:int=5):
+	scored_trials = [(trial, trial.value + stability_coefficient*get_trial_stability(trial)) for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
 
 	best_trials = [(t, scores) for t, scores in sorted(scored_trials, key=lambda x: x[1])[:topk]]
 	return best_trials
@@ -46,48 +47,43 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 	centrality_fraction = params['centrality_fraction']
 	dropout = params['dropout']
 	weight_decay = params['weight_decay']
-	patience = 20
+	patience = 15
 	scheduler_factor = params['scheduler_factor']
 	nbr_wt_intensity = params['nbr_weight_intensity']
 	network_skip_factor = params['network_skip_factor']
-
 	input_channels = dataset[0]["Val"].x.size(1)
-
 	hidden_channels = generate_hidden_dims(input_channels, params['depth'], params['last_layer_size']) + [params['last_layer_size']]
-
 	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
+	
 
 	utils.ME_loss.num_positive_edges = data_for_training[0]["train_sampler"].num_supervision_edges
 	utils.ME_loss.margin = params['margin']
 	utils.ME_loss.margin_loss_coef = params['margin_loss_coef']
 	utils.ME_loss.entropy_coef = params['entropy_coef']
-	min_network_skip = 0.001
-
-	total_val_samples = sum([(data["val_sampler"].num_supervision_edges + data["val_sampler"].num_negative_edges)*data["val_sampler"].num_batches for data in data_for_training])
-
-	preds_buf = torch.zeros(total_val_samples, dtype=torch.float32)
-	labels_buf = torch.zeros(total_val_samples, dtype=torch.int8)
-
-	pre_best_losses = deque(maxlen=6)
-	post_best_losses = deque(maxlen=5)
-	min_desired_netskip = 0.007
-	best_model_score = float('inf')
-	training_stats = []
 
 
 	del dataset
 	gc.collect()
 	torch.cuda.empty_cache()
 
-	for run in range(runs):
-			# Initialize model and optimizer
+	# Initialize model and optimizer
+
+	total_val_samples = sum([(data["val_sampler"].num_supervision_edges + data["val_sampler"].num_negative_edges)*data["val_sampler"].num_batches for data in data_for_training])
+
+	preds_buf = torch.zeros(total_val_samples, dtype=torch.float32)
+	labels_buf = torch.zeros(total_val_samples, dtype=torch.int8)
+
+	best_model = None
+	training_stats = []
+
+	for _ in range(runs):
 		model = utils.DualLayerModel(
-			in_channels=data_for_training[0]["input_channels"],
-			hidden_channels=hidden_channels,
-			dropout=dropout,
-			network_skip=0.5
-		).to(device)
-	
+				in_channels=data_for_training[0]["input_channels"],
+				hidden_channels=hidden_channels,
+				dropout=dropout,
+				network_skip=0.5
+			).to(device)
+		
 		optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=weight_decay)
 		scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 			optimizer= optimizer,
@@ -96,22 +92,19 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 			patience=10,
 			cooldown=2,
 			min_lr=1e-6
-		)	
-		network_skip_scheduler = utils.DecayScheduler(model, 'network_skip', initial_value=0.6, factor=network_skip_factor, cooldown=2, min_value=min_network_skip)
+		)
+		network_skip_scheduler = utils.DecayScheduler(model, 'network_skip', initial_value=0.6, factor=network_skip_factor, cooldown=2, min_value=0.001)
 		
-		best_val_score = float('inf')
-		best_val_loss = float('inf')
-		best_auc_penalty = float('inf')
-		best_train_loss = float('inf')
-		auc_at_best_loss = float('-inf')
+		# Training loop
+		best_composite_score = float('inf')
+		val_loss_at_best_score = float('inf')
+		train_loss_at_best_score = float('inf')
+		auc_at_best_score = float('-inf')
 		epochs_without_improvement = 0
-		best_loss_epoch = max_epochs
-		network_skip_at_best_loss = 0.6
+		best_score_epoch = max_epochs
 		best_auc = float('-inf')
 		best_auc_epoch = max_epochs
-		pre_stability = float('inf')
-		post_stability = float('inf')
-		best_model = None
+		epochs_since_curriculum_completed = 0
 
 		for epoch in range(max_epochs):
 			total_train_loss = 0.0  # Reset total training loss for the epoch
@@ -119,7 +112,6 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 			val_batch_count = 0
 			train_batch_count = 0
 			fill_idx = 0
-			
 
 			for data in data_for_training:
 				# Training
@@ -137,91 +129,56 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 						val_loss, edge_prob, edge_labels = utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=False, return_output=True) # type: ignore
 						total_val_loss += val_loss
 						n = edge_prob.size(0)
-						preds_buf[fill_idx:fill_idx+n] = edge_prob.cpu()
-						labels_buf[fill_idx:fill_idx+n] = edge_labels.cpu()
+						preds_buf[fill_idx:fill_idx+n] = edge_prob
+						labels_buf[fill_idx:fill_idx+n] = edge_labels
 						fill_idx += n
 
 			# Average losses
 			average_train_loss = total_train_loss / train_batch_count
 			average_val_loss = total_val_loss / val_batch_count
-			post_best_losses.append(average_val_loss)
+
+			if model.network_skip <= network_skip_scheduler.min_value + 1e-6:
+				epochs_since_curriculum_completed += 1
+				# netskip_decay_completed = True
 			
-			auc = utils.auc_score(preds_buf, labels_buf)
-			auc_penalty = ((1 - auc) * 10) ** 2
-
-			combined_score = average_val_loss + auc_penalty
-
-			print(f"Run {run+1}, Epoch {epoch+1:03d}: Train Loss: {average_train_loss:.4f}, Val Loss: {average_val_loss:.4f}, AUC: {auc:.4f}, Combined Score: {combined_score:.4f}, Network Skip: {model.network_skip:.4f}")
-						
-			if auc > best_auc:
-				best_auc = auc
-				best_auc_epoch = epoch + 1
-				best_auc_penalty = auc_penalty
-
-
 			# Early stopping logic
-			if combined_score < best_val_score:
-				best_val_loss = average_val_loss
-				best_val_score = combined_score
-				best_train_loss = average_train_loss
-				epochs_without_improvement = 0
-				best_loss_epoch = epoch + 1
-				auc_at_best_loss = auc
-				network_skip_at_best_loss = model.network_skip
-				pre_best_losses.extend(post_best_losses)
-				pre_best_losses.append(average_val_loss)
-				post_best_losses.clear()
-
-				## Save best model based on composite score
-				if best_loss_epoch > 5 and network_skip_at_best_loss <= min_desired_netskip:
+			if epochs_since_curriculum_completed > 2:
+				auc = utils.auc_score(preds_buf, labels_buf)
+				auc_penalty = 1 / (1 + math.exp(-20*(0.9 - auc)))
+				composite_score = average_val_loss*(1 + auc_penalty)
+				if auc > best_auc:
+					best_auc = auc
+					best_auc_epoch = epoch + 1
+				if best_composite_score > composite_score:
+					best_composite_score = composite_score
+					val_loss_at_best_score = average_val_loss
+					train_loss_at_best_score = average_train_loss
+					epochs_without_improvement = 0
+					best_score_epoch = epoch + 1
+					auc_at_best_score = auc
 					with torch.no_grad():
 						best_model = deepcopy(model).to('cpu')
+						torch.save(best_model, model_outfile)
+				else:
+					epochs_without_improvement += 1
+					
+				scheduler.step(average_val_loss)
+				network_skip_scheduler.step()
 
-			else:
-				epochs_without_improvement += 1
-				
-			scheduler.step(average_val_loss)
-			network_skip_scheduler.step()
+				if epochs_without_improvement >= patience:
+					print(f"Early stopping triggered after {epoch + 1} epochs.")
+					break
 
-			if epochs_without_improvement >= patience:
-				print(f"Early stopping triggered after {epoch + 1} epochs.")
-				break
 
-		# AUC related penalties
-		auc_gap = abs(best_auc - auc_at_best_loss)
-		auc_gap_correction = 1 + auc_gap / (best_auc + 1e-6)
-		auc_timing_penalty = min(abs(best_auc_epoch - best_loss_epoch) / max_epochs, 1.0)
-		auc_timing_penalty *= auc_gap_correction
-
-		# Epoch penalty
-		epoch_penalty = min(best_loss_epoch / max_epochs, 1.0)
-		if network_skip_at_best_loss > min_desired_netskip:
-			epoch_penalty *= network_skip_at_best_loss/min_desired_netskip
-
-		# Final stability calculation
-		pre_stability = ((torch.tensor(pre_best_losses)[:-1] - best_val_loss)**2).mean().item() if len(pre_best_losses) >= 5 else float('inf')
-		post_stability = ((torch.tensor(post_best_losses) - best_val_loss)**2).mean().item()
-
-		stability = 0.25*pre_stability + 0.75*post_stability
-
-		overall_composite_score = best_val_score + 0.3*stability + 0.2*epoch_penalty + 0.3*auc_timing_penalty + 0.5*best_auc_penalty
-
-		if best_model is not None and overall_composite_score < best_model_score:
-			best_model_score = overall_composite_score
-			torch.save(best_model, model_outfile)
-
-		training_stats.append({
-			"best_val_loss": best_val_loss,
-			"best_train_loss": best_train_loss,
-			"best_loss_epoch": best_loss_epoch,
-			"pre_stability": pre_stability,
-			"post_stability": post_stability,
-			"auc_at_best_loss": auc_at_best_loss,
-			"network_skip_at_best_loss": network_skip_at_best_loss,
-			"best_auc": best_auc,
-			"best_auc_epoch": best_auc_epoch,
-			"best_val_score": best_val_score,
-		})
+			training_stats.append({
+				"val_loss_at_best_score": val_loss_at_best_score,
+				"train_loss_at_best_score": train_loss_at_best_score,
+				"best_score_epoch": best_score_epoch,
+				"auc_at_best_score": auc_at_best_score,
+				"best_auc": best_auc,
+				"best_auc_epoch": best_auc_epoch,
+				"best_composite_score": best_composite_score
+				})
 
 	return training_stats
 
