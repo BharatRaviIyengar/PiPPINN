@@ -8,10 +8,14 @@ import optuna
 from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 import gc
-from collections import deque
 import pickle
 from copy import deepcopy
 import math
+
+def load_journal_study(journal_path:str, study_name = "PiPPINN_HPO"):
+	storage = JournalStorage(JournalFileBackend(journal_path))
+	study = optuna.load_study(study_name=study_name,storage=storage)
+	return study
 
 def generate_hidden_dims(input_dim, depth, last_layer_size):
 	n_layers = depth - 1  # intermediate layers count (excluding first)
@@ -24,15 +28,19 @@ def generate_hidden_dims(input_dim, depth, last_layer_size):
 
 	return hidden_dims
 
+def calculate_stability(scores, best_score = None, radius:int=5):
+	best_score = min(scores) if best_score is None else best_score
+	best_score_epoch = scores.index(best_score)
+	startindex = max(0, best_score_epoch - radius)
+	endindex = min(len(scores), best_score_epoch + radius + 1)
+	stability = [(scores[i] - best_score)**2 for i in range(startindex, endindex)]
+	return sum(stability)/len(stability)
+
 def get_trial_stability(trial:optuna.trial.FrozenTrial, radius:int=5):
 	best_score = trial.value
-	max_epochs = 200
 	scores = list(trial.intermediate_values.values())
-	best_score_epoch = next(i for (i,v) in enumerate(scores) if v == best_score)
-	startindex = max(0, best_score_epoch - radius)
-	endindex = min(max_epochs, best_score_epoch + radius + 1)
-	stability = (torch.tensor(scores[startindex:endindex]) - best_score)**2
-	return stability.mean().item()
+	stability = calculate_stability(scores, best_score, radius=radius)
+	return stability
 	
 	
 def choose_best_trials(study:optuna.Study, stability_coefficient = 50, topk:int=5):
@@ -74,9 +82,12 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 	labels_buf = torch.zeros(total_val_samples, dtype=torch.int8)
 
 	best_model = None
+	best_model_score = float('inf')
+	best_run = -1
 	training_stats = []
+	train_dynamics_names = ["epoch", "train_loss", "val_loss", "val_auc", "composite_score"]
 
-	for _ in range(runs):
+	for run in range(runs):
 		model = utils.DualLayerModel(
 				in_channels=data_for_training[0]["input_channels"],
 				hidden_channels=hidden_channels,
@@ -105,6 +116,7 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 		best_auc = float('-inf')
 		best_auc_epoch = max_epochs
 		epochs_since_curriculum_completed = 0
+		train_dynamics = []
 
 		for epoch in range(max_epochs):
 			total_train_loss = 0.0  # Reset total training loss for the epoch
@@ -146,6 +158,7 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 				auc = utils.auc_score(preds_buf, labels_buf)
 				auc_penalty = 1 / (1 + math.exp(-20*(0.9 - auc)))
 				composite_score = average_val_loss*(1 + auc_penalty)
+				train_dynamics.append((epoch, average_train_loss, average_val_loss, auc, composite_score))
 				if auc > best_auc:
 					best_auc = auc
 					best_auc_epoch = epoch + 1
@@ -156,9 +169,12 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 					epochs_without_improvement = 0
 					best_score_epoch = epoch + 1
 					auc_at_best_score = auc
-					with torch.no_grad():
-						best_model = deepcopy(model).to('cpu')
-						torch.save(best_model, model_outfile)
+					if composite_score < best_model_score:
+						best_model_score = composite_score
+						with torch.no_grad():
+							best_model = deepcopy(model).to('cpu')
+							best_run = run
+							torch.save(best_model, model_outfile)
 				else:
 					epochs_without_improvement += 1
 					
@@ -169,6 +185,8 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 					print(f"Early stopping triggered after {epoch + 1} epochs.")
 					break
 
+			train_dynamics_dict = {train_dynamics_names[i]: values for i, values in enumerate(zip(*train_dynamics))}
+			stability = calculate_stability(train_dynamics_dict["composite_score"], best_score = best_composite_score, radius=5)
 
 			training_stats.append({
 				"val_loss_at_best_score": val_loss_at_best_score,
@@ -177,10 +195,22 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 				"auc_at_best_score": auc_at_best_score,
 				"best_auc": best_auc,
 				"best_auc_epoch": best_auc_epoch,
-				"best_composite_score": best_composite_score
-				})
-
-	return training_stats
+				"best_composite_score": best_composite_score,
+				"stability": stability,
+				"train_dynamics": train_dynamics_dict
+			})
+	# Calculate inter-run statistics
+	metrics = ["best_composite_score", "val_loss_at_best_score", "auc_at_best_score", "stability"]
+	inter_run_stats = {}
+	for metric in metrics:
+		values = [run_stats[metric] for run_stats in training_stats]
+		mean = sum(values) / len(values)
+		stdv = (sum((x - mean)**2 for x in values) / len(values))**0.5
+		cv = stdv / mean if mean != 0 else float('inf')
+		inter_run_stats[metric] = {"mean":mean, "stdv":stdv, "cv":cv}
+	
+	inter_run_stats["best_run"] = best_run
+	return training_stats, inter_run_stats
 
 if __name__ == "__main__":
 
@@ -248,15 +278,13 @@ if __name__ == "__main__":
 	try:
 		best_trials = pickle.load(open(best_trials_file,"rb"))
 	except FileNotFoundError:
-		storage = JournalStorage(JournalFileBackend(args.trials))
-		study = optuna.load_study(study_name="PiPPINN_HPO",storage=storage)
+		study = load_journal_study(args.trials)
 		best_trials = choose_best_trials(study, topk=5)
 		pickle.dump(best_trials, open(best_trials_file,"wb"))
 
 	best_params = best_trials[args.num_trial][0].params
 
-	model_stats = run_training(params=best_params, dataset=input_data, batch_size=40000, num_batches=None, device=device, model_outfile= model_outfile, threads=args.threads, runs=args.runs)
+	per_run_stats, inter_run_stats = run_training(params=best_params, dataset=input_data, batch_size=40000, num_batches=None, device=device, model_outfile= model_outfile, threads=args.threads, runs=args.runs)
 
 	with open(model_stats_file,"w") as f:
-		json.dump(model_stats, f, indent=2)
-	
+		json.dump([inter_run_stats, per_run_stats], f, indent=2)
