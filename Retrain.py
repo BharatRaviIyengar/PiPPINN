@@ -184,21 +184,24 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 				if epochs_without_improvement >= patience:
 					print(f"Early stopping triggered after {epoch + 1} epochs.")
 					break
+		# End of epochs loop
 
-			train_dynamics_dict = {train_dynamics_names[i]: values for i, values in enumerate(zip(*train_dynamics))}
-			stability = calculate_stability(train_dynamics_dict["composite_score"], best_score = best_composite_score, radius=5)
+		train_dynamics_dict = {train_dynamics_names[i]: values for i, values in enumerate(zip(*train_dynamics))}
+		stability = calculate_stability(train_dynamics_dict["composite_score"], best_score = best_composite_score, radius=5)
 
-			training_stats.append({
-				"val_loss_at_best_score": val_loss_at_best_score,
-				"train_loss_at_best_score": train_loss_at_best_score,
-				"best_score_epoch": best_score_epoch,
-				"auc_at_best_score": auc_at_best_score,
-				"best_auc": best_auc,
-				"best_auc_epoch": best_auc_epoch,
-				"best_composite_score": best_composite_score,
-				"stability": stability,
-				"train_dynamics": train_dynamics_dict
-			})
+		training_stats.append({
+			"val_loss_at_best_score": val_loss_at_best_score,
+			"train_loss_at_best_score": train_loss_at_best_score,
+			"best_score_epoch": best_score_epoch,
+			"auc_at_best_score": auc_at_best_score,
+			"best_auc": best_auc,
+			"best_auc_epoch": best_auc_epoch,
+			"best_composite_score": best_composite_score,
+			"stability": stability,
+			"train_dynamics": train_dynamics_dict
+		})
+	# End of runs loop
+
 	# Calculate inter-run statistics
 	metrics = ["best_composite_score", "val_loss_at_best_score", "auc_at_best_score", "stability"]
 	inter_run_stats = {}
