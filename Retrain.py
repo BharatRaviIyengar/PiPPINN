@@ -177,13 +177,17 @@ def run_training(params:dict, num_batches, batch_size:int, dataset:list, model_o
 							torch.save(best_model, model_outfile)
 				else:
 					epochs_without_improvement += 1
-					
-				scheduler.step(average_val_loss)
-				network_skip_scheduler.step()
+				# end of early stopping logic
+			# end of curriculum completed check
+			
+			# Step schedulers
+			scheduler.step(average_val_loss)
+			network_skip_scheduler.step()
 
-				if epochs_without_improvement >= patience:
-					print(f"Early stopping triggered after {epoch + 1} epochs.")
-					break
+			# Implement early stopping
+			if epochs_without_improvement >= patience:
+				print(f"Early stopping triggered after {epoch + 1} epochs.")
+				break
 		# End of epochs loop
 
 		train_dynamics_dict = {train_dynamics_names[i]: values for i, values in enumerate(zip(*train_dynamics))}

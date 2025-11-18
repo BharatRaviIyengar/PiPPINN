@@ -8,7 +8,6 @@ from optuna.samplers import TPESampler
 from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 from optuna.pruners import HyperbandPruner
-from collections import deque
 import math
 
 import gc
@@ -83,7 +82,6 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	network_skip_at_best_score = 0.6
 	best_auc = float('-inf')
 	best_auc_epoch = max_epochs
-	min_epochs = 10
 	# netskip_decay_completed = False
 	epochs_since_curriculum_completed = 0
 	
