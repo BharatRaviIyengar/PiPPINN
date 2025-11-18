@@ -107,6 +107,11 @@ class Decoder(nn.Module):
 		fraction_node_contribution = node_contribution / (node_contribution + nbr_contribution + 1e-8)
 		edge_weights = ReLU(self.edge_wt_head(torch.cat([edge_features, nbrs_similarity], dim=-1)))
 		return edge_probabilities, edge_weights, fraction_node_contribution
+	
+def reparameterize(mu, std):
+	eps = torch.randn_like(std)
+	return mu + eps * std
+
 
 def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False, return_output=False):
 	"""
