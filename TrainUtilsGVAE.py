@@ -67,7 +67,7 @@ class NodeEncoder(nn.Module):
 
 
 class Decoder(nn.Module):
-	def __init__(self, in_channels, hidden_channels, coef_matrix_cols, dropout=0.0):
+	def __init__(self, in_channels, hidden_channels, dropout=0.0):
 		super().__init__()
 		self.in_channels = in_channels
 		self.hidden_channels = hidden_channels
@@ -113,6 +113,38 @@ def reparameterize(mu, std):
 	return mu + eps * std
 
 
+class GVAE_Model(nn.Module):
+	def __init__(self, node_in_channels, node_latent_channels,
+				 nbr_in_channels, nbr_hidden_channels, nbr_latent_channels,
+				 decoder_hidden_channels,
+				 dropout=0.0):
+		super().__init__()
+		self.node_encoder = NodeEncoder(node_in_channels, node_latent_channels, dropout)
+		self.neighborhood_encoder = NeighborhoodEncoder(nbr_in_channels, nbr_hidden_channels, nbr_latent_channels, dropout)
+		self.decoder = Decoder(node_latent_channels, decoder_hidden_channels, dropout)
+
+	def forward(self, x, supervision_edges, message_edges, message_edgewt):
+		# Encode nodes
+		node_mu, node_std = self.node_encoder(x)
+		nodes_latent = reparameterize(node_mu, node_std)
+
+		# Encode neighborhoods
+		nbr_mu, nbr_std = self.neighborhood_encoder(x, message_edges, message_edgewt)
+		nbrs_latent = reparameterize(nbr_mu, nbr_std)
+
+		# Decode edges
+		edge_probabilities, edge_weights, edge_explained_by_nodes = self.decoder(
+			nodes_latent,
+			nbrs_latent,
+			supervision_edges
+		)
+		return edge_probabilities, edge_weights, edge_explained_by_nodes
+	
+def KL_loss(mu, std, num_nodes):
+	kld = -0.5 * torch.sum(1 + torch.log(std.pow(2) + 1e-8) - mu.pow(2) - std.pow(2))
+	return kld / num_nodes
+	
+
 def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False, return_output=False):
 	"""
 	Processes a single batch for training or validation.
@@ -140,10 +172,10 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	else:
 		conditional_backward = lambda loss: None  # No-op for validation
 
-	edge_probability, edge_weights = model(
+	edge_probability, edge_weights, edge_explained_by_nodes = model(
 		data.node_features,
-		message_edges=data.message_edges,
 		supervision_edges=data.supervision_edges,
+		message_edges=data.message_edges,
 		message_edgewt = data.message_edgewts
 	)
 	edge_probability = edge_probability.squeeze(-1)
@@ -153,6 +185,7 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	bce_edge_classification_loss = bce_logit_loss(edge_probability,data.supervision_labels,weight=data.supervision_importance)
 	mse_edge_weight_loss = mse_loss(edge_weights.squeeze(-1), data.supervision_edgewts)
 	margin_and_entropy_loss = ME_loss(edge_probability)
+	KL_loss_nodes = KL_loss(model.node_encoder, data.node_features.size(0))
 
 	loss = bce_edge_classification_loss + mse_edge_weight_loss + margin_and_entropy_loss
 	
