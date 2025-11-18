@@ -138,9 +138,10 @@ class GVAE_Model(nn.Module):
 			nbrs_latent,
 			supervision_edges
 		)
-		return edge_probabilities, edge_weights, edge_explained_by_nodes
+		return edge_probabilities, edge_weights, edge_explained_by_nodes, node_mu, node_std, nbr_mu, nbr_std
 	
-def KL_loss(mu, std, num_nodes):
+def KL_loss(mu, std):
+	num_nodes = mu.size(0)
 	kld = -0.5 * torch.sum(1 + torch.log(std.pow(2) + 1e-8) - mu.pow(2) - std.pow(2))
 	return kld / num_nodes
 	
@@ -172,7 +173,7 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	else:
 		conditional_backward = lambda loss: None  # No-op for validation
 
-	edge_probability, edge_weights, edge_explained_by_nodes = model(
+	edge_probability, edge_weights, edge_explained_by_nodes, node_mu, node_std, nbr_mu, nbr_std = model(
 		data.node_features,
 		supervision_edges=data.supervision_edges,
 		message_edges=data.message_edges,
@@ -185,9 +186,10 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	bce_edge_classification_loss = bce_logit_loss(edge_probability,data.supervision_labels,weight=data.supervision_importance)
 	mse_edge_weight_loss = mse_loss(edge_weights.squeeze(-1), data.supervision_edgewts)
 	margin_and_entropy_loss = ME_loss(edge_probability)
-	KL_loss_nodes = KL_loss(model.node_encoder, data.node_features.size(0))
+	KL_loss_node = KL_loss(node_mu, node_std)
+	KL_loss_nbr = KL_loss(nbr_mu, nbr_std)
 
-	loss = bce_edge_classification_loss + mse_edge_weight_loss + margin_and_entropy_loss
+	loss = bce_edge_classification_loss + mse_edge_weight_loss + margin_and_entropy_loss + KL_loss_node + KL_loss_nbr
 	
 	# loss = calculate_loss(model_output, data, head_weights)
 	conditional_backward(loss)
