@@ -22,17 +22,16 @@ class NodeOnlyWrapper(nn.Module):
 		super().__init__()
 		self.model = model
 	def forward(self, x, supervision_edges):
-		x = self.model.layer_norm_input(x)
-		return self.model.NOD(x, supervision_edges)
+		x = self.model.node_mlp(x, supervision_edges)
+		return self.model.edge_decoder(x, supervision_edges)
 
 class GNNWrapper(nn.Module):
 	def __init__(self, model):
 		super().__init__()
 		self.model = model
 	def forward(self, x, supervision_edges, message_edges, message_edgewts=None):
-		x = self.model.layer_norm_input(x)
 		x = self.model.GNN(x, message_edges, message_edgewts)
-		return self.model.NOD(x, supervision_edges)
+		return self.model.edge_decoder(x, supervision_edges)
 	
 class SimpleDataset(Dataset):
 	def __init__(self, data):
