@@ -146,7 +146,7 @@ def KL_loss(mu, std):
 	return kld / num_nodes
 	
 
-def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False, return_output=False):
+def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, masked_supervision_fraction = 0.0, is_training=False, return_output=False):
 	"""
 	Processes a single batch for training or validation.
 
@@ -173,13 +173,42 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	else:
 		conditional_backward = lambda loss: None  # No-op for validation
 
-	edge_probability, edge_weights, edge_explained_by_nodes, node_mu, node_std, nbr_mu, nbr_std = model(
+	mask_supervision = torch.rand(data.supervision_labels.size(), device=device) < masked_supervision_fraction
+
+	# Forward pass
+
+	# Encode
+	node_mu, node_std = model.node_encoder(data.node_features)
+	nodes_latent = reparameterize(node_mu, node_std)
+
+	nbr_mu, nbr_std = model.neighborhood_encoder(
 		data.node_features,
-		supervision_edges=data.supervision_edges,
-		message_edges=data.message_edges,
-		message_edgewt = data.message_edgewts
+		data.message_edges,
+		data.message_edgewts
 	)
-	edge_probability = edge_probability.squeeze(-1)
+	nbr_latent = reparameterize(nbr_mu, nbr_std)
+
+	# Decode train supervision edges
+
+	train_logits, train_edge_weights, _ = model.decoder(
+	nodes_latent,
+	nbr_latent,
+	data.supervision_train_edges
+	)
+
+	train_logits = train_logits.squeeze(-1)
+	train_edge_weights = train_edge_weights.squeeze(-1)
+
+	# Decode masked supervision edges
+
+	masked_logits, masked_edge_weights, _ = model.decoder(
+		nodes_latent,
+		nbr_latent,
+		data.supervision_masked_edges
+	)
+
+	masked_logits = masked_logits.squeeze(-1)
+	masked_edge_weights = masked_edge_weights.squeeze(-1)
 
 	# Compute losses
 
