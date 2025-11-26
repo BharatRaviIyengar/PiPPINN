@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
-from torch.nn.functional import relu as ReLU, binary_cross_entropy_with_logits as bce_logit_loss, binary_cross_entropy as bce_loss, mse_loss, softplus, normalize as Normalize
+from torch.nn.functional import relu as ReLU, binary_cross_entropy_with_logits as bce_logit_loss, binary_cross_entropy as bce_loss, mse_loss, softplus, cosine_similarity as cosim
 from torch_geometric.data import Data
-from torch_scatter import scatter_max
+from torch_scatter import scatter_max, scatter_mean, scatter_add
+from torch_scatter.composite import scatter_softmax
 from warnings import warn
 from pathlib import Path
 from max_nbr import max_nbr
@@ -91,6 +92,68 @@ class Decoder(nn.Module):
 			if self.dropout > 0 and i < len(self.dims) - 1:
 				layers.append(nn.Dropout(p=self.dropout))
 		return nn.Sequential(*layers)
+	
+	def congruence_score(self, nodes_latent, message_edges, supervision_edges, softmax_intensity=10.0):
+		msg_src, msg_dst = message_edges
+		sup_src, sup_dst = supervision_edges
+		device = nodes_latent.device
+		N = nodes_latent.size(0)
+
+		# Step 1: Build directed supervision pairs
+		sup_query = torch.cat([sup_src, sup_dst])   # X
+		sup_partner = torch.cat([sup_dst, sup_src]) # Y
+		M = sup_query.size(0)
+
+		# Step 2: Gather message neighbors of each Y
+		mask = torch.isin(msg_dst, sup_partner)
+
+		msg_neighbors = msg_src[mask]      # Z => neighbors of Y
+		msg_partner = msg_dst[mask]        # Y
+
+		# Step 3: Map partner nodes Y -> directed supervision index
+		# Each sup_partner appears in sup_query/sup_partner pairs
+		partner_index = torch.full((N,), -1, device=device)
+		partner_index[sup_partner] = torch.arange(M, device=device)
+
+		msg_partner_idx = partner_index[msg_partner]
+
+		# Step 4: Count how many message neighbors per supervision query
+		neighbor_count = scatter_add(
+			torch.ones_like(msg_partner_idx),
+			msg_partner_idx,
+			dim=0,
+			dim_size=M
+		)
+
+		# Step 5: Expand sup_query nodes (global indices) to align with neighbors
+		expanded_queries = sup_query.repeat_interleave(neighbor_count)
+
+		# Step 6: Compute similarity: supervised node vs message neighbors
+		cosine_sim = cosim(
+			nodes_latent[expanded_queries],	# X
+			nodes_latent[msg_neighbors],	# Z
+			dim=-1
+		)
+
+		# Step 7: Softmax per supervision query node
+		weights = scatter_softmax(
+			softmax_intensity * cosine_sim,
+			expanded_queries,
+			dim=0
+		)
+
+		# Step 8: Aggregate to one congruence score per node
+		congruence_node = scatter_mean(
+			weights,
+			expanded_queries,
+			dim=0,
+			dim_size=N
+		)
+
+		# Step 9: Map back to supervision edges
+		congruence_per_edge = congruence_node[sup_src] + congruence_node[sup_dst]
+
+		return congruence_per_edge
 
 	def forward(self, nodes_latent, nbrs_latent, edge_index):
 		u, v  = edge_index
