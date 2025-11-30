@@ -77,11 +77,11 @@ class Decoder(nn.Module):
 				layers.append(nn.Dropout(p=self.dropout))
 		return nn.Sequential(*layers)
 	
-	def congruence_score(self, nodes_latent, message_edges, supervision_edges, softmax_intensity=10.0):
+	def congruence_score(self, node_embeddings, message_edges, supervision_edges, softmax_intensity=10.0):
 		msg_src, msg_dst = message_edges
 		sup_src, sup_dst = supervision_edges
-		device = nodes_latent.device
-		N = nodes_latent.size(0)
+		device = node_embeddings.device
+		N = node_embeddings.size(0)
 
 		# Step 1: Build directed supervision pairs
 		sup_query = torch.cat([sup_src, sup_dst])   # X
@@ -114,8 +114,8 @@ class Decoder(nn.Module):
 
 		# Step 6: Compute similarity: supervised node vs message neighbors
 		cosine_sim = cosim(
-			nodes_latent[expanded_queries],	# X
-			nodes_latent[msg_neighbors],	# Z
+			node_embeddings[expanded_queries],	# X
+			node_embeddings[msg_neighbors],	# Z
 			dim=-1
 		)
 
@@ -139,15 +139,15 @@ class Decoder(nn.Module):
 
 		return congruence_per_edge
 
-	def forward(self, nodes_latent, nbrs_latent, edge_index):
+	def forward(self, node_embeddings, nbrs_embeddings, edge_index):
 		u, v  = edge_index
-		additive = nodes_latent[u] + nodes_latent[v]
-		multiplicative = nodes_latent[u] * nodes_latent[v]
+		additive = node_embeddings[u] + node_embeddings[v]
+		multiplicative = node_embeddings[u] * node_embeddings[v]
 		# combined = additive * self.coef_matrix @ multiplicative
 		# # alternative:
 		combined = torch.cat([additive, multiplicative], dim=-1)
 		edge_features = self.edge_embedder(combined)
-		nbrs_similarity = torch.sum(nbrs_latent[u] * nbrs_latent[v], dim=-1, keepdim=True)
+		nbrs_similarity = torch.sum(nbrs_embeddings[u] * nbrs_embeddings[v], dim=-1, keepdim=True)
 		node_contribution = self.edge_prob_head(edge_features) * self.w_node
 		nbr_contribution =  nbrs_similarity * self.w_nbr
 		edge_probabilities =  node_contribution + nbr_contribution
