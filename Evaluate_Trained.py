@@ -22,7 +22,7 @@ class NodeOnlyWrapper(nn.Module):
 		super().__init__()
 		self.model = model
 	def forward(self, x, supervision_edges):
-		x = self.model.node_mlp(x, supervision_edges)
+		x = self.model.node_mlp(x)
 		return self.model.edge_decoder(x, supervision_edges)
 
 class GNNWrapper(nn.Module):
@@ -269,11 +269,11 @@ if __name__ == "__main__":
 		help="Output directory",
 		default="."
 	)
-	parser.add_argument("--hyperparams", "-p",
-		type=str,
-		help="Path to the hyperparameter file (.json)",
-		default=None
-	)
+	# parser.add_argument("--hyperparams", "-p",
+	# 	type=str,
+	# 	help="Path to the hyperparameter file (.json)",
+	# 	default=None
+	# )
 
 	args = parser.parse_args()
 
@@ -284,8 +284,8 @@ if __name__ == "__main__":
 	else:
 		work_device = torch.device('cpu')
 
-	with open(args.hyperparams, "r") as f:
-		params = json.load(f)
+	# with open(args.hyperparams, "r") as f:
+	# 	params = json.load(f)
 	
 
 	positive_data = torch.load(args.input,weights_only = False)
@@ -318,7 +318,7 @@ if __name__ == "__main__":
 		positive_edgewts = positive_data.edge_attr.to(work_device),
 		batch_size = 20000,
 		threads= args.threads,
-		nbr_wt_intensity = params["nbr_weight_intensity"],
+		nbr_wt_intensity = 0.7778960311411063,
 		extra_samples=50,
 		device=work_device
 	)
@@ -396,21 +396,21 @@ if __name__ == "__main__":
 	)
 
 	
-	# Plot calibration curves
-	import matplotlib.pyplot as plt
-	plt.figure(figsize=(8, 6))
-	prob_true_NOD, prob_pred_NOD = results_NOD["CalibrationCurve"]
-	prob_true_GNN, prob_pred_GNN = results_GNN["CalibrationCurve"]
-	plt.plot(prob_pred_NOD, prob_true_NOD, marker='x', label='NOD Model')
-	plt.plot(prob_pred_GNN, prob_true_GNN, marker='o', label='GNN Model')
-	plt.plot([0, 1], [0, 1], linestyle='--', color='gray', label='Perfect Calibration')
-	plt.xlabel('Mean Predicted Probability')
-	plt.ylabel('Fraction of Positives')
-	plt.title('Calibration Curves')
-	plt.legend()
-	plt.grid()
-	plt.savefig(f"{args.outdir}calibration_curves.svg")
-	plt.close()
+	# # Plot calibration curves
+	# import matplotlib.pyplot as plt
+	# plt.figure(figsize=(8, 6))
+	# prob_true_NOD, prob_pred_NOD = results_NOD["CalibrationCurve"]
+	# prob_true_GNN, prob_pred_GNN = results_GNN["CalibrationCurve"]
+	# plt.plot(prob_pred_NOD, prob_true_NOD, marker='x', label='NOD Model')
+	# plt.plot(prob_pred_GNN, prob_true_GNN, marker='o', label='GNN Model')
+	# plt.plot([0, 1], [0, 1], linestyle='--', color='gray', label='Perfect Calibration')
+	# plt.xlabel('Mean Predicted Probability')
+	# plt.ylabel('Fraction of Positives')
+	# plt.title('Calibration Curves')
+	# plt.legend()
+	# plt.grid()
+	# plt.savefig(f"{args.outdir}calibration_curves.svg")
+	# plt.close()
 
 	# Save results to CSV
 	import csv

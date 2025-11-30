@@ -1,31 +1,48 @@
 import torch
 import torch.nn as nn
-from torch.nn.functional import relu as ReLU, binary_cross_entropy_with_logits as bce_logit_loss, binary_cross_entropy as bce_loss, mse_loss, softplus, cosine_similarity as cosim
+from torch.nn.functional import relu as ReLU, binary_cross_entropy_with_logits as bce_logit_loss, binary_cross_entropy as bce_loss, mse_loss, softplus, normalize as Normalize
 from torch_geometric.data import Data
 from torch_geometric.utils import degree
 from torch_geometric.utils.map import map_index
-from torch_scatter import scatter_add, scatter_mean
-from torch_scatter.composite import scatter_softmax
+from torch_scatter import scatter_max
 from warnings import warn
 from pathlib import Path
 from max_nbr import max_nbr
 
 
-class NeighborhoodEncoder(nn.Module):
-	def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.0):
+class EdgeDecoder(nn.Module):
+	"""
+	Implements a simple decoder that predicts edges based on node features.
+
+	Args:
+		in_channels (int): Number of input features per node.
+		hidden_channels (list[int], optional): List of hidden layer sizes.
+		dropout (float, optional): Dropout rate.
+	Methods:
+		forward(x, edge_index):
+			Performs the forward pass of the decoder.
+			Args:
+				x (torch.Tensor): Node features.
+				edge_index (torch.Tensor): Edge indices.
+			Returns:
+				torch.Tensor: Output edge features.
+	"""
+
+	def __init__(self, in_channels, hidden_channels, dropout=0.0):
+		""" Initializes the NodeOnlyDecoder.
+		Args:
+			in_channels (int): Number of input features per node.
+			hidden_channels (list): List of hidden layer sizes.
+		"""
 		super().__init__()
-		self.pool = nn.Linear(in_channels, in_channels)
-		self.LN_pool = nn.LayerNorm(in_channels)
-		self.in_channels = in_channels
+		self.in_channels = in_channels*2
 		self.hidden_channels = hidden_channels
 		self.dropout = dropout
 		self.dims = [self.in_channels] + self.hidden_channels
+		self.edge_embedder = self.build_mlp()
+		self.edge_prob_head = nn.Linear(self.dims[-1], 1)
+		self.edge_wt_head = nn.Linear(self.dims[-1], 1)
 
-		self.edge_weight_message_coefficient = nn.Parameter(torch.tensor(0.5))
-		self.final_transform = self.build_mlp()
-
-		self.out = nn.Linear(self.dims[-1], out_channels)
-	
 	def build_mlp(self):
 		layers = []
 		layers.append(nn.LayerNorm(self.dims[0]))
@@ -37,123 +54,240 @@ class NeighborhoodEncoder(nn.Module):
 				layers.append(nn.Dropout(p=self.dropout))		
 		return nn.Sequential(*layers)
 
+	def forward(self, x, edge_index):
+		add = x[edge_index[0]] + x[edge_index[1]]
+		prod = x[edge_index[0]] * x[edge_index[1]]
+		edge_features = self.edge_embedder(torch.cat([add, prod], dim=-1))
+		edge_probabilities = self.edge_prob_head(edge_features)
+		edge_weights = ReLU(self.edge_wt_head(edge_features))
+		return edge_probabilities, edge_weights
+
+
+class Pool_SAGEConv(nn.Module):
+	"""
+	Implements a pooling-based GraphSAGE convolution layer for aggregating neighbor information.
+
+	Args:
+		in_channels (int): Number of input features per node.
+		out_channels (int): Number of output features per node.
+
+	Methods:
+		forward(x, edge_index, edge_weight):
+			Performs the forward pass of the convolution layer.
+			Args:
+				x (torch.Tensor): Node features.
+				edge_index (torch.Tensor): Edge indices.
+				edge_weight (torch.Tensor): Edge weights.
+			Returns:
+				torch.Tensor: Output node features after aggregation.
+	"""
+
+	def __init__(self, in_channels, out_channels):
+		super().__init__()
+		
+		# Linear fully connected pooling
+		self.pool = nn.Linear(in_channels, in_channels)
+		self.LN_pool = nn.LayerNorm(in_channels)
+
+		# Final linear layer after aggregation
+		self.final_lin = nn.Linear(in_channels * 2, out_channels)
+		self.LN_final = nn.LayerNorm(out_channels)
+
+		# Learnable parameter that controls how much the edge weight influences message aggregation
+		self.edge_weight_message_coefficient = nn.Parameter(torch.tensor(0.5))
+
+		
 	def forward(self, x, edge_index, edge_weight):
 		src, dst = edge_index
-		EWMC = softplus(self.edge_weight_message_coefficient)
-		neighborhood_features = x[src] * (1 + EWMC * edge_weight.unsqueeze(-1))
-		pooled = self.pool(neighborhood_features)
+		coeff = softplus(self.edge_weight_message_coefficient)
+		edge_features = x[src] * (1 + coeff * edge_weight.unsqueeze(-1))
+
+		# Pool and activate neighbor messages
+		pooled = self.pool(edge_features)
 		pooled = self.LN_pool(pooled)
 		pooled = ReLU(pooled)
 		
-		# Aggregate neighbor messages via softmax attention
-		attn = scatter_softmax(pooled, dst, dim=0)
-		aggregate = scatter_mean(pooled * attn, dst, dim=0, dim_size=x.size(0))
-		neighborhood = self.final_transform(aggregate)
-		return self.out(neighborhood)
+		# Aggregate neighbor messages via max
+		aggregate, _ = scatter_max(pooled, dst, dim=0, dim_size=x.size(0))
+		
+		# Concatenate self-representation and aggregated neighbors
+		h = torch.cat([x, aggregate], dim=-1)
+		h = self.final_lin(h)
+		h = self.LN_final(h)
+		# Final transformation
+		return ReLU(h)
 	
-class Decoder(nn.Module):
+class GraphSAGE(nn.Module):
+	"""
+	Defines the GraphSAGE model with multiple forward logics for different use cases.
+	"""
+
 	def __init__(self, in_channels, hidden_channels, dropout=0.0):
+		"""
+		Args:
+			in_channels (int): Number of input features per node.
+			hidden_channels (int): Number of hidden features per node.
+			dropout (float): Dropout rate.
+		"""
 		super().__init__()
+		
+		self.dropout = nn.Dropout(p=dropout)
 		self.in_channels = in_channels
 		self.hidden_channels = hidden_channels
-		self.dropout = dropout
-		self.dims = [2*self.in_channels] + self.hidden_channels
-		self.edge_embedder = self.build_mlp()
-		self.edge_wt_head = nn.Linear(self.dims[-1]+1, 1)
-		self.edge_prob_head = nn.Linear(self.dims[-1],1)
+		self.conv1 = Pool_SAGEConv(in_channels, hidden_channels)
+		self.conv2 = Pool_SAGEConv(hidden_channels, hidden_channels)
 
-		# self.coef_matrix = nn.Parameter(torch.randn(in_channels, coef_matrix_cols))
-		self.w_node = nn.Parameter(torch.tensor(0.5))
-		self.w_nbr = nn.Parameter(torch.tensor(0.5))
 
-	def build_mlp(self):
-		layers = []
-		layers.append(nn.LayerNorm(self.dims[0]))
-		for i in range(len(self.dims) - 1):
-			layers.append(nn.Linear(self.dims[i], self.dims[i + 1]))
-			layers.append(nn.LayerNorm(self.dims[i + 1]))
-			layers.append(nn.ReLU())
-			if self.dropout > 0 and i < len(self.dims) - 1:
-				layers.append(nn.Dropout(p=self.dropout))
-		return nn.Sequential(*layers)
+	def forward(self, x, message_edges, message_edgewt=None):
+		"""
+		Forward logic with message passing.
+		"""
+		if message_edgewt is None:
+			message_edgewt = torch.ones(message_edges.size(1), device=message_edges.device)
+
+		# Perform message passing
+		x = self.conv1(x, message_edges, message_edgewt)
+		x = self.dropout(x)
+
+		x = self.conv2(x, message_edges, message_edgewt)
+		x = self.dropout(x)
+		return x
 	
-	def congruence_score(self, nodes_latent, message_edges, supervision_edges, softmax_intensity=10.0):
-		msg_src, msg_dst = message_edges
-		sup_src, sup_dst = supervision_edges
-		device = nodes_latent.device
-		N = nodes_latent.size(0)
+class DualLayerModel(nn.Module):
+	"""
+	Model with two layers: a Node-Only Decoder and a Graph Neural Network.
 
-		# Step 1: Build directed supervision pairs
-		sup_query = torch.cat([sup_src, sup_dst])   # X
-		sup_partner = torch.cat([sup_dst, sup_src]) # Y
-		M = sup_query.size(0)
-
-		# Step 2: Gather message neighbors of each Y
-		mask = torch.isin(msg_dst, sup_partner)
-
-		msg_neighbors = msg_src[mask]      # Z => neighbors of Y
-		msg_partner = msg_dst[mask]        # Y
-
-		# Step 3: Map partner nodes Y -> directed supervision index
-		# Each sup_partner appears in sup_query/sup_partner pairs
-		partner_index = torch.full((N,), -1, device=device)
-		partner_index[sup_partner] = torch.arange(M, device=device)
-
-		msg_partner_idx = partner_index[msg_partner]
-
-		# Step 4: Count how many message neighbors per supervision query
-		neighbor_count = scatter_add(
-			torch.ones_like(msg_partner_idx),
-			msg_partner_idx,
-			dim=0,
-			dim_size=M
+	Args:
+		in_channels (int): Number of input features per node.
+		hidden_channels (int): Number of hidden features per node.
+		dropout (float, optional): Dropout rate.
+	"""
+	def __init__(self, in_channels, hidden_channels = [2048, 2048, 1024, 1024], dropout=0.0, network_skip = 0.2):
+		super().__init__()
+		self.layer_norm_input = nn.LayerNorm(in_channels)
+		self.node_mlp = nn.Sequential(
+			nn.Linear(in_channels, in_channels),
+			nn.LayerNorm(in_channels),
+			nn.ReLU(),
+			nn.Dropout(p=dropout),
+			nn.Linear(in_channels, in_channels),
+			nn.LayerNorm(in_channels),
+			nn.ReLU()
 		)
+		self.GNN = GraphSAGE(in_channels=in_channels, hidden_channels=in_channels, dropout=dropout)
+		self.network_skip = network_skip
+		self.edge_decoder = EdgeDecoder(in_channels=in_channels, hidden_channels=hidden_channels, dropout=dropout)
 
-		# Step 5: Expand sup_query nodes (global indices) to align with neighbors
-		expanded_queries = sup_query.repeat_interleave(neighbor_count)
+	def forward(self, x, supervision_edges, message_edges, message_edgewt=None):
+		x = self.GNN(x, message_edges, message_edgewt) if torch.rand(1) >= self.network_skip else self.node_mlp(x)
+		return self.edge_decoder(x, supervision_edges)
 
-		# Step 6: Compute similarity: supervised node vs message neighbors
-		cosine_sim = cosim(
-			nodes_latent[expanded_queries],	# X
-			nodes_latent[msg_neighbors],	# Z
-			dim=-1
-		)
+	
+class DecayScheduler:
+	def __init__(self, model, attr_name, initial_value, factor=0.8, cooldown=2, min_value=0.1):
+		"""
+		Simple scheduler that decays a parameter by a factor every epoch after cooldown.
+		
+		Args:
+			model: nn.Module with parameter to modify.
+			attr_name: str, exact attribute name (e.g. 'network_skip').
+			initial_value: float, starting value.
+			factor: float, decay multiplier per epoch after cooldown.
+			cooldown: int, epochs to wait before starting decay.
+			min_value: float, minimum dropout value allowed.
+		"""
+		self.model = model
+		self.attr_name = attr_name
+		self.factor = factor
+		self.cooldown = cooldown
+		self.cooldown_counter = 0
+		self.min_value = min_value
+		self.epoch = 0
+		self.current_value = initial_value
+		setattr(self.model, self.attr_name, self.current_value)
 
-		# Step 7: Softmax per supervision query node
-		weights = scatter_softmax(
-			softmax_intensity * cosine_sim,
-			expanded_queries,
-			dim=0
-		)
+	def step(self):
+		self.epoch += 1
+		self.cooldown_counter += 1
+		if self.cooldown_counter > self.cooldown:
+			new_value = max(self.min_value, self.current_value * self.factor)
+			self.cooldown_counter = 0
+			if new_value < self.current_value:
+				self.current_value = new_value
+				setattr(self.model, self.attr_name, self.current_value)
+				print(f"Parameter {self.attr_name} decayed to {self.current_value:.4f} at epoch {self.epoch}")
 
-		# Step 8: Aggregate to one congruence score per node
-		congruence_node = scatter_mean(
-			weights,
-			expanded_queries,
-			dim=0,
-			dim_size=N
-		)
+def BCE_contrastive_loss(edge_embeddings, num_positive_edges, batch_size=4000):
+	"""
+	Memory-efficient InfoNCE contrastive loss for edge embeddings.
 
-		# Step 9: Map back to supervision edges
-		congruence_per_edge = congruence_node[sup_src] + congruence_node[sup_dst]
+	Args:
+		edge_embeddings (torch.Tensor): Shape [num_edges, embedding_dim].
+		num_positive_edges: Last index of positive edges in the edge tensor. This function assumes that edges are ordered as [positive, negative]
+		batch_size (int): Number of edges to process at a time.
 
-		return congruence_per_edge
+	Returns:
+		torch.Tensor: Scalar loss.
+	"""
+	num_edges = edge_embeddings.size(0)
+	device = edge_embeddings.device
+	edge_embeddings = Normalize(edge_embeddings, p=2, dim=-1)
 
-	def forward(self, nodes_latent, nbrs_latent, edge_index):
-		u, v  = edge_index
-		additive = nodes_latent[u] + nodes_latent[v]
-		multiplicative = nodes_latent[u] * nodes_latent[v]
-		# combined = additive * self.coef_matrix @ multiplicative
-		# # alternative:
-		combined = torch.cat([additive, multiplicative], dim=-1)
-		edge_features = self.edge_embedder(combined)
-		nbrs_similarity = torch.sum(nbrs_latent[u] * nbrs_latent[v], dim=-1, keepdim=True)
-		node_contribution = self.edge_prob_head(edge_features) * self.w_node
-		nbr_contribution =  nbrs_similarity * self.w_nbr
-		edge_probabilities =  node_contribution + nbr_contribution
-		fraction_node_contribution = node_contribution / (node_contribution + nbr_contribution + 1e-8)
-		edge_weights = ReLU(self.edge_wt_head(torch.cat([edge_features, nbrs_similarity], dim=-1)))
-		return edge_probabilities, edge_weights, fraction_node_contribution
+	coordinates = torch.zeros((3,2,2), dtype=torch.long)
+	# Each coordinate slice has:
+	# [row_start, row_end
+	#  col_start, col_end]
+
+	# positive edges vs positive edges
+	coordinates[0,:,1] = num_positive_edges 
+
+	# negative edges vs negative edges
+	coordinates[1,:,0] = num_positive_edges 
+	coordinates[1,:,1] = num_edges
+
+	# positive edges vs negative edges
+	coordinates[2,0,1] = num_positive_edges
+	coordinates[2,1,0] = num_positive_edges
+	coordinates[2,1,1] = num_edges
+
+	loss = 0.0
+
+	for slice in range(3):
+		row_begin = coordinates[slice,0,0]
+		row_end = coordinates[slice,0,1]
+		col_begin = coordinates[slice,1,0]
+		col_end   = coordinates[slice,1,1]
+
+		edge_emb_2 = edge_embeddings[col_begin:col_end]
+		num_columns = edge_emb_2.size(0)
+		mask = torch.ones((batch_size, num_columns), dtype = torch.bool, device=device)
+		label_val = 0.0
+		if slice < 2:
+			mask = torch.triu(mask)
+			mask.fill_diagonal_(False)
+			label_val = 1.0
+		labels = torch.full((mask.sum().item(),), label_val, device=device)
+		for start in range(row_begin, row_end, batch_size):
+			end = min(start + batch_size, row_end)
+			actual_batch_size = end - start
+			mask_batch = mask[:actual_batch_size, :]
+			edge_emb_1 = edge_embeddings[start:end]
+			sim = torch.matmul(edge_emb_1, edge_emb_2.T)
+			sim = ((sim + 1)/2).clamp(min=0.0, max=1.0)	# Scale cosine similarity to [0,1]
+			num_pairs = mask_batch.sum()
+			loss += bce_loss(sim[mask_batch],labels[:num_pairs])/num_pairs
+
+	return loss
+
+class BCE_ContrastiveLoss():
+	"""
+	Wrapper for the BCE_contrastive_loss function to be used as a loss module.
+	"""
+	def __init__(self, num_positive_edges = 12000, batch_size=4000):
+		self.batch_size = batch_size
+		self.num_positive_edges = num_positive_edges
+	def __call__(self, edge_embeddings):
+		return BCE_contrastive_loss(edge_embeddings, self.num_positive_edges, self.batch_size)
 
 def hinge_loss(margin: float, positive_logits, negative_logits):
 	loss_margin = torch.relu(margin - positive_logits).mean() + torch.relu(margin + negative_logits).mean()
