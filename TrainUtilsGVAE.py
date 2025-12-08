@@ -93,7 +93,7 @@ class Decoder(nn.Module):
 				layers.append(nn.Dropout(p=self.dropout))
 		return nn.Sequential(*layers)
 	
-	def congruence_score(self, nodes_latent, message_edges, supervision_edges, softmax_intensity=10.0):
+	def congruence_score(self, nodes_latent, supervision_edges, message_edges, message_edgewt = None, softmax_intensity=10.0):
 		msg_src, msg_dst = message_edges
 		sup_src, sup_dst = supervision_edges
 		device = nodes_latent.device
@@ -152,6 +152,11 @@ class Decoder(nn.Module):
 
 		# Step 9: Map back to supervision edges
 		congruence_per_edge = congruence_node[sup_src] + congruence_node[sup_dst]
+
+		# if message_edgewt is not None:
+		# 	weighted_edges = weights * message_edgewt[mask]
+		# 	edge_weight_node = scatter_mean(weighted_edges, expanded_queries, dim=0, dim_size=N)
+		# 	edge_weight_per_edge     = edge_weight_node[sup_src] + edge_weight_node[sup_dst]
 
 		return congruence_per_edge
 
