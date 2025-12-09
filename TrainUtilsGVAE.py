@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.nn.functional import relu as ReLU, binary_cross_entropy_with_logits as bce_logit_loss, binary_cross_entropy as bce_loss, mse_loss, softplus, cosine_similarity as cosim
+import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_scatter import scatter_max, scatter_mean, scatter_add
 from torch_scatter.composite import scatter_softmax
@@ -8,6 +8,68 @@ from warnings import warn
 from pathlib import Path
 from max_nbr import max_nbr
 from TrainUtils import EdgeSampler
+
+bce_logits_loss = F.binary_cross_entropy_with_logits
+cosim = F.cosine_similarity
+
+def build_MLP(dims, activation=nn.ReLU, dropout=0.0, use_layernorm=False, normalize_input=False):
+	layers = []
+	if normalize_input:
+		layers.append(nn.LayerNorm(dims[0]))
+	for i in range(len(dims) - 1):
+		layers.append(nn.Linear(dims[i], dims[i + 1]))
+		if use_layernorm:
+			layers.append(nn.LayerNorm(dims[i + 1]))
+		if i < len(dims) - 1:
+			layers.append(activation())
+			if dropout > 0:
+				layers.append(nn.Dropout(dropout))
+	return nn.Sequential(*layers)
+
+# PositiveLinear ensures weight >= 0
+class PositiveLinear(nn.Module):
+	def __init__(self, in_features, out_features, bias=True, epsilon=1e-6):
+		super().__init__()
+		self.epsilon = epsilon
+		self.raw_weight = nn.Parameter(torch.randn(out_features, in_features) * 0.01)
+		if bias:
+			self.bias = nn.Parameter(torch.zeros(out_features))
+		else:
+			self.register_parameter('bias', None)
+
+	def forward(self, x):
+		# softplus ensures strictly positive weights
+		weight = F.softplus(self.raw_weight) + self.epsilon
+		return F.linear(x, weight, self.bias)
+
+# MonotonicMLP using PositiveLinear layers
+class MonotonicMLP(nn.Module):
+	def __init__(self, dims = [1,32,32,1], activation=nn.Softplus, epsilon=1e-6):
+		"""
+		dims: list of layer sizes, e.g., [1, 32, 32, 1] for 1D input/output
+		activation: monotone increasing activation
+		dropout: dropout rate
+		"""
+		super().__init__()
+		assert dims[0] == 1 and dims[-1] == 1, "Input and output must be 1D"
+		self.epsilon = epsilon
+		self.activation = activation()
+		layers = []
+		for i in range(len(dims) - 2):
+			layers.append(PositiveLinear(dims[i], dims[i+1], epsilon=epsilon))
+		# final layer (still PositiveLinear to ensure monotonicity)
+		layers.append(PositiveLinear(dims[-2], dims[-1], epsilon=epsilon))
+		self.layers = nn.ModuleList(layers)
+
+	def forward(self, x):
+		h = x
+		for layer in self.layers[:-1]:
+			h = layer(h)
+			h = self.activation(h)
+		# final layer without activation
+		h = self.layers[-1](h)
+		return h
+
 
 class NeighborhoodEncoder(nn.Module):
 	def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.0):
@@ -19,30 +81,19 @@ class NeighborhoodEncoder(nn.Module):
 		self.dropout = dropout
 		self.dims = [self.in_channels] + self.hidden_channels
 
-		self.edge_weight_message_coefficient = nn.Parameter(torch.tensor(0.5))
-		self.final_transform = self.build_mlp()
+		self.edge_strength_message_coefficient = nn.Parameter(torch.tensor(0.5))
+		self.final_transform = build_MLP(dims=self.dims, dropout=self.dropout, use_layernorm=True, normalize_input=False)
 
 		self.gaussian_mu_head = nn.Linear(self.dims[-1], out_channels)
 		self.gaussian_logvar_head = nn.Linear(self.dims[-1], out_channels)
-	
-	def build_mlp(self):
-		layers = []
-		layers.append(nn.LayerNorm(self.dims[0]))
-		for i in range(len(self.dims) - 1):
-			layers.append(nn.Linear(self.dims[i], self.dims[i + 1]))
-			layers.append(nn.LayerNorm(self.dims[i + 1]))
-			layers.append(nn.ReLU())
-			if self.dropout > 0 and i < len(self.dims) - 1:
-				layers.append(nn.Dropout(p=self.dropout))		
-		return nn.Sequential(*layers)
 
-	def forward(self, x, edge_index, edge_weight):
+	def forward(self, x, edge_index, edge_strength):
 		src, dst = edge_index
-		EWMC = softplus(self.edge_weight_message_coefficient)
-		neighborhood_features = x[src] * (1 + EWMC * edge_weight.unsqueeze(-1))
+		EWMC = F.softplus(self.edge_strength_message_coefficient)
+		neighborhood_features = x[src] * (1 + EWMC * edge_strength.unsqueeze(-1))
 		pooled = self.pool(neighborhood_features)
 		pooled = self.LN_pool(pooled)
-		pooled = ReLU(pooled)
+		pooled = F.relu(pooled)
 		
 		# Aggregate neighbor messages via max
 		aggregate, _ = scatter_max(pooled, dst, dim=0, dim_size=x.size(0))
@@ -74,26 +125,21 @@ class Decoder(nn.Module):
 		self.hidden_channels = hidden_channels
 		self.dropout = dropout
 		self.dims = [2*self.in_channels] + self.hidden_channels
-		self.edge_embedder = self.build_mlp()
+		self.edge_embedder = build_MLP(dims=self.dims, dropout=self.dropout, use_layernorm=True, normalize_input=False)
 		self.edge_wt_head = nn.Linear(self.dims[-1]+1, 1)
 		self.edge_prob_head = nn.Linear(self.dims[-1],1)
 
 		# self.coef_matrix = nn.Parameter(torch.randn(in_channels, coef_matrix_cols))
-		self.w_node = nn.Parameter(torch.tensor(0.5))
-		self.w_nbr = nn.Parameter(torch.tensor(0.5))
 
-	def build_mlp(self):
-		layers = []
-		layers.append(nn.LayerNorm(self.dims[0]))
-		for i in range(len(self.dims) - 1):
-			layers.append(nn.Linear(self.dims[i], self.dims[i + 1]))
-			layers.append(nn.LayerNorm(self.dims[i + 1]))
-			layers.append(nn.ReLU())
-			if self.dropout > 0 and i < len(self.dims) - 1:
-				layers.append(nn.Dropout(p=self.dropout))
-		return nn.Sequential(*layers)
+		self.w_p_node = nn.Parameter(torch.tensor(0.5))	# weight for node contribution to edge probability
+		self.w_p_nbr = nn.Parameter(torch.tensor(0.5))	# weight for neighbor contribution to edge probability
+		self.w_p_cong = nn.Parameter(torch.tensor(0.5))	# weight for edge congruence contribution to edge probability
+		self.w_s_node = nn.Parameter(torch.tensor(0.5))	# weight for node contribution to edge weight (strength)
+		self.w_s_cong = nn.Parameter(torch.tensor(0.5))	# weight for node contribution to edge weight (strength)
+
+		self.monotonic_map = MonotonicMLP()
 	
-	def congruence_score(self, nodes_latent, supervision_edges, message_edges, message_edgewt = None, softmax_intensity=10.0):
+	def congruence_score(self, nodes_latent, supervision_edges, message_edges, message_edgestr = None, softmax_intensity=10.0):
 		msg_src, msg_dst = message_edges
 		sup_src, sup_dst = supervision_edges
 		device = nodes_latent.device
@@ -151,17 +197,23 @@ class Decoder(nn.Module):
 		)
 
 		# Step 9: Map back to supervision edges
-		congruence_per_edge = congruence_node[sup_src] + congruence_node[sup_dst]
+		ExistenceByCongruence = congruence_node[sup_src] + congruence_node[sup_dst]
 
-		# if message_edgewt is not None:
-		# 	weighted_edges = weights * message_edgewt[mask]
-		# 	edge_weight_node = scatter_mean(weighted_edges, expanded_queries, dim=0, dim_size=N)
-		# 	edge_weight_per_edge     = edge_weight_node[sup_src] + edge_weight_node[sup_dst]
+		if message_edgestr is not None:
+			weighted_edges = self.monotonic_map(cosine_sim) * message_edgestr[mask]
+			edge_strength_node = scatter_mean(
+				weighted_edges,
+				expanded_queries,
+				dim=0,
+				dim_size=N
+			)
+			WeightsByCongruence = edge_strength_node[sup_src] + edge_strength_node[sup_dst]
+			return ExistenceByCongruence, WeightsByCongruence
+		else:
+			return ExistenceByCongruence
 
-		return congruence_per_edge
-
-	def forward(self, nodes_latent, nbrs_latent, edge_index):
-		u, v  = edge_index
+	def forward(self, nodes_latent, nbrs_latent, supervision_edges, message_edges=None, message_edgestr=None):
+		u, v  = supervision_edges
 		additive = nodes_latent[u] + nodes_latent[v]
 		multiplicative = nodes_latent[u] * nodes_latent[v]
 		# combined = additive * self.coef_matrix @ multiplicative
@@ -169,12 +221,13 @@ class Decoder(nn.Module):
 		combined = torch.cat([additive, multiplicative], dim=-1)
 		edge_features = self.edge_embedder(combined)
 		nbrs_similarity = torch.sum(nbrs_latent[u] * nbrs_latent[v], dim=-1, keepdim=True)
+		ExistenceByCongruence, WeightsByCongruence = self.congruence_score(nodes_latent, supervision_edges, message_edges, message_edgestr)
 		node_contribution = self.edge_prob_head(edge_features) * self.w_node
 		nbr_contribution =  nbrs_similarity * self.w_nbr
 		edge_probabilities =  node_contribution + nbr_contribution
 		fraction_node_contribution = node_contribution / (node_contribution + nbr_contribution + 1e-8)
-		edge_weights = ReLU(self.edge_wt_head(torch.cat([edge_features, nbrs_similarity], dim=-1)))
-		return edge_probabilities, edge_weights, fraction_node_contribution
+		edge_strengths = F.relu(self.edge_wt_head(torch.cat([edge_features, nbrs_similarity], dim=-1)))
+		return edge_probabilities, edge_strengths, fraction_node_contribution
 	
 def reparameterize(mu, std):
 	eps = torch.randn_like(std)
@@ -191,22 +244,22 @@ class GVAE_Model(nn.Module):
 		self.neighborhood_encoder = NeighborhoodEncoder(nbr_in_channels, nbr_hidden_channels, nbr_latent_channels, dropout)
 		self.decoder = Decoder(node_latent_channels, decoder_hidden_channels, dropout)
 
-	def forward(self, x, supervision_edges, message_edges, message_edgewt):
+	def forward(self, x, supervision_edges, message_edges, message_edgestr):
 		# Encode nodes
 		node_mu, node_std = self.node_encoder(x)
 		nodes_latent = reparameterize(node_mu, node_std)
 
 		# Encode neighborhoods
-		nbr_mu, nbr_std = self.neighborhood_encoder(x, message_edges, message_edgewt)
+		nbr_mu, nbr_std = self.neighborhood_encoder(x, message_edges, message_edgestr)
 		nbrs_latent = reparameterize(nbr_mu, nbr_std)
 
 		# Decode edges
-		edge_probabilities, edge_weights, edge_explained_by_nodes = self.decoder(
+		edge_probabilities, edge_strengths, edge_explained_by_nodes = self.decoder(
 			nodes_latent,
 			nbrs_latent,
 			supervision_edges
 		)
-		return edge_probabilities, edge_weights, edge_explained_by_nodes, node_mu, node_std, nbr_mu, nbr_std
+		return edge_probabilities, edge_strengths, edge_explained_by_nodes, node_mu, node_std, nbr_mu, nbr_std
 	
 def KL_loss(mu, std):
 	num_nodes = mu.size(0)
@@ -252,41 +305,41 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	nbr_mu, nbr_std = model.neighborhood_encoder(
 		data.node_features,
 		data.message_edges,
-		data.message_edgewts
+		data.message_edgestrs
 	)
 	nbr_latent = reparameterize(nbr_mu, nbr_std)
 
 	# Decode train supervision edges
 
-	train_logits, train_edge_weights, _ = model.decoder(
+	train_logits, train_edge_strengths, _ = model.decoder(
 	nodes_latent,
 	nbr_latent,
 	data.supervision_train_edges
 	)
 
 	train_logits = train_logits.squeeze(-1)
-	train_edge_weights = train_edge_weights.squeeze(-1)
+	train_edge_strengths = train_edge_strengths.squeeze(-1)
 
 	# Decode masked supervision edges
 
-	masked_logits, masked_edge_weights, _ = model.decoder(
+	masked_logits, masked_edge_strengths, _ = model.decoder(
 		nodes_latent,
 		nbr_latent,
 		data.supervision_masked_edges
 	)
 
 	masked_logits = masked_logits.squeeze(-1)
-	masked_edge_weights = masked_edge_weights.squeeze(-1)
+	masked_edge_strengths = masked_edge_strengths.squeeze(-1)
 
 	# Compute losses
 
-	bce_edge_classification_loss = bce_logit_loss(edge_probability,data.supervision_labels,weight=data.supervision_importance)
-	mse_edge_weight_loss = mse_loss(edge_weights.squeeze(-1), data.supervision_edgewts)
+	bce_edge_classification_loss = bce_logits_loss(edge_probability,data.supervision_labels,weight=data.supervision_importance)
+	mse_edge_strength_loss = F.mse_loss(edge_strengths.squeeze(-1), data.supervision_edgestrs)
 	margin_and_entropy_loss = ME_loss(edge_probability)
 	KL_loss_node = KL_loss(node_mu, node_std)
 	KL_loss_nbr = KL_loss(nbr_mu, nbr_std)
 
-	loss = bce_edge_classification_loss + mse_edge_weight_loss + margin_and_entropy_loss + KL_loss_node + KL_loss_nbr
+	loss = bce_edge_classification_loss + mse_edge_strength_loss + margin_and_entropy_loss + KL_loss_node + KL_loss_nbr
 	
 	# loss = calculate_loss(model_output, data, head_weights)
 	conditional_backward(loss)
