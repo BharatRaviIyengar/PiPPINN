@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
-from torch_scatter import scatter_max, scatter_mean, scatter_add
-from torch_scatter.composite import scatter_softmax
+from torch_scatter import scatter_max, scatter_mean, scatter_add, scatter_softmax
 from warnings import warn
 from pathlib import Path
 from max_nbr import max_nbr
@@ -11,6 +10,16 @@ from TrainUtils import EdgeSampler
 
 bce_logits_loss = F.binary_cross_entropy_with_logits
 cosim = F.cosine_similarity
+
+class SoftplusSimplex(nn.Module):
+	def __init__(self, n, init=0.0):
+		super().__init__()
+		self.raw = nn.Parameter(torch.full((n,), init))
+
+	def forward(self):
+		u = F.softplus(self.raw)
+		return u / u.sum()
+
 
 def build_MLP(dims, activation=nn.ReLU, dropout=0.0, use_layernorm=False, normalize_input=False):
 	layers = []
@@ -42,8 +51,8 @@ class PositiveLinear(nn.Module):
 		weight = F.softplus(self.raw_weight) + self.epsilon
 		return F.linear(x, weight, self.bias)
 
-# MonotonicMLP using PositiveLinear layers
-class MonotonicMLP(nn.Module):
+# MonotoneMap using PositiveLinear layers
+class MonotoneMap(nn.Module):
 	def __init__(self, dims = [1,32,32,1], activation=nn.Softplus, epsilon=1e-6):
 		"""
 		dims: list of layer sizes, e.g., [1, 32, 32, 1] for 1D input/output
@@ -130,14 +139,12 @@ class Decoder(nn.Module):
 		self.edge_prob_head = nn.Linear(self.dims[-1],1)
 
 		# self.coef_matrix = nn.Parameter(torch.randn(in_channels, coef_matrix_cols))
+		self.sim_scale = nn.Parameter(torch.tensor(1.0))
+		self.sim_shift = nn.Parameter(torch.tensor(0.0))
 
-		self.w_p_node = nn.Parameter(torch.tensor(0.5))	# weight for node contribution to edge probability
-		self.w_p_nbr = nn.Parameter(torch.tensor(0.5))	# weight for neighbor contribution to edge probability
-		self.w_p_cong = nn.Parameter(torch.tensor(0.5))	# weight for edge congruence contribution to edge probability
-		self.w_s_node = nn.Parameter(torch.tensor(0.5))	# weight for node contribution to edge weight (strength)
-		self.w_s_cong = nn.Parameter(torch.tensor(0.5))	# weight for node contribution to edge weight (strength)
+		self.edge_prob_coefficients = SoftplusSimplex(n=3, init=1.0/3.0)
 
-		self.monotonic_map = MonotonicMLP()
+		self.monotonic_map = MonotoneMap()
 	
 	def congruence_score(self, nodes_latent, supervision_edges, message_edges, message_edgestr = None, softmax_intensity=10.0):
 		msg_src, msg_dst = message_edges
@@ -190,7 +197,7 @@ class Decoder(nn.Module):
 
 		# Step 8: Aggregate to one congruence score per node
 		congruence_node = scatter_mean(
-			weights,
+			weights*cosine_sim,
 			expanded_queries,
 			dim=0,
 			dim_size=N
@@ -207,8 +214,8 @@ class Decoder(nn.Module):
 				dim=0,
 				dim_size=N
 			)
-			WeightsByCongruence = edge_strength_node[sup_src] + edge_strength_node[sup_dst]
-			return ExistenceByCongruence, WeightsByCongruence
+			StrengthByCongruence = edge_strength_node[sup_src] + edge_strength_node[sup_dst]
+			return ExistenceByCongruence, StrengthByCongruence
 		else:
 			return ExistenceByCongruence
 
@@ -221,13 +228,14 @@ class Decoder(nn.Module):
 		combined = torch.cat([additive, multiplicative], dim=-1)
 		edge_features = self.edge_embedder(combined)
 		nbrs_similarity = torch.sum(nbrs_latent[u] * nbrs_latent[v], dim=-1, keepdim=True)
-		ExistenceByCongruence, WeightsByCongruence = self.congruence_score(nodes_latent, supervision_edges, message_edges, message_edgestr)
-		node_contribution = self.edge_prob_head(edge_features) * self.w_node
-		nbr_contribution =  nbrs_similarity * self.w_nbr
-		edge_probabilities =  node_contribution + nbr_contribution
-		fraction_node_contribution = node_contribution / (node_contribution + nbr_contribution + 1e-8)
+		ExistenceByCongruence, StrengthByCongruence = self.congruence_score(nodes_latent, supervision_edges, message_edges, message_edgestr)
+		P_cong = self.sim_scale * (ExistenceByCongruence + self.sim_shift)
+		P_nbr = self.sim_scale * (nbrs_similarity + self.sim_shift)
+		P_dec = self.edge_prob_head(edge_features)
+		edge_prob_logits =  self.edge_prob_coefficients * torch.cat([P_dec, P_nbr, P_cong], dim=-1)
+		fractional_contribution = self.edge_prob_coefficients
 		edge_strengths = F.relu(self.edge_wt_head(torch.cat([edge_features, nbrs_similarity], dim=-1)))
-		return edge_probabilities, edge_strengths, fraction_node_contribution
+		return edge_prob_logits, edge_strengths, fraction_node_contribution
 	
 def reparameterize(mu, std):
 	eps = torch.randn_like(std)
