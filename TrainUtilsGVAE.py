@@ -12,7 +12,7 @@ bce_logits_loss = F.binary_cross_entropy_with_logits
 cosim = F.cosine_similarity
 
 class SoftplusSimplex(nn.Module):
-	def __init__(self, n, init=0.0):
+	def __init__(self, n, init=1.0):
 		super().__init__()
 		self.raw = nn.Parameter(torch.full((n,), init))
 
@@ -135,7 +135,7 @@ class Decoder(nn.Module):
 		self.dropout = dropout
 		self.dims = [2*self.in_channels] + self.hidden_channels
 		self.edge_embedder = build_MLP(dims=self.dims, dropout=self.dropout, use_layernorm=True, normalize_input=False)
-		self.edge_wt_head = nn.Linear(self.dims[-1]+1, 1)
+		self.edge_wt_head = nn.Linear(self.dims[-1], 1)
 		self.edge_prob_head = nn.Linear(self.dims[-1],1)
 
 		# self.coef_matrix = nn.Parameter(torch.randn(in_channels, coef_matrix_cols))
@@ -143,6 +143,7 @@ class Decoder(nn.Module):
 		self.sim_shift = nn.Parameter(torch.tensor(0.0))
 
 		self.edge_prob_coefficients = SoftplusSimplex(n=3, init=1.0/3.0)
+		self.edge_strength_coefficients = SoftplusSimplex(n=2, init=0.5)
 
 		self.monotonic_map = MonotoneMap()
 	
@@ -232,10 +233,13 @@ class Decoder(nn.Module):
 		P_cong = self.sim_scale * (ExistenceByCongruence + self.sim_shift)
 		P_nbr = self.sim_scale * (nbrs_similarity + self.sim_shift)
 		P_dec = self.edge_prob_head(edge_features)
-		edge_prob_logits =  self.edge_prob_coefficients * torch.cat([P_dec, P_nbr, P_cong], dim=-1)
-		fractional_contribution = self.edge_prob_coefficients
-		edge_strengths = F.relu(self.edge_wt_head(torch.cat([edge_features, nbrs_similarity], dim=-1)))
-		return edge_prob_logits, edge_strengths, fraction_node_contribution
+		P_combined = torch.stack([P_dec, P_nbr, P_cong], dim=-1)
+		wp = self.edge_prob_coefficients()
+		edge_prob_logits =  (wp * P_combined).sum(dim=-1)
+		Strength_dec = F.relu(self.edge_wt_head(edge_features))
+		ws = self.edge_strength_coefficients()
+		edge_strengths = ws[0]*Strength_dec + ws[1]*StrengthByCongruence
+		return edge_prob_logits, edge_strengths
 	
 def reparameterize(mu, std):
 	eps = torch.randn_like(std)
