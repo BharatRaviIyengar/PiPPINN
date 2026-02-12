@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
-from torch_scatter import scatter_max, scatter_mean, scatter_add, scatter_softmax
+from torch_scatter import scatter_max, scatter_mean, scatter_add, scatter_softmax, scatter_sum
 from warnings import warn
 from pathlib import Path
 from max_nbr import max_nbr
@@ -90,7 +90,7 @@ class NeighborhoodEncoder(nn.Module):
 		self.dropout = dropout
 		self.dims = [self.in_channels] + self.hidden_channels
 
-		self.edge_strength_message_coefficient = nn.Parameter(torch.tensor(0.5))
+		self.edge_strength_message_coefficient = nn.Parameter(torch.tensor(0.5)) # a learnable global parameter that controls how much edge strength influences the message passing
 		self.final_transform = build_MLP(dims=self.dims, dropout=self.dropout, use_layernorm=True, normalize_input=False)
 
 		self.gaussian_mu_head = nn.Linear(self.dims[-1], out_channels)
@@ -98,21 +98,25 @@ class NeighborhoodEncoder(nn.Module):
 
 	def forward(self, x, edge_index, edge_strength):
 		src, dst = edge_index
-		EWMC = F.softplus(self.edge_strength_message_coefficient)
-		neighborhood_features = x[src] * (1 + EWMC * edge_strength.unsqueeze(-1))
-		pooled = self.pool(neighborhood_features)
-		pooled = self.LN_pool(pooled)
-		pooled = F.relu(pooled)
+		EWMC = F.softplus(self.edge_strength_message_coefficient) # coefficeint is positive due to softplus
+		neighborhood_features = x[src] * (1 + EWMC * edge_strength.unsqueeze(-1)) # feature vector of source node modulated by edge strength
+		pooled = self.pool(neighborhood_features) # apply a linear transform
+		pooled = self.LN_pool(pooled) # apply layer normalization
+		pooled = F.relu(pooled) # activation
 		
-		# Aggregate neighbor messages via max
+		# Aggregate neighbor messages via feature-wise max over neighbors
+		# (for each feature, select the strongest neighbor contribution)
 		aggregate, _ = scatter_max(pooled, dst, dim=0, dim_size=x.size(0))
 		neighborhood = self.final_transform(aggregate)
+
+		# Transform to Gaussian parameters
 		mu = self.gaussian_mu_head(neighborhood)
 		logvar = self.gaussian_logvar_head(neighborhood)
 		std = torch.exp(0.5 * logvar)
 		return mu, std
 	
 class NodeEncoder(nn.Module):
+	# Simple MLP encoder that produces Gaussian parameters for each node's latent representation
 	def __init__(self, in_channels, out_channels, dropout=0.0):
 		super().__init__()
 		self.in_channels = in_channels
@@ -138,25 +142,32 @@ class Decoder(nn.Module):
 		self.edge_wt_head = nn.Linear(self.dims[-1], 1)
 		self.edge_prob_head = nn.Linear(self.dims[-1],1)
 
-		# self.coef_matrix = nn.Parameter(torch.randn(in_channels, coef_matrix_cols))
+		# Initialize learnable parameters that can scale and shift scores that range from -1 to 1 (e.g., cosine similarity) to a range that is similar to that of a standard MLP.
+		# This helps the decoder to combine congruence and neighborhood similarity scores (-1,1) with that of the MLP based edge decoder using a simple linear combination.
+
 		self.sim_scale = nn.Parameter(torch.tensor(1.0))
 		self.sim_shift = nn.Parameter(torch.tensor(0.0))
 
 		self.edge_prob_coefficients = SoftplusSimplex(n=3, init=1.0/3.0)
 		self.edge_strength_coefficients = SoftplusSimplex(n=2, init=0.5)
 
+		# Initialize a learnable monotonic function that preserves the order of input an output values. 
+		# This allows us to interpolate the value of a supervision edge's strength from congruent edges of known strength using an arbitrary learned nonlinear function, while ensuring that the contribution from a congruent edge to the predicted edge strength is always non-negative and increases as the congruence score increases.
 		self.monotonic_map = MonotoneMap()
 	
 	def congruence_score(self, nodes_latent, supervision_edges, message_edges, message_edgestr = None, softmax_intensity=10.0):
+		# Computes a congruence score for each supervision (unseen) edge based on whether a similar edge exists among message (seen) edges.
+		# The intuition is that if node Y interacts with node Z, and if node Z has similar latent features as node X, then X & Y are likely to interact. That is, X is congruent with known neighbors of Y, which increases the likelihood of an X-Y interaction.
+
 		msg_src, msg_dst = message_edges
 		sup_src, sup_dst = supervision_edges
 		device = nodes_latent.device
-		N = nodes_latent.size(0)
+		N = nodes_latent.size(0) # total number of nodes
 
-		# Step 1: Build directed supervision pairs
-		sup_query = torch.cat([sup_src, sup_dst])   # X
-		sup_partner = torch.cat([sup_dst, sup_src]) # Y
-		M = sup_query.size(0)
+		# Step 1: Build directed supervision pairs (edges are by default undirected in a PPI graph)
+		sup_query = torch.cat([sup_src, sup_dst])   # Xs
+		sup_partner = torch.cat([sup_dst, sup_src]) # Ys
+		M = sup_query.size(0) # total number of directed supervision edges (twice the number of undirected edges)
 
 		# Step 2: Gather message neighbors of each Y
 		mask = torch.isin(msg_dst, sup_partner)
@@ -166,10 +177,11 @@ class Decoder(nn.Module):
 
 		# Step 3: Map partner nodes Y -> directed supervision index
 		# Each sup_partner appears in sup_query/sup_partner pairs
-		partner_index = torch.full((N,), -1, device=device)
-		partner_index[sup_partner] = torch.arange(M, device=device)
 
-		msg_partner_idx = partner_index[msg_partner]
+		partner_index = torch.full((N,), -1, device=device)
+		partner_index[sup_partner] = torch.arange(M, device=device) # Map the index of a node Y in the set N to the index of all supervision edges (X,Y for all X) in the set M. Nodes that do not appear as Y get a value of -1.  
+
+		msg_partner_idx = partner_index[msg_partner] # For each message edge (Z,Y), get the index of the corresponding supervision edge (X,Y) that shares the same Y. This creates an alignment between message edges and supervision edges based on their shared partner node Y.
 
 		# Step 4: Count how many message neighbors per supervision query
 		neighbor_count = scatter_add(
@@ -180,24 +192,28 @@ class Decoder(nn.Module):
 		)
 
 		# Step 5: Expand sup_query nodes (global indices) to align with neighbors
+		# For example, if Y has 3 neighbors (Z1, Z2, Z3) in the message edges, we will have 3 rows comparing X to each of those 3 neighbors. This allows us to compute similarity between each neighbor and the supervision query node X.
+
 		expanded_queries = sup_query.repeat_interleave(neighbor_count)
 
-		# Step 6: Compute similarity: supervised node vs message neighbors
+		# Step 6: Compute similarity: supervised node (X) vs message neighbors (Zs)
 		cosine_sim = cosim(
 			nodes_latent[expanded_queries],	# X
 			nodes_latent[msg_neighbors],	# Z
 			dim=-1
 		)
 
-		# Step 7: Softmax per supervision query node
+		# Step 7: Logsumexp per supervision query node
+		# We want to give the highest attention to the node Z that is most similar to X and ignore those that are not similar. By exponentiating the cosine similarity, we amplify the contribution of similar neighbors and diminish that of dissimilar neighbors. The softmax_intensity parameter controls how much more weight we give to the most similar neighbor compared to others. A higher value means we focus more on the single most similar neighbor, while a lower value means we consider a broader set of neighbors.
+
 		weights = scatter_softmax(
 			softmax_intensity * cosine_sim,
 			expanded_queries,
 			dim=0
 		)
 
-		# Step 8: Aggregate to one congruence score per node
-		congruence_node = scatter_mean(
+		# Step 8: Aggregate to one congruence score per node based on the softmax attention weights. If any neighbor Z is very similar to X, then the congruence score will be high. If no neighbors are similar to X, then the congruence score will be low.
+		congruence_node = scatter_sum(
 			weights*cosine_sim,
 			expanded_queries,
 			dim=0,
@@ -205,7 +221,14 @@ class Decoder(nn.Module):
 		)
 
 		# Step 9: Map back to supervision edges
-		ExistenceByCongruence = congruence_node[sup_src] + congruence_node[sup_dst]
+		# Combine congruence evidence for both nodes in the supervision edge.
+		congruence_edge = torch.stack([congruence_node[sup_src], congruence_node[sup_dst]], dim=0)
+		final_weights = torch.softmax(softmax_intensity*congruence_edge, dim=0)
+		ExistenceByCongruence = torch.sum(final_weights * congruence_edge, dim=0)
+
+			
+
+		# Step 10 (optional): Calculate the strength of the supervision edge based on the strength of the most congruent message edge. If message_edgestr is not provided, we skip this step and just return the existence score based on congruence. The monotonic map ensures that more similar a node Z is to X, the higher the contribution of Z's edge strength to the predicted strength of the supervision edge (X,Y). 
 
 		if message_edgestr is not None:
 			weighted_edges = self.monotonic_map(cosine_sim) * message_edgestr[mask]
