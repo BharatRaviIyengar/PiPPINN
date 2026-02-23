@@ -346,6 +346,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		return self.centrality[edge_list[0]] + self.centrality[edge_list[1]]  
 	
 	def generate_soft_negative_labels(self, edge_centrality, min_centrality=2, max_centrality = None, hardness=1):
+		# Generate soft negative labels based on edge centrality. Edges with higher centrality get softer labels (closer to 0.5), while edges with lower centrality get harder labels (closer to 0).
 		max_centrality = edge_centrality.max() if max_centrality is None else max_centrality
 		negative_probs = 0.5 * ((max_centrality - edge_centrality) / (max_centrality - min_centrality + 1e-8)) ** hardness
 		return negative_probs.clamp(min=0.0, max=0.5)

@@ -53,9 +53,9 @@ class PositiveLinear(nn.Module):
 
 # MonotoneMap using PositiveLinear layers
 class MonotoneMap(nn.Module):
-	def __init__(self, dims = [1,32,32,1], activation=nn.Softplus, epsilon=1e-6):
+	def __init__(self, dims = [1,8,8,1], activation=nn.Softplus, epsilon=1e-6):
 		"""
-		dims: list of layer sizes, e.g., [1, 32, 32, 1] for 1D input/output
+		dims: list of layer sizes, e.g., [1, 8, 8, 1] for 1D input/output
 		activation: monotone increasing activation
 		dropout: dropout rate
 		"""
@@ -142,18 +142,15 @@ class Decoder(nn.Module):
 		self.edge_wt_head = nn.Linear(self.dims[-1], 1)
 		self.edge_prob_head = nn.Linear(self.dims[-1],1)
 
-		# Initialize learnable parameters that can scale and shift scores that range from -1 to 1 (e.g., cosine similarity) to a range that is similar to that of a standard MLP.
-		# This helps the decoder to combine congruence and neighborhood similarity scores (-1,1) with that of the MLP based edge decoder using a simple linear combination.
+		# Initialize learnable monotonic non-linear functions that can translate similarity scores to edge probabilities and edge strengths.
+		# This ensures that the higher scores always mean higher edge probabilities and strengths, while allowing the model to learn the optimal nonlinear mapping from similarity to edge properties.
 
-		self.sim_scale = nn.Parameter(torch.tensor(1.0))
-		self.sim_shift = nn.Parameter(torch.tensor(0.0))
+		self.monomap_EdgeStrength_Congruence = MonotoneMap()
+		self.monomap_EdgeExistence_Congruence = MonotoneMap()
+		self.monomap_EdgeExistence_NbrSimilarity = MonotoneMap()
 
 		self.edge_prob_coefficients = SoftplusSimplex(n=3, init=1.0/3.0)
 		self.edge_strength_coefficients = SoftplusSimplex(n=2, init=0.5)
-
-		# Initialize a learnable monotonic function that preserves the order of input an output values. 
-		# This allows us to interpolate the value of a supervision edge's strength from congruent edges of known strength using an arbitrary learned nonlinear function, while ensuring that the contribution from a congruent edge to the predicted edge strength is always non-negative and increases as the congruence score increases.
-		self.monotonic_map = MonotoneMap()
 	
 	def congruence_score(self, nodes_latent, supervision_edges, message_edges, message_edgestr = None, softmax_intensity=10.0):
 		# Computes a congruence score for each supervision (unseen) edge based on whether a similar edge exists among message (seen) edges.
@@ -225,13 +222,12 @@ class Decoder(nn.Module):
 		congruence_edge = torch.stack([congruence_node[sup_src], congruence_node[sup_dst]], dim=0)
 		final_weights = torch.softmax(softmax_intensity*congruence_edge, dim=0)
 		ExistenceByCongruence = torch.sum(final_weights * congruence_edge, dim=0)
-
-			
+		ExistenceByCongruence = self.monomap_EdgeExistence_Congruence(ExistenceByCongruence.unsqueeze(-1)).squeeze(-1)
 
 		# Step 10 (optional): Calculate the strength of the supervision edge based on the strength of the most congruent message edge. If message_edgestr is not provided, we skip this step and just return the existence score based on congruence. The monotonic map ensures that more similar a node Z is to X, the higher the contribution of Z's edge strength to the predicted strength of the supervision edge (X,Y). 
 
 		if message_edgestr is not None:
-			weighted_edges = self.monotonic_map(cosine_sim) * message_edgestr[mask]
+			weighted_edges = self.monomap_EdgeStrength_Congruence(cosine_sim) * message_edgestr[mask]
 			edge_strength_node = scatter_mean(
 				weighted_edges,
 				expanded_queries,
@@ -239,7 +235,7 @@ class Decoder(nn.Module):
 				dim_size=N
 			)
 			StrengthByCongruence = edge_strength_node[sup_src] + edge_strength_node[sup_dst]
-			return ExistenceByCongruence, StrengthByCongruence
+			return ExistenceByCongruence, StrengthByCongruence.squeeze(-1)
 		else:
 			return ExistenceByCongruence
 
@@ -247,22 +243,28 @@ class Decoder(nn.Module):
 		u, v  = supervision_edges
 		additive = nodes_latent[u] + nodes_latent[v]
 		multiplicative = nodes_latent[u] * nodes_latent[v]
-		# combined = additive * self.coef_matrix @ multiplicative
-		# # alternative:
 		combined = torch.cat([additive, multiplicative], dim=-1)
 		edge_features = self.edge_embedder(combined)
 		nbrs_similarity = torch.sum(nbrs_latent[u] * nbrs_latent[v], dim=-1, keepdim=True)
 		ExistenceByCongruence, StrengthByCongruence = self.congruence_score(nodes_latent, supervision_edges, message_edges, message_edgestr)
-		P_cong = self.sim_scale * (ExistenceByCongruence + self.sim_shift)
-		P_nbr = self.sim_scale * (nbrs_similarity + self.sim_shift)
-		P_dec = self.edge_prob_head(edge_features)
-		P_combined = torch.stack([P_dec, P_nbr, P_cong], dim=-1)
-		wp = self.edge_prob_coefficients()
-		edge_prob_logits =  (wp * P_combined).sum(dim=-1)
-		Strength_dec = F.relu(self.edge_wt_head(edge_features))
-		ws = self.edge_strength_coefficients()
-		edge_strengths = ws[0]*Strength_dec + ws[1]*StrengthByCongruence
-		return edge_prob_logits, edge_strengths
+		ExistenceByNbrSimilarity = self.monomap_EdgeExistence_NbrSimilarity(nbrs_similarity)
+
+		ExistenceViaDecoder = self.edge_prob_head(edge_features).squeeze(-1)
+
+		edge_prob_logits =  ExistenceByCongruence + ExistenceByNbrSimilarity  + ExistenceViaDecoder
+
+		StrengthViaDecoder = F.relu(self.edge_wt_head(edge_features).squeeze(-1))
+
+		edge_strengths = StrengthViaDecoder + StrengthByCongruence
+
+		individual_contributions = {
+			"ExistenceByCongruence": ExistenceByCongruence.detach().cpu(),
+			"ExistenceByNbrSimilarity": ExistenceByNbrSimilarity.detach().cpu(),
+			"ExistenceViaDecoder": ExistenceViaDecoder.detach().cpu(),
+			"StrengthByCongruence": StrengthByCongruence.detach().cpu(),
+
+		}
+		return edge_prob_logits, edge_strengths, individual_contributions
 	
 def reparameterize(mu, std):
 	eps = torch.randn_like(std)
@@ -289,12 +291,12 @@ class GVAE_Model(nn.Module):
 		nbrs_latent = reparameterize(nbr_mu, nbr_std)
 
 		# Decode edges
-		edge_probabilities, edge_strengths, edge_explained_by_nodes = self.decoder(
+		edge_prob_logits, edge_strengths, edge_individal_contributions = self.decoder(
 			nodes_latent,
 			nbrs_latent,
 			supervision_edges
 		)
-		return edge_probabilities, edge_strengths, edge_explained_by_nodes, node_mu, node_std, nbr_mu, nbr_std
+		return node_mu, node_std, nbr_mu, nbr_std, edge_prob_logits, edge_strengths, edge_individal_contributions
 	
 def KL_loss(mu, std):
 	num_nodes = mu.size(0)
@@ -302,7 +304,7 @@ def KL_loss(mu, std):
 	return kld / num_nodes
 	
 
-def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, masked_supervision_fraction = 0.0, is_training=False, return_output=False):
+def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False, return_output=False):
 	"""
 	Processes a single batch for training or validation.
 
@@ -329,10 +331,7 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	else:
 		conditional_backward = lambda loss: None  # No-op for validation
 
-	mask_supervision = torch.rand(data.supervision_labels.size(), device=device) < masked_supervision_fraction
-
 	# Forward pass
-
 	# Encode
 	node_mu, node_std = model.node_encoder(data.node_features)
 	nodes_latent = reparameterize(node_mu, node_std)
@@ -344,33 +343,21 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 	)
 	nbr_latent = reparameterize(nbr_mu, nbr_std)
 
-	# Decode train supervision edges
+	# Decode supervision edges
 
-	train_logits, train_edge_strengths, _ = model.decoder(
+	edge_prob_logits, edge_strengths, edge_contributions = model.decoder(
 	nodes_latent,
 	nbr_latent,
 	data.supervision_train_edges
 	)
 
-	train_logits = train_logits.squeeze(-1)
-	train_edge_strengths = train_edge_strengths.squeeze(-1)
-
-	# Decode masked supervision edges
-
-	masked_logits, masked_edge_strengths, _ = model.decoder(
-		nodes_latent,
-		nbr_latent,
-		data.supervision_masked_edges
-	)
-
-	masked_logits = masked_logits.squeeze(-1)
-	masked_edge_strengths = masked_edge_strengths.squeeze(-1)
-
 	# Compute losses
 
-	bce_edge_classification_loss = bce_logits_loss(edge_probability,data.supervision_labels,weight=data.supervision_importance)
-	mse_edge_strength_loss = F.mse_loss(edge_strengths.squeeze(-1), data.supervision_edgestrs)
-	margin_and_entropy_loss = ME_loss(edge_probability)
+	bce_edge_classification_loss = bce_logits_loss(edge_prob_logits, data.supervision_labels)
+
+	positve_edges = data.supervision_labels.bool()
+	mse_edge_strength_loss = F.mse_loss(edge_strengths[positve_edges], data.supervision_edgestrs[positve_edges])
+	margin_and_entropy_loss = ME_loss(edge_prob_logits)
 	KL_loss_node = KL_loss(node_mu, node_std)
 	KL_loss_nbr = KL_loss(nbr_mu, nbr_std)
 
@@ -383,6 +370,6 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 		optimizer.step()
 
 	if return_output:
-		return loss.item(), edge_probability.detach().cpu(), data.supervision_labels.detach().cpu()
+		return loss.item(), edge_prob_logits.detach().cpu(), data.supervision_labels.detach().cpu()
 	else:
 		return loss.item()
