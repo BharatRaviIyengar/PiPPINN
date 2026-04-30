@@ -3,10 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_scatter import scatter_max, scatter_mean, scatter_add, scatter_softmax, scatter_sum
-from warnings import warn
-from pathlib import Path
-from max_nbr import max_nbr
-from TrainUtils import EdgeSampler
 
 bce_logits_loss = F.binary_cross_entropy_with_logits
 cosim = F.cosine_similarity
@@ -304,7 +300,7 @@ def KL_loss(mu, std):
 	return kld / num_nodes
 	
 
-def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False, return_output=False):
+def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False, return_output=False):
 	"""
 	Processes a single batch for training or validation.
 
@@ -357,11 +353,10 @@ def process_data(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, de
 
 	positve_edges = data.supervision_labels.bool()
 	mse_edge_strength_loss = F.mse_loss(edge_strengths[positve_edges], data.supervision_edgestrs[positve_edges])
-	margin_and_entropy_loss = ME_loss(edge_prob_logits)
 	KL_loss_node = KL_loss(node_mu, node_std)
 	KL_loss_nbr = KL_loss(nbr_mu, nbr_std)
 
-	loss = bce_edge_classification_loss + mse_edge_strength_loss + margin_and_entropy_loss + KL_loss_node + KL_loss_nbr
+	loss = bce_edge_classification_loss + mse_edge_strength_loss + KL_loss_node + KL_loss_nbr
 	
 	# loss = calculate_loss(model_output, data, head_weights)
 	conditional_backward(loss)

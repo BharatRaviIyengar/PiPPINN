@@ -2,7 +2,8 @@ import argparse as ap
 from pathlib import Path
 import sys
 import torch
-import TrainUtils as utils
+import TrainUtils as TUtils
+import GVAE_model as GVAE
 import optuna
 from optuna.samplers import TPESampler
 from optuna.storages import JournalStorage
@@ -34,22 +35,22 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	nbr_wt_intensity = params['nbr_weight_intensity']
 	hidden_channels = params['hidden_channels']
 	network_skip_factor = params['network_skip_factor']
+	latent_channels = params['latent_channels']
 	
-	data_for_training = [utils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
-
-	utils.ME_loss.num_positive_edges = data_for_training[0]["train_sampler"].num_supervision_edges
-	utils.ME_loss.margin = params['margin']
-	utils.ME_loss.margin_loss_coef = params['margin_loss_coef']
-	utils.ME_loss.entropy_coef = params['entropy_coef']
-
+	data_for_training = [TUtils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
 
 	del dataset
 	gc.collect()
 	torch.cuda.empty_cache()
 
 	# Initialize model and optimizer
-	model = utils.DualLayerModel(
-			in_channels=data_for_training[0]["input_channels"],
+	model = GVAE.GVAE_Model(
+			node_in_channels=data_for_training[0]["input_channels"],
+			nbr_in_channels=data_for_training[0]["input_channels"],
+			node_latent_channels=latent_channels,
+			nbr_latent_channels=latent_channels,
+			node_hidden_channels=hidden_channels,
+			nbr_hidden_channels=hidden_channels,
 			hidden_channels=hidden_channels,
 			dropout=dropout,
 			network_skip=0.5
@@ -65,7 +66,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		min_lr=1e-6
 	)
 
-	network_skip_scheduler = utils.DecayScheduler(model, 'network_skip', initial_value=0.6, factor=network_skip_factor, cooldown=2, min_value=0.001)
+	network_skip_scheduler = TUtils.DecayScheduler(model, 'network_skip', initial_value=0.6, factor=network_skip_factor, cooldown=2, min_value=0.001)
 
 	total_val_samples = sum([(data["val_sampler"].num_supervision_edges + data["val_sampler"].num_negative_edges)*data["val_sampler"].num_batches for data in data_for_training])
 
