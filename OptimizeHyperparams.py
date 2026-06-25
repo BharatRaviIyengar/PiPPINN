@@ -13,16 +13,6 @@ import math
 
 import gc
 
-def generate_hidden_dims(input_dim, depth, last_layer_size):
-	n_layers = depth - 1  # intermediate layers count (excluding first)
-	
-	if n_layers == 0:
-		return []  # no intermediate layers, just input and last layer
-
-	decay_factor = (last_layer_size / input_dim) ** (1 / n_layers)
-	hidden_dims = [int(input_dim * decay_factor ** i) for i in range(n_layers)]
-
-	return hidden_dims
 
 def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, max_epochs = 200, threads:int=1):
 	""" Run training for a single trial with the given parameters."""

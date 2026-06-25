@@ -10,6 +10,31 @@ from warnings import warn
 from pathlib import Path
 from max_nbr import max_nbr
 
+def generate_hidden_dims(input_dim, depth, last_layer_size):
+	n_layers = depth - 1  # intermediate layers count (excluding first)
+	
+	if n_layers == 0:
+		return []  # no intermediate layers, just input and last layer
+
+	decay_factor = (last_layer_size / input_dim) ** (1 / n_layers)
+	hidden_dims = [int(input_dim * decay_factor ** i) for i in range(n_layers)]
+
+	return hidden_dims
+
+def build_MLP(dims, activation=nn.ReLU, dropout=0.0, use_layernorm=False, normalize_input=False):
+	layers = []
+	if normalize_input:
+		layers.append(nn.LayerNorm(dims[0]))
+	for i in range(len(dims) - 1):
+		layers.append(nn.Linear(dims[i], dims[i + 1]))
+		if use_layernorm:
+			layers.append(nn.LayerNorm(dims[i + 1]))
+		if i < len(dims) - 1:
+			layers.append(activation())
+			if dropout > 0:
+				layers.append(nn.Dropout(dropout))
+	return nn.Sequential(*layers)
+
 
 def hinge_loss(margin: float, positive_logits, negative_logits):
 	loss_margin = torch.relu(margin - positive_logits).mean() + torch.relu(margin + negative_logits).mean()

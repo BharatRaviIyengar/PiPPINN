@@ -1,0 +1,343 @@
+# Interpretable Variational Graph Autoencoder for Protein–Protein Interaction Prediction
+
+## Objective
+
+Develop an interpretable link prediction model that combines:
+
+- Protein sequence information
+- Graph topology
+- Homology/congruence-based reasoning
+- Uncertainty quantification via variational inference
+
+The model predicts both:
+
+1. Probability of interaction between proteins
+2. Interaction strength/confidence
+
+while providing biologically meaningful explanations for its predictions.
+
+--------------------------------------------------------------------------------
+1. Data
+--------------------------------------------------------------------------------
+
+### Protein Interaction Network
+
+- Protein interactions obtained from STRING DB.
+- Graph nodes represent proteins.
+- Graph edges represent known protein-protein interactions.
+
+### Node Features
+
+Protein sequences are embedded using ESM2-3B.
+
+For proteins within the ESM context limit:
+
+- Per-residue embeddings are generated.
+- Residue embeddings are averaged to obtain a single protein embedding.
+
+For proteins longer than 1022 residues:
+
+- Sliding-window inference is performed.
+- Window embeddings are merged.
+- Residue embeddings are averaged to obtain a single protein embedding.
+
+Additional feature:
+
+- Log-transformed protein length.
+
+Protein length is scaled to match the magnitude of the ESM embedding dimensions and appended to the feature vector.
+
+--------------------------------------------------------------------------------
+2. Variational Encoder
+--------------------------------------------------------------------------------
+
+The encoder consists of two complementary branches.
+
+### 2.1 Raw Sequence Encoder
+
+Input:
+
+- Protein sequence embedding
+- Protein length feature
+
+Architecture:
+
+- Multi-layer perceptron (MLP)
+
+Outputs:
+
+- μ_raw
+- σ_raw
+
+These parameterize a Gaussian latent representation describing sequence-derived information.
+
+This branch captures:
+
+- Sequence similarity
+- Functional similarity
+- Structural information encoded by ESM
+- Protein-specific properties independent of graph topology
+
+### 2.2 Neighborhood Encoder
+
+Architecture:
+
+- Two-hop GraphSAGE encoder
+- Max-pooling aggregation
+
+Outputs:
+
+- μ_nbr
+- σ_nbr
+
+These parameterize a Gaussian latent representation describing graph-derived information.
+
+This branch captures:
+
+- Local network structure
+- Functional neighborhoods
+- Community membership
+- Topological context
+
+--------------------------------------------------------------------------------
+3. Decoder Architecture
+--------------------------------------------------------------------------------
+
+The decoder combines multiple interpretable prediction mechanisms.
+
+### 3.1 Congruence Decoder
+
+Biological intuition:
+
+If:
+
+    Y interacts with Z
+
+and
+
+    X is sufficiently similar to Z
+
+then
+
+    X may also interact with Y.
+
+This resembles homology-based transfer of interaction evidence.
+
+Procedure:
+
+For candidate interaction:
+
+    X ↔ Y
+
+all known neighbors Z of Y are examined.
+
+For each neighbor:
+
+- Similarity(X, Z) is computed.
+- Neighbor edge strength(Y, Z) is incorporated.
+
+A learned monotonic positive function converts:
+
+    similarity(X, Z)
+
+into an interaction probability contribution.
+
+A second learned monotonic function combines:
+
+    similarity(X, Z)
+    edge_strength(Y, Z)
+
+to estimate interaction strength.
+
+Interpretability:
+
+Predictions can be traced to specific neighboring proteins that provide supporting evidence.
+
+### 3.2 Neighborhood Similarity Decoder
+
+Biological intuition:
+
+If:
+
+    X interacts with Y
+    Y interacts with Z
+
+then
+
+    X may also interact with Z.
+
+This captures transitivity and neighborhood consistency.
+
+Procedure:
+
+- Compute similarity between neighborhood latent representations.
+- Higher similarity implies greater likelihood of interaction.
+
+Interpretability:
+
+Predictions are explained through shared graph context.
+
+### 3.3 Deep Decoder
+
+A neural decoder learns interaction patterns that cannot be captured by the explicit congruence and neighborhood mechanisms.
+
+Input:
+
+- Raw sequence latents
+- Neighborhood latents
+
+Architecture:
+
+- Deep MLP
+
+Outputs:
+
+- Interaction probability contribution
+- Interaction strength contribution
+
+Interpretability:
+
+Represents residual predictive information not explained by explicit biological rules.
+
+### 3.4 Final Prediction Layer
+
+Final interaction probability is obtained through a generalized linear combination of:
+
+- Congruence decoder output
+- Neighborhood similarity output
+- Deep decoder output
+
+Final interaction strength is obtained from:
+
+- Congruence-based strength prediction
+- Deep decoder strength prediction
+
+This allows explicit biological reasoning and learned nonlinear reasoning to contribute jointly.
+
+--------------------------------------------------------------------------------
+4. Loss Functions
+--------------------------------------------------------------------------------
+
+### Variational Regularization
+
+KL-divergence loss:
+
+- Encourages latent distributions to remain close to the prior.
+- Provides uncertainty-aware representations.
+
+### Link Prediction Loss
+
+Binary cross-entropy with logits.
+
+Training uses a Positive-Unlabeled (PU) framework:
+
+- Known interactions are treated as positives.
+- Sampled non-edges are treated as uncertain negatives.
+
+### Edge Strength Loss
+
+Mean squared error (MSE).
+
+Applied only to positive edges with known interaction strengths.
+
+--------------------------------------------------------------------------------
+5. Data Processing and Sampling
+--------------------------------------------------------------------------------
+
+### Train-Validation Split
+
+80/20 split.
+
+Additionally:
+
+- Approximately 6% of edges are reserved such that both endpoint nodes occur only in the validation graph.
+
+Purpose:
+
+- Evaluate generalization to unseen proteins.
+
+### Negative Edge Sampling
+
+For each positive edge:
+
+- Two random negative edges are generated.
+
+Negative edges are sampled through random node pairing.
+
+### Positive-Unlabeled Risk Weighting
+
+Negative-edge risk is weighted inversely by the summed centrality of the endpoint nodes.
+
+Rationale:
+
+Highly connected proteins are better documented and are less likely to contain missing interactions.
+
+Therefore:
+
+- Negative edges involving highly connected proteins receive higher confidence (values near zero).
+- Negative edges involving poorly connected proteins receive lower confidence (values near 0.5).
+
+This accounts for incomplete network coverage.
+
+### Edge Mini-Batch Sampling
+
+Training edges are sampled using a hybrid strategy:
+
+- 30% centrality-weighted sampling
+- 70% uniform sampling
+
+Purpose:
+
+- Preserve network-core information.
+- Maintain coverage of peripheral regions.
+- Improve training stability.
+
+--------------------------------------------------------------------------------
+6. Interpretability Strategy
+--------------------------------------------------------------------------------
+
+The model provides three complementary sources of evidence:
+
+1. Congruence Evidence
+   - Interaction inferred from similarity to known interaction partners.
+
+2. Neighborhood Evidence
+   - Interaction inferred from shared graph context.
+
+3. Learned Evidence
+   - Interaction inferred by the deep decoder.
+
+Because these components remain separate throughout prediction, individual contributions can be inspected and analyzed independently.
+
+--------------------------------------------------------------------------------
+7. Potential Future Upgrade: Fourier-Based Protein Representations
+--------------------------------------------------------------------------------
+
+Current sequence embeddings are obtained through average pooling of per-residue ESM embeddings.
+
+A potential enhancement is to replace or augment average pooling with a low-frequency Fourier representation of the residue embedding sequence.
+
+Motivation:
+
+- Preserve coarse positional structure.
+- Reduce dilution of localized interaction signals.
+- Improve congruence-based reasoning for multidomain proteins.
+- Retain substantially more information than average pooling while remaining far more compact than residue-level representations.
+
+Proposed workflow:
+
+    Per-residue ESM embeddings
+            ↓
+    Dimensionality reduction
+            ↓
+    Fourier pooling across sequence position
+            ↓
+    Compact K × d representation
+
+Expected benefit:
+
+- Strongest impact on the congruence decoder.
+- Moderate impact on the deep decoder.
+- Limited impact on neighborhood-based predictions.
+
+The Fourier representation would remain an optional future enhancement pending evaluation of memory, storage, and computational trade-offs.

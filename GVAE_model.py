@@ -1,8 +1,12 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
-from torch_scatter import scatter_max, scatter_mean, scatter_add, scatter_softmax, scatter_sum
+from torch_scatter import scatter_mean
+from torch_scatter.composite import scatter_logsumexp, scatter_std
+from TrainUtils import build_MLP, generate_hidden_dims
 
 bce_logits_loss = F.binary_cross_entropy_with_logits
 cosim = F.cosine_similarity
@@ -15,21 +19,6 @@ class SoftplusSimplex(nn.Module):
 	def forward(self):
 		u = F.softplus(self.raw)
 		return u / u.sum()
-
-
-def build_MLP(dims, activation=nn.ReLU, dropout=0.0, use_layernorm=False, normalize_input=False):
-	layers = []
-	if normalize_input:
-		layers.append(nn.LayerNorm(dims[0]))
-	for i in range(len(dims) - 1):
-		layers.append(nn.Linear(dims[i], dims[i + 1]))
-		if use_layernorm:
-			layers.append(nn.LayerNorm(dims[i + 1]))
-		if i < len(dims) - 1:
-			layers.append(activation())
-			if dropout > 0:
-				layers.append(nn.Dropout(dropout))
-	return nn.Sequential(*layers)
 
 # PositiveLinear ensures weight >= 0
 class PositiveLinear(nn.Module):
@@ -76,55 +65,63 @@ class MonotoneMap(nn.Module):
 		return h
 
 
-class NeighborhoodEncoder(nn.Module):
-	def __init__(self, in_channels, hidden_channels, out_channels, dropout=0.0):
+class NeighborhoodAggregator(nn.Module):
+	def __init__(self, node_latent_dimension, node_actual_degree = None):
 		super().__init__()
-		self.pool = nn.Linear(in_channels, in_channels)
-		self.LN_pool = nn.LayerNorm(in_channels)
-		self.in_channels = in_channels
-		self.hidden_channels = hidden_channels
-		self.dropout = dropout
-		self.dims = [self.in_channels] + self.hidden_channels
+		self.feature_list = []
+		self.node_latent_dimension = node_latent_dimension
+		if node_actual_degree is not None:
+			self.feature_list.append(node_actual_degree.unsqueeze(-1))
 
-		self.edge_strength_message_coefficient = nn.Parameter(torch.tensor(0.5)) # a learnable global parameter that controls how much edge strength influences the message passing
-		self.final_transform = build_MLP(dims=self.dims, dropout=self.dropout, use_layernorm=True, normalize_input=False)
+		self.edge_strength_message_coefficient = nn.Parameter(torch.tensor(0.5)) # a learnable global coefficient that determines how much edge strength should modulate the message from a neighbor. Initialized to 0.5, meaning that initially we allow edge strength to increase the neighbor's contribution by up to 50%. The model can learn to adjust this coefficient based on the data, potentially learning that edge strength is more or less important for modulating neighbor contributions.
 
-		self.gaussian_mu_head = nn.Linear(self.dims[-1], out_channels)
-		self.gaussian_logvar_head = nn.Linear(self.dims[-1], out_channels)
+		self.final_transform = nn.Linear(node_latent_dimension*3 + len(self.feature_list), node_latent_dimension) # final linear transformation after aggregation
 
-	def forward(self, x, edge_index, edge_strength):
-		src, dst = edge_index
+	def forward(self, node_latents, edges, edge_strengths):
+		src, dst = edges
 		EWMC = F.softplus(self.edge_strength_message_coefficient) # coefficeint is positive due to softplus
-		neighborhood_features = x[src] * (1 + EWMC * edge_strength.unsqueeze(-1)) # feature vector of source node modulated by edge strength
-		pooled = self.pool(neighborhood_features) # apply a linear transform
-		pooled = self.LN_pool(pooled) # apply layer normalization
-		pooled = F.relu(pooled) # activation
-		
-		# Aggregate neighbor messages via feature-wise max over neighbors
-		# (for each feature, select the strongest neighbor contribution)
-		aggregate, _ = scatter_max(pooled, dst, dim=0, dim_size=x.size(0))
-		neighborhood = self.final_transform(aggregate)
+		neighborhood_features = node_latents[src] * (1 + EWMC * edge_strengths.unsqueeze(-1)) # feature vector of source node modulated by edge strength
 
-		# Transform to Gaussian parameters
-		mu = self.gaussian_mu_head(neighborhood)
-		logvar = self.gaussian_logvar_head(neighborhood)
-		std = torch.exp(0.5 * logvar)
-		return mu, std
+		self.feature_list.append(scatter_mean(neighborhood_features, dst, dim=0, dim_size=node_latents.size(0))) # mean aggregation of neighbor features
+
+		self.feature_list.append(scatter_std(neighborhood_features, dst, dim=0, dim_size=self.node_latent_dimension)) # deviation from mean for variance calculation
+
+		self.feature_list.append(scatter_logsumexp(neighborhood_features, dst, dim=0, dim_size=self.node_latent_dimension)) # logsumexp aggregation of neighbor features
+
+		combined = torch.cat(self.feature_list, dim=-1) # combine all aggregated features
+
+		final_representation = self.final_transform(combined) # final linear transformation
+		return final_representation
+		
 	
 class NodeEncoder(nn.Module):
 	# Simple MLP encoder that produces Gaussian parameters for each node's latent representation
-	def __init__(self, in_channels, out_channels, dropout=0.0):
+	def __init__(self, input_dimension, layers, output_dimension, dropout=0.0):
 		super().__init__()
-		self.in_channels = in_channels
-		self.out_channels = out_channels
+		self.channels = generate_hidden_dims(input_dimension, layers, output_dimension)
 		self.dropout = dropout
-		self.gaussian_mu_head = nn.Linear(self.in_channels, self.out_channels)
-		self.gaussian_logvar_head = nn.Linear(self.in_channels, self.out_channels)
+		self.transform = build_MLP(self.channels, dropout=dropout, use_layernorm=True)
+		self.gaussian_mu_head = nn.Linear(output_dimension, output_dimension)
+		self.gaussian_logvar_head = nn.Linear(output_dimension, output_dimension)
+
 	def forward(self, x):
+		x = self.transform(x)
 		mu = self.gaussian_mu_head(x)
 		logvar = self.gaussian_logvar_head(x)
 		std = torch.exp(0.5 * logvar)
 		return mu, std
+	
+class NeighborhoodEncoder(nn.Module):
+	def __init__(self, node_latent_dimension, node_actual_degree = None, num_hops = 1):
+		super().__init__()
+		self.node_latent_dimension = node_latent_dimension
+		self.aggregator = NeighborhoodAggregator(node_latent_dimension)
+		self.num_hops = num_hops
+
+	def forward(self, node_latents, edges, edge_strengths):
+		for _ in range(self.num_hops):
+			node_latents = self.aggregator(node_latents, edges, edge_strengths)
+		return node_latents
 
 
 class Decoder(nn.Module):
@@ -147,6 +144,37 @@ class Decoder(nn.Module):
 
 		self.edge_prob_coefficients = SoftplusSimplex(n=3, init=1.0/3.0)
 		self.edge_strength_coefficients = SoftplusSimplex(n=2, init=0.5)
+
+	def Neighborhood_Similarity(self, node_latent, supervision_edges, message_edges, tau=1.0):
+
+		u, v  = supervision_edges
+		sup_edge_id = torch.arange(u.size(0), device=u.device) # unique ID for each supervision edge
+		msg_src, msg_dst = message_edges
+		mask_u_s = torch.isin(msg_dst, u)
+		mask_u_d = torch.isin(msg_src, u)
+		mask_v_s = torch.isin(msg_dst, v)
+		mask_v_d = torch.isin(msg_src, v)
+
+		
+		nbrs_u = torch.cat([msg_src[torch.isin(msg_dst, u)], msg_dst[torch.isin(msg_src, u)]])
+		nbrs_v = torch.cat([msg_src[torch.isin(msg_dst, v)], msg_dst[torch.isin(msg_src, v)]])
+
+		if nbrs_u.size(0) <= nbrs_v.size(0):
+			smaller_nbrhood = nbrs_u
+			larger_nbrhood = nbrs_v
+		else:
+			smaller_nbrhood = nbrs_v
+			larger_nbrhood = nbrs_u
+		log_large = math.log(larger_nbrhood.size(0))
+
+		larger_nbrhood_embeddings = F.normalize(node_latent[larger_nbrhood], dim=1)
+		smaller_nbrhood_embeddings = F.normalize(node_latent[smaller_nbrhood], dim=1)
+
+		nbrs_similarity = smaller_nbrhood_embeddings @ larger_nbrhood_embeddings.t()
+
+		neighborhood_overlap = tau * (torch.logsumexp(nbrs_similarity / tau, dim=1) - log_large) 
+
+		return neighborhood_overlap.mean()
 	
 	def congruence_score(self, nodes_latent, supervision_edges, message_edges, message_edgestr = None, softmax_intensity=10.0):
 		# Computes a congruence score for each supervision (unseen) edge based on whether a similar edge exists among message (seen) edges.
