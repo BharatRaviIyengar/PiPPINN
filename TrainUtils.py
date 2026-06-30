@@ -8,7 +8,7 @@ from torch_scatter import scatter_add, scatter_mean
 from torch_scatter.composite import scatter_softmax
 from warnings import warn
 from pathlib import Path
-from max_nbr import max_nbr
+from NeighborhoodRestriction import restrict_neighborhood
 
 def generate_hidden_dims(input_dim, depth, last_layer_size):
 	n_layers = depth - 1  # intermediate layers count (excluding first)
@@ -89,7 +89,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			  negative_edges=None,
 			  negative_batch_size=None,
 			  supervision_fraction = 0.3,
-			  max_neighbors = 30,
+			  max_neighbors = 60,
 			  frac_sample_from_unsampled=0.1,
 			  nbr_weight_intensity=1.0,
 			  device=None,
@@ -432,49 +432,46 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		src, dst = self.bidirectional_message_edges 
 		
 		# Compute degrees for message nodes  
-		degrees = degree(src, num_nodes = src.max()+1)  
-		deg_src = degrees[src]  
-		deg_dst = degrees[dst]
+		degrees = degree(src, num_nodes = src.max()+1) 
+
+		final_message_edges, neighborhood_matrix, neighborhood_weights = restrict_neighborhood(self.bidirectional_message_edges, degrees, self.final_message_mask, edge_weights=self.message_edgewts, intensity= self.nbr_weight_intensity, max_neighbors=self.max_neighbors, nthreads=self.threads)
+
+		# deg_src = degrees[src]  
+		# deg_dst = degrees[dst]
 		
-		# Determine neighbor weights based on source and destination degrees
-		weights = deg_src / deg_dst 
-		# Augment neighbor weights with edge weights if available
-		if self.edge_attr is not None:
-			weights.mul_(self.message_edgewts)
+		# # Determine neighbor weights based on source and destination degrees
+		# weights = deg_src / deg_dst 
+		# # Augment neighbor weights with edge weights if available
+		# if self.edge_attr is not None:
+		# 	weights.mul_(self.message_edgewts)
 
-		# Intensify or dampen neighbor weights
-		weights.pow_(self.nbr_weight_intensity)
+		# # Intensify or dampen neighbor weights
+		# weights.pow_(self.nbr_weight_intensity)
 
-		# Identify violators (nodes with degree greater than max_neighbors)
-		violators_mask = deg_dst > self.max_neighbors  
-		# violator_dst_nodes = torch.unique(dst[violators_mask]) 
+		# # Identify violators (nodes with degree greater than max_neighbors)
+		# violators_mask = deg_dst > self.max_neighbors  
+		# # violator_dst_nodes = torch.unique(dst[violators_mask]) 
 
-		# Mark non-violators as True in final_message_mask
-		self.final_message_mask[~violators_mask] = True  
+		# # Mark non-violators as True in final_message_mask
+		# self.final_message_mask[~violators_mask] = True  
 
-		self.final_message_mask |= max_nbr(dst, weights, violators_mask, self.max_neighbors, nthreads=self.threads)
+		# self.final_message_mask |= max_nbr(dst, weights, violators_mask, self.max_neighbors, nthreads=self.threads)
 
-		# for d in violator_dst_nodes:  
-		# 	edge_indices = (dst == d).nonzero(as_tuple=False).view(-1)  
-		# 	w = weights[edge_indices]  
-		# 	sampled = torch.multinomial(w, self.max_neighbors, replacement=False)  
-		# 	self.final_message_mask[sampled] = True   
-
-		final_message_edges = self.bidirectional_message_edges[:,self.final_message_mask]  
+		# final_message_edges = self.bidirectional_message_edges[:,self.final_message_mask]  
 
 		# Create a PyG Data object  
 		batch = Data(  
 			message_edges = final_message_edges,  
 			supervision_edges = remapped_edge_index[:, -self.num_all_sup_edges:], 
 			supervision_labels = self.supervision_labels,  
-			supervision_importance = self.supervision_importance  
+			supervision_importance = self.supervision_importance,
+			neighborhood_matrix = neighborhood_matrix,
+			neighborhood_weights = neighborhood_weights
 		).to(self.device)
 		if self.node_embeddings is not None:  
 			batch.node_features = self.node_embeddings[self.node_mask, :].to(self.device)
 
-			
 		# Assign edge weights to the batch (if available, otherwise zero)
-		batch.message_edgewts = self.message_edgewts[self.final_message_mask]  
 		batch.supervision_edgewts = self.supervision_edgewts
 
 		return batch  

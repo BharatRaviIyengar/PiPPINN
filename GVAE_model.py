@@ -64,36 +64,6 @@ class MonotoneMap(nn.Module):
 		h = self.layers[-1](h)
 		return h
 
-
-class NeighborhoodAggregator(nn.Module):
-	def __init__(self, node_latent_dimension, node_actual_degree = None):
-		super().__init__()
-		self.feature_list = []
-		self.node_latent_dimension = node_latent_dimension
-		if node_actual_degree is not None:
-			self.feature_list.append(node_actual_degree.unsqueeze(-1))
-
-		self.edge_strength_message_coefficient = nn.Parameter(torch.tensor(0.5)) # a learnable global coefficient that determines how much edge strength should modulate the message from a neighbor. Initialized to 0.5, meaning that initially we allow edge strength to increase the neighbor's contribution by up to 50%. The model can learn to adjust this coefficient based on the data, potentially learning that edge strength is more or less important for modulating neighbor contributions.
-
-		self.final_transform = nn.Linear(node_latent_dimension*3 + len(self.feature_list), node_latent_dimension) # final linear transformation after aggregation
-
-	def forward(self, node_latents, edges, edge_strengths):
-		src, dst = edges
-		EWMC = F.softplus(self.edge_strength_message_coefficient) # coefficeint is positive due to softplus
-		neighborhood_features = node_latents[src] * (1 + EWMC * edge_strengths.unsqueeze(-1)) # feature vector of source node modulated by edge strength
-
-		self.feature_list.append(scatter_mean(neighborhood_features, dst, dim=0, dim_size=node_latents.size(0))) # mean aggregation of neighbor features
-
-		self.feature_list.append(scatter_std(neighborhood_features, dst, dim=0, dim_size=self.node_latent_dimension)) # deviation from mean for variance calculation
-
-		self.feature_list.append(scatter_logsumexp(neighborhood_features, dst, dim=0, dim_size=self.node_latent_dimension)) # logsumexp aggregation of neighbor features
-
-		combined = torch.cat(self.feature_list, dim=-1) # combine all aggregated features
-
-		final_representation = self.final_transform(combined) # final linear transformation
-		return final_representation
-		
-	
 class NodeEncoder(nn.Module):
 	# Simple MLP encoder that produces Gaussian parameters for each node's latent representation
 	def __init__(self, input_dimension, layers, output_dimension, dropout=0.0):
@@ -111,19 +81,6 @@ class NodeEncoder(nn.Module):
 		std = torch.exp(0.5 * logvar)
 		return mu, std
 	
-class NeighborhoodEncoder(nn.Module):
-	def __init__(self, node_latent_dimension, node_actual_degree = None, num_hops = 1):
-		super().__init__()
-		self.node_latent_dimension = node_latent_dimension
-		self.aggregator = NeighborhoodAggregator(node_latent_dimension)
-		self.num_hops = num_hops
-
-	def forward(self, node_latents, edges, edge_strengths):
-		for _ in range(self.num_hops):
-			node_latents = self.aggregator(node_latents, edges, edge_strengths)
-		return node_latents
-
-
 class Decoder(nn.Module):
 	def __init__(self, in_channels, hidden_channels, dropout=0.0):
 		super().__init__()
@@ -144,138 +101,105 @@ class Decoder(nn.Module):
 
 		self.edge_prob_coefficients = SoftplusSimplex(n=3, init=1.0/3.0)
 		self.edge_strength_coefficients = SoftplusSimplex(n=2, init=0.5)
+		self.trasitivity_sharpness = 1.0
+		self.congruence_sharpness = 1.0
 
-	def Neighborhood_Similarity(self, node_latent, supervision_edges, message_edges, tau=1.0):
+	def Transitivity_and_Congruence(self, node_latent, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix):
+		'''
+		Compute the likelihood of edge existence and strength based on transitivity and congruence.
+
+		Transitivity is determined by neighborhood similarity i.e. if u and v have similar neighbors, they are more likely to be connected.
+
+		Congruence is determined by the similarity of u and v to each other's neighbors i.e. if u is similar to v's neighbors and v is similar to u's neighbors, they are more likely to be connected.
+		'''
 
 		u, v  = supervision_edges
-		sup_edge_id = torch.arange(u.size(0), device=u.device) # unique ID for each supervision edge
-		msg_src, msg_dst = message_edges
-		mask_u_s = torch.isin(msg_dst, u)
-		mask_u_d = torch.isin(msg_src, u)
-		mask_v_s = torch.isin(msg_dst, v)
-		mask_v_d = torch.isin(msg_src, v)
+		nbrs_u = neighborhood_matrix[u] # neighbors of u
+		nbrs_v = neighborhood_matrix[v] # neighbors of v
+
+		nbrs_u_mask = (nbrs_u != -1) # mask for valid neighbors of u
+		nbrs_v_mask = (nbrs_v != -1) # mask for valid neighbors of v
+
+		# Replace invalid neighbor indices with 0 to avoid indexing errors 
+		nbrs_u_safe = nbrs_u.clamp_min(0)
+		nbrs_v_safe = nbrs_v.clamp_min(0)
+
+		latents_Nu = F.normalize(node_latent[nbrs_u_safe], p=2, dim=1) # latent features of neighbors of u
+		latents_Nv = F.normalize(node_latent[nbrs_v_safe], p=2, dim=1) # latent features of neighbors of v
+
+		latents_u	= F.normalize(node_latent[u], p=2, dim=1).unsqueeze(1) # latent features of u
+		latents_v	= F.normalize(node_latent[v], p=2, dim=1).unsqueeze(1) # latent features of v
+
+		# Calculate pairwise cosine similarity between neighbors of u and neighbors of v (Transitivity)
+		
+		nsim = torch.bmm(latents_Nu, latents_Nv.transpose(1, 2)) # shape: (num_edges, max_neighbors, max_neighbors)
+
+		# Mask out invalid pairs of neighbors (i.e., where either neighbor is invalid)
+
+		pair_mask = nbrs_u_mask.unsqueeze(2) & nbrs_v_mask.unsqueeze(1) # shape: (num_edges, max_neighbors, max_neighbors)
+		nsim.masked_fill_(~pair_mask, float('-inf')) # mask out invalid pairs
 
 		
-		nbrs_u = torch.cat([msg_src[torch.isin(msg_dst, u)], msg_dst[torch.isin(msg_src, u)]])
-		nbrs_v = torch.cat([msg_src[torch.isin(msg_dst, v)], msg_dst[torch.isin(msg_src, v)]])
+		# Compute the neighborhood similarity scores for u and v based on their neighbors' similarities
+		# LogSumExp is used to aggregate the similarity scores such that higher similarity scores dominate the aggregation, while still allowing for contributions from lower scores.
+		# This is biologically reasonable as it allows for the possibility that even if most neighbors are dissimilar, a few highly similar neighbors can still indicate a strong relationship.
 
-		if nbrs_u.size(0) <= nbrs_v.size(0):
-			smaller_nbrhood = nbrs_u
-			larger_nbrhood = nbrs_v
-		else:
-			smaller_nbrhood = nbrs_v
-			larger_nbrhood = nbrs_u
-		log_large = math.log(larger_nbrhood.size(0))
+		Nu_to_Nv = self.transitivity_sharpness * torch.logsumexp(nsim / self.transitivity_sharpness, dim=2)  # [num_edges, max_nbrs]
+		Nv_to_Nu = self.transitivity_sharpness * torch.logsumexp(nsim / self.transitivity_sharpness, dim=1)  # [num_edges, max_nbrs]
 
-		larger_nbrhood_embeddings = F.normalize(node_latent[larger_nbrhood], dim=1)
-		smaller_nbrhood_embeddings = F.normalize(node_latent[smaller_nbrhood], dim=1)
+		num_Nu = nbrs_u_mask.sum(dim=1).clamp_min(1)
+		num_Nv = nbrs_v_mask.sum(dim=1).clamp_min(1)
 
-		nbrs_similarity = smaller_nbrhood_embeddings @ larger_nbrhood_embeddings.t()
+		score_u = Nu_to_Nv.sum(dim=1) / num_Nu
+		score_v = Nv_to_Nu.sum(dim=1) / num_Nv
 
-		neighborhood_overlap = tau * (torch.logsumexp(nbrs_similarity / tau, dim=1) - log_large) 
+		# Determine the neighborhood score based on the number of neighbors for u and v. The score is taken from the node with fewer neighbors to avoid biasing towards nodes with more neighbors, which could artificially deflate similarity scores.
+		neighborhood_score = torch.where(num_Nu <= num_Nv, score_u, score_v)
 
-		return neighborhood_overlap.mean()
-	
-	def congruence_score(self, nodes_latent, supervision_edges, message_edges, message_edgestr = None, softmax_intensity=10.0):
-		# Computes a congruence score for each supervision (unseen) edge based on whether a similar edge exists among message (seen) edges.
-		# The intuition is that if node Y interacts with node Z, and if node Z has similar latent features as node X, then X & Y are likely to interact. That is, X is congruent with known neighbors of Y, which increases the likelihood of an X-Y interaction.
+		# Perform pairwise cosine similarity between u and neighbors of v, and v and neighbors of u (Congruence)
 
-		msg_src, msg_dst = message_edges
-		sup_src, sup_dst = supervision_edges
-		device = nodes_latent.device
-		N = nodes_latent.size(0) # total number of nodes
+		sim_u_to_Nv = torch.bmm(latents_u, latents_Nv.transpose(1, 2)).squeeze(1) # shape: (num_edges, max_neighbors)
+		sim_v_to_Nu = torch.bmm(latents_v, latents_Nu.transpose(1, 2)).squeeze(1) # shape: (num_edges, max_neighbors)
 
-		# Step 1: Build directed supervision pairs (edges are by default undirected in a PPI graph)
-		sup_query = torch.cat([sup_src, sup_dst])   # Xs
-		sup_partner = torch.cat([sup_dst, sup_src]) # Ys
-		M = sup_query.size(0) # total number of directed supervision edges (twice the number of undirected edges)
+		combined_mask = torch.cat([nbrs_v_mask, nbrs_u_mask], dim=1) # shape: (num_edges, 2*max_neighbors)
 
-		# Step 2: Gather message neighbors of each Y
-		mask = torch.isin(msg_dst, sup_partner)
+		combined_sim = torch.cat([sim_u_to_Nv, sim_v_to_Nu], dim=1) # shape: (num_edges, 2*max_neighbors)
 
-		msg_neighbors = msg_src[mask]      # Z => neighbors of Y
-		msg_partner = msg_dst[mask]        # Y
+		combined_edge_strengths = torch.cat([neighborhood_strength_matrix[u], neighborhood_strength_matrix[v]], dim=1) # shape: (num_edges, 2*max_neighbors)
+		
+		combined_sim.masked_fill_(~combined_mask, float('-inf')) # mask out invalid pairs
 
-		# Step 3: Map partner nodes Y -> directed supervision index
-		# Each sup_partner appears in sup_query/sup_partner pairs
+		# Compute attention weights using softmax over the combined similarity scores, scaled by temperature tau. This allows the model to focus on the most relevant neighbor pairs when aggregating information for edge existence and strength predictions. A softmax is better choice than logsumexp here because we just want to find one good evidence of a congruent neighbor pair, rather than aggregating all the evidence. The softmax will assign higher weights to the most similar pairs, while still allowing for contributions from less similar pairs.
 
-		partner_index = torch.full((N,), -1, device=device)
-		partner_index[sup_partner] = torch.arange(M, device=device) # Map the index of a node Y in the set N to the index of all supervision edges (X,Y for all X) in the set M. Nodes that do not appear as Y get a value of -1.  
+		attention = torch.softmax(combined_sim / self.congruence_sharpness, dim=1)
 
-		msg_partner_idx = partner_index[msg_partner] # For each message edge (Z,Y), get the index of the corresponding supervision edge (X,Y) that shares the same Y. This creates an alignment between message edges and supervision edges based on their shared partner node Y.
+		combined_sim.masked_fill_(~combined_mask, 0.0) # set invalid pairs to 0 for aggregation
 
-		# Step 4: Count how many message neighbors per supervision query
-		neighbor_count = scatter_add(
-			torch.ones_like(msg_partner_idx),
-			msg_partner_idx,
-			dim=0,
-			dim_size=M
-		)
+		combined_edge_strengths.masked_fill_(~combined_mask, 0.0) # set invalid pairs to 0 for aggregation
 
-		# Step 5: Expand sup_query nodes (global indices) to align with neighbors
-		# For example, if Y has 3 neighbors (Z1, Z2, Z3) in the message edges, we will have 3 rows comparing X to each of those 3 neighbors. This allows us to compute similarity between each neighbor and the supervision query node X.
+		congruence_score = (attention*combined_sim).sum(dim=1)
 
-		expanded_queries = sup_query.repeat_interleave(neighbor_count)
+		# Translate the neighborhood similarity and congruence scores into edge existence probabilities and edge strengths using the learnable monotonic mappings. This ensures that higher similarity scores always correspond to higher probabilities and strengths, while allowing the model to learn the optimal nonlinear mapping from similarity to edge properties.
 
-		# Step 6: Compute similarity: supervised node (X) vs message neighbors (Zs)
-		cosine_sim = cosim(
-			nodes_latent[expanded_queries],	# X
-			nodes_latent[msg_neighbors],	# Z
-			dim=-1
-		)
+		ExistenceByTransitivity = self.monomap_EdgeExistence_NbrSimilarity(neighborhood_score.unsqueeze(-1)).squeeze(-1)
+		ExistenceByCongruence = self.monomap_EdgeExistence_Congruence(congruence_score.unsqueeze(-1)).squeeze(-1)
+		StrengthByCongruence = self.monomap_EdgeStrength_Congruence(congruence_score.unsqueeze(-1)).squeeze(-1) * combined_edge_strengths
 
-		# Step 7: Logsumexp per supervision query node
-		# We want to give the highest attention to the node Z that is most similar to X and ignore those that are not similar. By exponentiating the cosine similarity, we amplify the contribution of similar neighbors and diminish that of dissimilar neighbors. The softmax_intensity parameter controls how much more weight we give to the most similar neighbor compared to others. A higher value means we focus more on the single most similar neighbor, while a lower value means we consider a broader set of neighbors.
+		return ExistenceByTransitivity, ExistenceByCongruence, StrengthByCongruence
 
-		weights = scatter_softmax(
-			softmax_intensity * cosine_sim,
-			expanded_queries,
-			dim=0
-		)
+	def forward(self, nodes_latent, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix):
 
-		# Step 8: Aggregate to one congruence score per node based on the softmax attention weights. If any neighbor Z is very similar to X, then the congruence score will be high. If no neighbors are similar to X, then the congruence score will be low.
-		congruence_node = scatter_sum(
-			weights*cosine_sim,
-			expanded_queries,
-			dim=0,
-			dim_size=N
-		)
-
-		# Step 9: Map back to supervision edges
-		# Combine congruence evidence for both nodes in the supervision edge.
-		congruence_edge = torch.stack([congruence_node[sup_src], congruence_node[sup_dst]], dim=0)
-		final_weights = torch.softmax(softmax_intensity*congruence_edge, dim=0)
-		ExistenceByCongruence = torch.sum(final_weights * congruence_edge, dim=0)
-		ExistenceByCongruence = self.monomap_EdgeExistence_Congruence(ExistenceByCongruence.unsqueeze(-1)).squeeze(-1)
-
-		# Step 10 (optional): Calculate the strength of the supervision edge based on the strength of the most congruent message edge. If message_edgestr is not provided, we skip this step and just return the existence score based on congruence. The monotonic map ensures that more similar a node Z is to X, the higher the contribution of Z's edge strength to the predicted strength of the supervision edge (X,Y). 
-
-		if message_edgestr is not None:
-			weighted_edges = self.monomap_EdgeStrength_Congruence(cosine_sim) * message_edgestr[mask]
-			edge_strength_node = scatter_mean(
-				weighted_edges,
-				expanded_queries,
-				dim=0,
-				dim_size=N
-			)
-			StrengthByCongruence = edge_strength_node[sup_src] + edge_strength_node[sup_dst]
-			return ExistenceByCongruence, StrengthByCongruence.squeeze(-1)
-		else:
-			return ExistenceByCongruence
-
-	def forward(self, nodes_latent, nbrs_latent, supervision_edges, message_edges=None, message_edgestr=None):
 		u, v  = supervision_edges
 		additive = nodes_latent[u] + nodes_latent[v]
 		multiplicative = nodes_latent[u] * nodes_latent[v]
 		combined = torch.cat([additive, multiplicative], dim=-1)
 		edge_features = self.edge_embedder(combined)
-		nbrs_similarity = torch.sum(nbrs_latent[u] * nbrs_latent[v], dim=-1, keepdim=True)
-		ExistenceByCongruence, StrengthByCongruence = self.congruence_score(nodes_latent, supervision_edges, message_edges, message_edgestr)
-		ExistenceByNbrSimilarity = self.monomap_EdgeExistence_NbrSimilarity(nbrs_similarity)
+
+		ExistenceByTransitivity, ExistenceByCongruence, StrengthByCongruence = self.Transitivity_and_Congruence(nodes_latent, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix)
 
 		ExistenceViaDecoder = self.edge_prob_head(edge_features).squeeze(-1)
 
-		edge_prob_logits =  ExistenceByCongruence + ExistenceByNbrSimilarity  + ExistenceViaDecoder
+		edge_prob_logits =  ExistenceByCongruence + ExistenceByTransitivity  + ExistenceViaDecoder
 
 		StrengthViaDecoder = F.relu(self.edge_wt_head(edge_features).squeeze(-1))
 
@@ -283,7 +207,7 @@ class Decoder(nn.Module):
 
 		individual_contributions = {
 			"ExistenceByCongruence": ExistenceByCongruence.detach().cpu(),
-			"ExistenceByNbrSimilarity": ExistenceByNbrSimilarity.detach().cpu(),
+			"ExistenceByTransitivity": ExistenceByTransitivity.detach().cpu(),
 			"ExistenceViaDecoder": ExistenceViaDecoder.detach().cpu(),
 			"StrengthByCongruence": StrengthByCongruence.detach().cpu(),
 
@@ -302,7 +226,6 @@ class GVAE_Model(nn.Module):
 				 dropout=0.0):
 		super().__init__()
 		self.node_encoder = NodeEncoder(node_in_channels, node_latent_channels, dropout)
-		self.neighborhood_encoder = NeighborhoodEncoder(nbr_in_channels, nbr_hidden_channels, nbr_latent_channels, dropout)
 		self.decoder = Decoder(node_latent_channels, decoder_hidden_channels, dropout)
 
 	def forward(self, x, supervision_edges, message_edges, message_edgestr):

@@ -55,6 +55,37 @@ at::Tensor max_nbr(
 	return sampled_mask;
 }
 
+at::Tensor generate_neighborhood(
+	torch::Tensor nodes_in_batch,
+	torch::Tensor message_edges,
+	int64_t max_neighbors = 30,
+	int64_t nthreads = 1
+){
+	
+	TORCH_CHECK(message_edges.dim() == 2 && message_edges.size(0) == 2, "message_edges must be a 2D tensor with shape [2, num_edges]");
+	TORCH_CHECK(message_edges.dtype() == torch::kInt64, "message_edges must be int64");
+
+	auto message_edges_cpu = message_edges.cpu();
+
+	int64_t maxindex = message_edges_cpu.max().item<int64_t>();
+	TORCH_CHECK(maxindex < nodes_in_batch.size(0), "message_edges contains indices that exceed the number of nodes in the batch");
+
+	torch::Tensor neighborhood = torch::full({nodes_in_batch.size(0), max_neighbors}, -1, torch::dtype(torch::kInt64).device(message_edges_cpu.device()));
+
+	torch::Tensor current_index = torch::zeros({nodes_in_batch.size(0)}, torch::dtype(torch::kInt64).device(message_edges_cpu.device()));
+
+	omp_set_num_threads(nthreads);
+	#pragma omp parallel for
+	for (int64_t i = 0; i < message_edges_cpu.size(1); ++i) {
+		int64_t src = message_edges_cpu[0][i].item<int64_t>();
+		int64_t j = current_index[src].item<int64_t>();
+		neighborhood[src][j] = message_edges_cpu[1][i];
+		current_index[src] += 1;
+	}
+
+	return neighborhood;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	m.def("max_nbr", &max_nbr,
 		"Maximum neighborhood restriction",
