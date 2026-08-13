@@ -1,5 +1,3 @@
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -42,7 +40,6 @@ class MonotoneMap(nn.Module):
 		"""
 		dims: list of layer sizes, e.g., [1, 8, 8, 1] for 1D input/output
 		activation: monotone increasing activation
-		dropout: dropout rate
 		"""
 		super().__init__()
 		assert dims[0] == 1 and dims[-1] == 1, "Input and output must be 1D"
@@ -101,7 +98,7 @@ class Decoder(nn.Module):
 
 		self.edge_prob_coefficients = SoftplusSimplex(n=3, init=1.0/3.0)
 		self.edge_strength_coefficients = SoftplusSimplex(n=2, init=0.5)
-		self.trasitivity_sharpness = 1.0
+		self.transitivity_sharpness = 1.0
 		self.congruence_sharpness = 1.0
 
 	def Transitivity_and_Congruence(self, node_latent, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix):
@@ -163,6 +160,9 @@ class Decoder(nn.Module):
 
 		combined_mask = torch.cat([nbrs_v_mask, nbrs_u_mask], dim=1) # shape: (num_edges, 2*max_neighbors)
 
+		assert combined_mask.any(dim=1).all(), \
+    "Congruence calculation requires at least one valid neighbor per supervision edge."
+
 		combined_sim = torch.cat([sim_u_to_Nv, sim_v_to_Nu], dim=1) # shape: (num_edges, 2*max_neighbors)
 
 		combined_edge_strengths = torch.cat([neighborhood_strength_matrix[u], neighborhood_strength_matrix[v]], dim=1) # shape: (num_edges, 2*max_neighbors)
@@ -177,13 +177,22 @@ class Decoder(nn.Module):
 
 		combined_edge_strengths.masked_fill_(~combined_mask, 0.0) # set invalid pairs to 0 for aggregation
 
-		congruence_score = (attention*combined_sim).sum(dim=1)
+		# Per-neighbor congruence evidence
+		congruence_contributions = attention * combined_sim
+
+		# Scalar evidence for edge existence
+		congruence_score = congruence_contributions.sum(dim=1)
+
+		# Strength evidence, preserving the same local congruence structure
+		congruence_strength = (
+				congruence_contributions * combined_edge_strengths
+		).sum(dim=1)
 
 		# Translate the neighborhood similarity and congruence scores into edge existence probabilities and edge strengths using the learnable monotonic mappings. This ensures that higher similarity scores always correspond to higher probabilities and strengths, while allowing the model to learn the optimal nonlinear mapping from similarity to edge properties.
 
 		ExistenceByTransitivity = self.monomap_EdgeExistence_NbrSimilarity(neighborhood_score.unsqueeze(-1)).squeeze(-1)
 		ExistenceByCongruence = self.monomap_EdgeExistence_Congruence(congruence_score.unsqueeze(-1)).squeeze(-1)
-		StrengthByCongruence = self.monomap_EdgeStrength_Congruence(congruence_score.unsqueeze(-1)).squeeze(-1) * combined_edge_strengths
+		StrengthByCongruence = self.monomap_EdgeStrength_Congruence(congruence_strength.unsqueeze(-1)).squeeze(-1)
 
 		return ExistenceByTransitivity, ExistenceByCongruence, StrengthByCongruence
 
@@ -210,7 +219,7 @@ class Decoder(nn.Module):
 			"ExistenceByTransitivity": ExistenceByTransitivity.detach().cpu(),
 			"ExistenceViaDecoder": ExistenceViaDecoder.detach().cpu(),
 			"StrengthByCongruence": StrengthByCongruence.detach().cpu(),
-
+			"StrengthViaDecoder": StrengthViaDecoder.detach().cpu()
 		}
 		return edge_prob_logits, edge_strengths, individual_contributions
 	
@@ -220,30 +229,26 @@ def reparameterize(mu, std):
 
 
 class GVAE_Model(nn.Module):
-	def __init__(self, node_in_channels, node_latent_channels,
-				 nbr_in_channels, nbr_hidden_channels, nbr_latent_channels,
+	def __init__(self, node_in_channels, layers, node_latent_channels,
 				 decoder_hidden_channels,
 				 dropout=0.0):
 		super().__init__()
-		self.node_encoder = NodeEncoder(node_in_channels, node_latent_channels, dropout)
+		self.node_encoder = NodeEncoder(node_in_channels, layers, node_latent_channels, dropout)
 		self.decoder = Decoder(node_latent_channels, decoder_hidden_channels, dropout)
 
-	def forward(self, x, supervision_edges, message_edges, message_edgestr):
+	def forward(self, x, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix):
 		# Encode nodes
 		node_mu, node_std = self.node_encoder(x)
 		nodes_latent = reparameterize(node_mu, node_std)
 
-		# Encode neighborhoods
-		nbr_mu, nbr_std = self.neighborhood_encoder(x, message_edges, message_edgestr)
-		nbrs_latent = reparameterize(nbr_mu, nbr_std)
-
 		# Decode edges
-		edge_prob_logits, edge_strengths, edge_individal_contributions = self.decoder(
+		edge_prob_logits, edge_strengths, edge_contributions = self.decoder(
 			nodes_latent,
-			nbrs_latent,
-			supervision_edges
+			supervision_edges,
+			neighborhood_matrix,
+			neighborhood_strength_matrix
 		)
-		return node_mu, node_std, nbr_mu, nbr_std, edge_prob_logits, edge_strengths, edge_individal_contributions
+		return edge_prob_logits, edge_strengths, edge_contributions, node_mu, node_std
 	
 def KL_loss(mu, std):
 	num_nodes = mu.size(0)
