@@ -1,16 +1,22 @@
-from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CppExtension #, CUDAExtension, CUDA_HOME
+from pathlib import Path
 
-def get_extension():
-	return CppExtension(
-			'NeighborhoodRestriction',  # name of the extension
-			sources=['Neighborhood_restriction.cpp'],
-			extra_compile_args=['-O3', '-fopenmp'],
-			extra_link_args=['-fopenmp']
-		)
+from setuptools import setup
+from torch.utils.cpp_extension import BuildExtension, CppExtension
+
+
+ROOT = Path(__file__).resolve().parent
+
 
 setup(
-	name='NeighborhoodRestriction',
-	ext_modules=[get_extension()],
-	cmdclass={'build_ext': BuildExtension}
+	name="pippinn-neighborhood-restriction",
+	version="0.1.0",
+	ext_modules=[
+		CppExtension(
+			name="NeighborhoodRestriction",
+			sources=[str(ROOT / "Neighborhood_restriction.cpp")],
+			extra_compile_args=["-O3", "-std=c++17", "-fopenmp"],
+			extra_link_args=["-fopenmp"],
+		)
+	],
+	cmdclass={"build_ext": BuildExtension},
 )
