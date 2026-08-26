@@ -1,201 +1,179 @@
-#include <ATen/ATen.h>
-#include <torch/torch.h>
 #include <omp.h>
 #include <torch/extension.h>
-#include <vector>
 #include <tuple>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <cstdint>
 
-// This function samples a maximum of `max_neighbors` neighbors for each unique destination node in `dst`, based on the provided `weights`. It returns a boolean mask indicating which edges are selected.
-
-at::Tensor max_nbr(
-	torch::Tensor dst, // Destination nodes for each edge
-	torch::Tensor weights, // Weights for each edge, used for sampling
-	torch::Tensor violators_mask, // Boolean mask indicating which edges have destination nodes with more than `max_neighbors` edges
-	int64_t max_neighbors = 60, // Maximum number of neighbors to sample for each destination node
-	int64_t nthreads = 1 // Number of threads to use for parallel processing during maximum neighbor sampling
-) {
-
-	TORCH_CHECK(dst.dim() == 1 && weights.dim() == 1, "dst and weights must be 1D");
-	TORCH_CHECK(dst.size(0) == weights.size(0), "dst and weights must be same size");
-	TORCH_CHECK(dst.dtype() == torch::kInt64, "dst must be int64");
-	TORCH_CHECK(weights.dtype() == torch::kFloat32 || weights.dtype() == torch::kFloat64, "weights must be float32/float64");
-
-
-	torch::Device device = dst.device();
-	weights = weights.to(device);
-
-	auto options = torch::TensorOptions().dtype(torch::kBool).device(device);
-	torch::Tensor sampled_mask = torch::zeros({dst.size(0)}, options);
-
-	auto unique_dst = std::get<0>(at::_unique(dst.masked_select(violators_mask), /*sorted=*/false)).cpu(); // Get unique destination nodes that violate the max_neighbors constraint
-	const int64_t num_dst = unique_dst.size(0);
-
-	omp_set_num_threads(nthreads);
-	#pragma omp parallel for
-	for (int64_t i = 0; i < num_dst; ++i) {
-		int64_t d = unique_dst[i].item<int64_t>();
-		auto indices = torch::nonzero(dst == d).view(-1); // Get indices of edges that have destination node `d`
-		if (indices.numel() == 0) continue;
-
-		auto w = weights.index_select(0, indices); // Get weights for edges with destination node `d`
-
-		// int64_t k = std::min(max_neighbors, indices.size(0)); WE DONT NEED THIS LINE, WE ALREADY HAVE A VIOLATORS MASK, SO WE KNOW THAT THE NUMBER OF EDGES IS GREATER THAN MAX_NEIGHBORS
-
-		auto sampled = torch::multinomial(w, max_neighbors, /*replacement=*/false); // Sample `max_neighbors` neighbors based on weights
-		auto global_sampled = indices.index_select(0, sampled); // Get the global indices of the sampled neighbors
-		sampled_mask.index_fill_(0, global_sampled, true); // Update the sampled_mask to indicate which edges are selected
-	}
-
-	return sampled_mask.to(device); // Return the sampled mask on the same device as the input tensors
-}
-
-at::Tensor generate_neighborhood(
-	int64_t num_nodes_in_batch,
-	torch::Tensor message_edges,
-    c10::optional<torch::Tensor> edge_weights_opt = c10::nullopt,
+std::tuple<torch::Tensor, torch::Tensor>
+restrict_neighborhood(
+	torch::Tensor bidirectional_message_edges,
+	torch::Tensor node_degrees,
+	torch::Tensor edge_strength,
+	float intensity = 1.0,
 	int64_t max_neighbors = 60,
 	int64_t nthreads = 1
-){	
-	auto message_edges_cpu = message_edges.cpu();
+) {
+	TORCH_CHECK(
+		bidirectional_message_edges.dim() == 2 &&
+		bidirectional_message_edges.size(0) == 2 &&
+		bidirectional_message_edges.dtype() == torch::kInt64,
+		"bidirectional_message_edges must be a 2D integer tensor with shape [2, num_edges]"
+	);
 
-	int64_t maxindex = message_edges_cpu.max().item<int64_t>();
-	TORCH_CHECK(maxindex < num_nodes_in_batch, "message_edges contains indices that exceed the number of nodes in the batch");
+	TORCH_CHECK(
+		node_degrees.dim() == 1,
+		"node_degrees must be 1D"
+	);
 
-	torch::Tensor neighborhood = torch::full({num_nodes_in_batch, max_neighbors}, -1, torch::dtype(torch::kInt64).device(message_edges_cpu.device())); // Initialize neighborhood tensor with -1, indicating no neighbor
+	TORCH_CHECK(
+		edge_strength.dim() == 1 &&
+		edge_strength.size(0) == bidirectional_message_edges.size(1),
+		"edge_strength must be 1D with length num_edges"
+	);
 
-    if (edge_weights_opt.has_value()) {
-        auto edge_weights = edge_weights_opt.value();
-        TORCH_CHECK(
-            edge_weights.dim() == 1 &&
-            edge_weights.size(0) == message_edges_cpu.size(1),
-            "edge_weights must be 1D with length num_edges"
-        );
-        torch::Tensor edge_weight_matrix = torch::full({num_nodes_in_batch, max_neighbors}, -1.0, torch::dtype(torch::kFloat32).device(message_edges_cpu.device())); // Initialize edge weight matrix with -1.0
-    }
+	TORCH_CHECK(
+		max_neighbors > 0 && nthreads > 0 && std::isfinite(intensity),
+		"max_neighbors and nthreads must be positive, intensity must be finite"
+	);
 
-	torch::Tensor current_index = torch::zeros({num_nodes_in_batch}, torch::dtype(torch::kInt64).device(message_edges_cpu.device())); // Initialize a tensor to keep track of the current neighbor index for each node in the batch
+	auto int64_options = torch::TensorOptions()
+		.device(torch::kCPU)
+		.dtype(torch::kInt64);
 
-	for (int64_t i = 0; i < message_edges_cpu.size(1); ++i) {
-		int64_t src = message_edges_cpu[0][i].item<int64_t>();
-		int64_t j = current_index[src].item<int64_t>();
-		if (j < max_neighbors){
-			neighborhood[src][j] = message_edges_cpu[1][i];
-            if (edge_weights_opt.has_value()) {
-                edge_weight_matrix[src][j] = edge_weights[i];
-            }
-			current_index[src] += 1;
-		}
-		
+	auto float_options = torch::TensorOptions()
+			.device(torch::kCPU)
+			.dtype(torch::kFloat32);
+
+	const auto output_device = bidirectional_message_edges.device();
+	const int64_t num_nodes = node_degrees.size(0);
+	const int64_t num_edges = bidirectional_message_edges.size(1);
+
+	auto edges = bidirectional_message_edges.cpu().contiguous();
+	auto edge_str = edge_strength.to(float_options).contiguous();
+	auto degrees = node_degrees.to(int64_options).contiguous();
+
+	
+
+	// Offsets for grouping edges by destination node, used for efficient neighbor sampling
+	auto offsets = torch::zeros({degrees.size(0) + 1}, int64_options);
+	offsets.slice(0,1).copy_(degrees.cumsum(0));
+
+	// auto src = edges[0];
+	// auto dst = edges[1];
+	
+	// Get raw pointers to the data of the tensors for efficient access in the following computations
+	
+	const auto* edges_ptr = edges.data_ptr<int64_t>();
+	const auto* edge_str_ptr = edge_str.data_ptr<float>();
+	const auto* degrees_ptr = degrees.data_ptr<int64_t>();
+	const auto* offsets_ptr = offsets.data_ptr<int64_t>();
+
+	const auto* src_ptr = edges_ptr;
+	const auto* dst_ptr = edges_ptr + num_edges;
+
+	TORCH_CHECK(
+    offsets_ptr[num_nodes] == num_edges,
+    "node_degrees must sum to the number of message edges"
+	);
+	
+	auto grouped_edges = torch::empty({num_edges}, int64_options);
+	auto cursor = offsets.slice(0, 0, -1).clone(); // Initialize cursor to track the current position for each destination node
+
+	auto* grouped_ptr = grouped_edges.data_ptr<int64_t>();
+	auto* cursor_ptr = cursor.data_ptr<int64_t>();
+
+	// Fill grouped edges //
+
+	for (int64_t e=0; e < num_edges; ++e) {
+		TORCH_CHECK(
+			src_ptr[e] >= 0 && src_ptr[e] < num_nodes,
+			"Source node index out of bounds"
+		);
+		TORCH_CHECK(
+			dst_ptr[e] >= 0 && dst_ptr[e] < num_nodes,
+			"Destination node index out of bounds"
+		);
+		const int64_t current_node = dst_ptr[e]; // Get the destination node for the current edge
+		const int64_t current_index = cursor_ptr[current_node]; // Get the current index for this destination node in the grouped edges
+		grouped_ptr[current_index] = e; // Assign the current edge index to the grouped edges at the current index for this destination node
+		cursor_ptr[current_node] += 1; // Move the cursor for this destination node to the next position
 	}
 
-    if (edge_weights_opt.has_value()) {
-        return std::make_tuple(neighborhood.to(message_edges.device()), edge_weight_matrix.to(message_edges.device()));
-    }
-    else {
-        return std::make_tuple(neighborhood.to(message_edges.device()), torch::Tensor());
-    }
-}
+	// Generate random numbers for sampling edges based on weights //
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-restrict_neighborhood(
-    torch::Tensor bidirectional_message_edges,
-    torch::Tensor node_degrees,
-    torch::Tensor final_message_mask,
-    c10::optional<torch::Tensor> edge_weights_opt = c10::nullopt,
-    double intensity = 1.0,
-    int64_t max_neighbors = 60,
-    int64_t nthreads = 1
-) {
-    TORCH_CHECK(
-        bidirectional_message_edges.dim() == 2 &&
-        bidirectional_message_edges.size(0) == 2,
-        "bidirectional_message_edges must have shape [2, num_edges]"
-    );
+	auto uniform_random = torch::rand({num_edges}, float_options); // Generate uniform random numbers for each edge
 
-    TORCH_CHECK(
-        bidirectional_message_edges.dtype() == torch::kInt64,
-        "bidirectional_message_edges must be int64"
-    );
+	auto keys = torch::empty({num_edges}, float_options); // Initialize a tensor to hold the keys for sampling
 
-    TORCH_CHECK(
-        node_degrees.dim() == 1,
-        "node_degrees must be 1D"
-    );
+	const auto* uniform_ptr = uniform_random.data_ptr<float>();
+	auto* key_ptr = keys.data_ptr<float>();
 
-    TORCH_CHECK(
-        final_message_mask.dim() == 1 &&
-        final_message_mask.size(0) == bidirectional_message_edges.size(1),
-        "final_message_mask must be 1D with length num_edges"
-    );
+	constexpr float min_uniform =	std::numeric_limits<float>::min();
 
-    TORCH_CHECK(
-        final_message_mask.dtype() == torch::kBool,
-        "final_message_mask must be bool"
-    );
+	// Generate keys for sampling based on the uniform random numbers and edge weights. The keys are computed as -log(u) / w, where u is a uniform random number and w is the weight of the edge. This transformation allows for sampling edges based on their weights. This is a common technique in weighted random sampling where the final weight describes the Poisson rate (waiting time) of choosing an edge.
 
-    auto src = bidirectional_message_edges[0];
-    auto dst = bidirectional_message_edges[1];
+	for (int64_t e=0; e < num_edges; ++e) {
+		const int64_t src = src_ptr[e];
+		const int64_t dst = dst_ptr[e];
 
-    auto deg_src = node_degrees.index_select(0, src).to(torch::kFloat32);;
-    auto deg_dst = node_degrees.index_select(0, dst).to(torch::kFloat32);;
+		// The weight of an edge is the centrality of the source node relative to the destination node. This calculation ensures that central destination nodes prefer edges from central source nodes. At the same time, peripheral destination nodes can accept edges from both central and peripheral source nodes. Biologically, this means we collect information about important proteins (e.g. master regulators) preferentially from other important proteins, while also allowing peripheral proteins to receive information from both important and peripheral proteins.
 
-    int64_t num_nodes_in_batch = node_degrees.size(0);
+		float weight = static_cast<float>(degrees_ptr[src])/static_cast<float>(std::max<int64_t>(1, degrees_ptr[dst]));
 
-    auto weights = deg_src / deg_dst.clamp_min(1.0);
+		// Further weigh the edges based on their strengths.
+		weight *= edge_str_ptr[e];
 
-    if (edge_weights_opt.has_value()) {
-        auto edge_weights = edge_weights_opt.value();
+		// Control the weight intensity.
+		weight = std::pow(weight, intensity);
 
-        TORCH_CHECK(
-            edge_weights.dim() == 1 &&
-            edge_weights.size(0) == src.size(0),
-            "edge_weights must be 1D with length num_edges"
-        );
+		TORCH_CHECK(std::isfinite(weight) && weight > 0.0, "Edge weight must be positive and finite");
 
-        weights = weights * edge_weights;
-    }
+		float u = std::max(uniform_ptr[e], min_uniform);
+		key_ptr[e] = -std::log(u) / weight;
 
-    weights = weights.pow(intensity);
+	}
 
-    auto violators_mask = deg_dst > max_neighbors;
+	// Initialize output variables
 
-    final_message_mask.fill_(false);
+	auto neighborhood_matrix = torch::full({num_nodes, max_neighbors}, -1, int64_options); // Initialize a neighborhood tensor with -1, indicating no neighbor
 
-    // Keep all non-violating edges.
-    final_message_mask.masked_fill_(~violators_mask, true);
+	auto neighbor_strength_matrix = torch::full({num_nodes, max_neighbors}, -1.0, float_options); // Initialize a neighborhood weights tensor with -1.0
 
-    // Sample among violating destination nodes.
-    auto sampled_mask = max_nbr(
-        dst,
-        weights,
-        violators_mask,
-        max_neighbors,
-        nthreads
-    );
+	auto* neighborhood_ptr = neighborhood_matrix.data_ptr<int64_t>();
+	auto* neighbor_strength_ptr = neighbor_strength_matrix.data_ptr<float>();
 
-    final_message_mask.logical_or_(sampled_mask);
+	#pragma omp parallel for num_threads(nthreads)
+	for (int64_t node=0; node < num_nodes; ++node) {
 
-    // Boolean column filtering: [2, E] -> [2, E_restricted]
-    auto final_message_edges =
-        bidirectional_message_edges.index(
-            {torch::indexing::Slice(), final_message_mask}
-        );
+		const int64_t start = offsets_ptr[node];
+		const int64_t end = offsets_ptr[node+1];
+		const int64_t num_neighbors = end - start;
 
-    auto neighborhood_data = generate_neighborhood(
-        num_nodes_in_batch,
-        final_message_edges,
-        max_neighbors,
-        nthreads
-    ).to(node_degrees.device());
+		auto* group_start = grouped_ptr + start;
+		auto* group_end = grouped_ptr + end;
 
-    neighborhood = std::get<0>(neighborhood_data);
-    neighborhood_weights = std::get<1>(neighborhood_data);
+		// This partially sorts the edges such that the first `max_neighbors` edges have the smallest keys, which correspond to the highest weights. This allows us to select the top `max_neighbors` edges for each destination node.
+		if (num_neighbors > max_neighbors) {
+			std::nth_element(
+				group_start,
+				group_start + max_neighbors,
+				group_end,
+				[key_ptr](int64_t a, int64_t b) {
+				return key_ptr[a] < key_ptr[b];
+			});
+		} 
 
-    return std::make_tuple(
-        final_message_edges,
-        neighborhood,
-        neighborhood_weights
-    );
+		const int64_t limit = std::min(num_neighbors, max_neighbors);
+		const int64_t row_offset = node * max_neighbors;
+		for (int64_t col= 0; col < limit; ++col) {
+			const int64_t edge_index = grouped_ptr[start + col];
+			neighborhood_ptr[row_offset + col] = src_ptr[edge_index]; // Store the source node of the selected edge in the neighborhood matrix
+			neighbor_strength_ptr[row_offset + col] = edge_str_ptr[edge_index]; // Store the strength of the selected edge in the neighbor strength matrix
+		}
+	}
+	return std::make_tuple(neighborhood_matrix.to(output_device), neighbor_strength_matrix.to(output_device));
 }
 
 
@@ -203,8 +181,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	m.def("restrict_neighborhood", &restrict_neighborhood, "Restrict Neighborhood",
 		py::arg("bidirectional_message_edges"),
 		py::arg("node_degrees"),
-		py::arg("final_message_mask"),
-		py::arg("edge_weights") = py::none(),
+		py::arg("edge_strength"),
 		py::arg("intensity") = 1.0,
 		py::arg("max_neighbors") = 60,
 		py::arg("nthreads") = 1

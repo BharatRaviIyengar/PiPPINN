@@ -2,21 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
-from torch_scatter import scatter_mean
-from torch_scatter.composite import scatter_logsumexp, scatter_std
 from TrainUtils import build_MLP, generate_hidden_dims
 
 bce_logits_loss = F.binary_cross_entropy_with_logits
 cosim = F.cosine_similarity
-
-class SoftplusSimplex(nn.Module):
-	def __init__(self, n, init=1.0):
-		super().__init__()
-		self.raw = nn.Parameter(torch.full((n,), init))
-
-	def forward(self):
-		u = F.softplus(self.raw)
-		return u / u.sum()
 
 # PositiveLinear ensures weight >= 0
 class PositiveLinear(nn.Module):
@@ -63,9 +52,9 @@ class MonotoneMap(nn.Module):
 
 class NodeEncoder(nn.Module):
 	# Simple MLP encoder that produces Gaussian parameters for each node's latent representation
-	def __init__(self, input_dimension, layers, output_dimension, dropout=0.0):
+	def __init__(self, input_dimension, num_layers, output_dimension, dropout=0.0):
 		super().__init__()
-		self.channels = generate_hidden_dims(input_dimension, layers, output_dimension)
+		self.channels = generate_hidden_dims(input_dimension, num_layers, output_dimension) + [output_dimension]
 		self.dropout = dropout
 		self.transform = build_MLP(self.channels, dropout=dropout, use_layernorm=True)
 		self.gaussian_mu_head = nn.Linear(output_dimension, output_dimension)
@@ -79,10 +68,10 @@ class NodeEncoder(nn.Module):
 		return mu, std
 	
 class Decoder(nn.Module):
-	def __init__(self, in_channels, hidden_channels, dropout=0.0):
+	def __init__(self, in_channels, num_decoder_layers, dropout=0.0):
 		super().__init__()
 		self.in_channels = in_channels
-		self.hidden_channels = hidden_channels
+		self.hidden_channels = [in_channels] * num_decoder_layers
 		self.dropout = dropout
 		self.dims = [2*self.in_channels] + self.hidden_channels
 		self.edge_embedder = build_MLP(dims=self.dims, dropout=self.dropout, use_layernorm=True, normalize_input=False)
@@ -96,8 +85,6 @@ class Decoder(nn.Module):
 		self.monomap_EdgeExistence_Congruence = MonotoneMap()
 		self.monomap_EdgeExistence_NbrSimilarity = MonotoneMap()
 
-		self.edge_prob_coefficients = SoftplusSimplex(n=3, init=1.0/3.0)
-		self.edge_strength_coefficients = SoftplusSimplex(n=2, init=0.5)
 		self.transitivity_sharpness = 1.0
 		self.congruence_sharpness = 1.0
 
@@ -108,24 +95,33 @@ class Decoder(nn.Module):
 		Transitivity is determined by neighborhood similarity i.e. if u and v have similar neighbors, they are more likely to be connected.
 
 		Congruence is determined by the similarity of u and v to each other's neighbors i.e. if u is similar to v's neighbors and v is similar to u's neighbors, they are more likely to be connected.
+
+		Inputs:
+		- node_latent: Tensor of shape [num_nodes, latent_dim], latent representations of nodes
+		- supervision_edges: Tensor of shape [2, num_edges], pairs of nodes for which we want to predict edge existence and strength
+		- neighborhood_matrix: Tensor of shape [num_nodes, max_neighbors], indices of neighbors for each node. If a node has fewer than max_neighbors, the remaining entries are filled with -1.
+		- neighborhood_strength_matrix: Tensor of shape [num_nodes, max_neighbors], strengths of edges to neighbors for each node. If a node has fewer than max_neighbors, the remaining entries are filled with 0.
 		'''
 
 		u, v  = supervision_edges
-		nbrs_u = neighborhood_matrix[u] # neighbors of u
-		nbrs_v = neighborhood_matrix[v] # neighbors of v
+		nbrs_u = neighborhood_matrix[u] # neighbors of u. Dimension = [num_edges, max_neighbors]
+		nbrs_v = neighborhood_matrix[v] # neighbors of v. Dimension = [num_edges, max_neighbors]
+
 
 		nbrs_u_mask = (nbrs_u != -1) # mask for valid neighbors of u
 		nbrs_v_mask = (nbrs_v != -1) # mask for valid neighbors of v
+
+		transitivity_impossible = ~(nbrs_u_mask.any(dim=-1) & nbrs_v_mask.any(dim=-1)) # only consider edges where both u and v have at least one neighbor
 
 		# Replace invalid neighbor indices with 0 to avoid indexing errors 
 		nbrs_u_safe = nbrs_u.clamp_min(0)
 		nbrs_v_safe = nbrs_v.clamp_min(0)
 
-		latents_Nu = F.normalize(node_latent[nbrs_u_safe], p=2, dim=1) # latent features of neighbors of u
-		latents_Nv = F.normalize(node_latent[nbrs_v_safe], p=2, dim=1) # latent features of neighbors of v
+		latents_Nu = F.normalize(node_latent[nbrs_u_safe], p=2, dim=-1) # latent features of neighbors of u. Normalized along the feature (last) dimension for cosine similarity computation.
+		latents_Nv = F.normalize(node_latent[nbrs_v_safe], p=2, dim=-1) # latent features of neighbors of v. Normalized along the feature (last) dimension for cosine similarity computation.
 
-		latents_u	= F.normalize(node_latent[u], p=2, dim=1).unsqueeze(1) # latent features of u
-		latents_v	= F.normalize(node_latent[v], p=2, dim=1).unsqueeze(1) # latent features of v
+		latents_u	= F.normalize(node_latent[u], p=2, dim=-1).unsqueeze(1) # latent features of u
+		latents_v	= F.normalize(node_latent[v], p=2, dim=-1).unsqueeze(1) # latent features of v
 
 		# Calculate pairwise cosine similarity between neighbors of u and neighbors of v (Transitivity)
 		
@@ -134,18 +130,21 @@ class Decoder(nn.Module):
 		# Mask out invalid pairs of neighbors (i.e., where either neighbor is invalid)
 
 		pair_mask = nbrs_u_mask.unsqueeze(2) & nbrs_v_mask.unsqueeze(1) # shape: (num_edges, max_neighbors, max_neighbors)
-		nsim.masked_fill_(~pair_mask, float('-inf')) # mask out invalid pairs
 
+		nsim.masked_fill_(~pair_mask, float('-inf')) # mask out invalid pairs
 		
 		# Compute the neighborhood similarity scores for u and v based on their neighbors' similarities
 		# LogSumExp is used to aggregate the similarity scores such that higher similarity scores dominate the aggregation, while still allowing for contributions from lower scores.
-		# This is biologically reasonable as it allows for the possibility that even if most neighbors are dissimilar, a few highly similar neighbors can still indicate a strong relationship.
+		# This is biologically reasonable as it allows for the possibility that even if most neighbors are dissimilar, a few highly similar neighbors can still indicate a strong relationship. At the same time, more similar neighbors will increase the score, reflecting the idea that having more similar neighbors strengthens the evidence for a connection.
 
 		Nu_to_Nv = self.transitivity_sharpness * torch.logsumexp(nsim / self.transitivity_sharpness, dim=2)  # [num_edges, max_nbrs]
 		Nv_to_Nu = self.transitivity_sharpness * torch.logsumexp(nsim / self.transitivity_sharpness, dim=1)  # [num_edges, max_nbrs]
 
-		num_Nu = nbrs_u_mask.sum(dim=1).clamp_min(1)
-		num_Nv = nbrs_v_mask.sum(dim=1).clamp_min(1)
+		num_Nu = nbrs_u_mask.sum(dim=-1).clamp_min(1)
+		num_Nv = nbrs_v_mask.sum(dim=-1).clamp_min(1)
+
+		Nu_to_Nv.masked_fill_(~nbrs_u_mask, 0.0)
+		Nv_to_Nu.masked_fill_(~nbrs_v_mask, 0.0)
 
 		score_u = Nu_to_Nv.sum(dim=1) / num_Nu
 		score_v = Nv_to_Nu.sum(dim=1) / num_Nv
@@ -169,7 +168,7 @@ class Decoder(nn.Module):
 		
 		combined_sim.masked_fill_(~combined_mask, float('-inf')) # mask out invalid pairs
 
-		# Compute attention weights using softmax over the combined similarity scores, scaled by temperature tau. This allows the model to focus on the most relevant neighbor pairs when aggregating information for edge existence and strength predictions. A softmax is better choice than logsumexp here because we just want to find one good evidence of a congruent neighbor pair, rather than aggregating all the evidence. The softmax will assign higher weights to the most similar pairs, while still allowing for contributions from less similar pairs.
+		# Compute attention weights using softmax over the combined similarity scores. This allows the model to focus on the most relevant neighbor pairs when aggregating information for edge existence and strength predictions. A softmax is better choice than logsumexp here because we just want to find one good evidence of a congruent neighbor pair, rather than aggregating all the evidence. The softmax will assign higher weights to the most similar pairs, while still allowing for contributions from less similar pairs.
 
 		attention = torch.softmax(combined_sim / self.congruence_sharpness, dim=1)
 
@@ -177,21 +176,19 @@ class Decoder(nn.Module):
 
 		combined_edge_strengths.masked_fill_(~combined_mask, 0.0) # set invalid pairs to 0 for aggregation
 
-		# Per-neighbor congruence evidence
-		congruence_contributions = attention * combined_sim
-
 		# Scalar evidence for edge existence
-		congruence_score = congruence_contributions.sum(dim=1)
+		congruence_score = (attention * combined_sim).sum(dim=1)
 
 		# Strength evidence, preserving the same local congruence structure
-		congruence_strength = (
-				congruence_contributions * combined_edge_strengths
-		).sum(dim=1)
+		congruence_strength = (attention * combined_edge_strengths).sum(dim=1)
 
 		# Translate the neighborhood similarity and congruence scores into edge existence probabilities and edge strengths using the learnable monotonic mappings. This ensures that higher similarity scores always correspond to higher probabilities and strengths, while allowing the model to learn the optimal nonlinear mapping from similarity to edge properties.
-
 		ExistenceByTransitivity = self.monomap_EdgeExistence_NbrSimilarity(neighborhood_score.unsqueeze(-1)).squeeze(-1)
+
+		ExistenceByTransitivity[transitivity_impossible] = 0.0 # if transitivity is not possible (i.e., one of the nodes has no neighbors), we explicitly set the existence probability to 0.0, as we have no evidence to support the existence of an edge based on transitivity.
+
 		ExistenceByCongruence = self.monomap_EdgeExistence_Congruence(congruence_score.unsqueeze(-1)).squeeze(-1)
+
 		StrengthByCongruence = self.monomap_EdgeStrength_Congruence(congruence_strength.unsqueeze(-1)).squeeze(-1)
 
 		return ExistenceByTransitivity, ExistenceByCongruence, StrengthByCongruence
@@ -229,12 +226,11 @@ def reparameterize(mu, std):
 
 
 class GVAE_Model(nn.Module):
-	def __init__(self, node_in_channels, layers, node_latent_channels,
-				 decoder_hidden_channels,
-				 dropout=0.0):
+	def __init__(self, node_in_channels, num_encoder_layers, node_latent_channels,
+				 num_decoder_layers, dropout=0.0):
 		super().__init__()
-		self.node_encoder = NodeEncoder(node_in_channels, layers, node_latent_channels, dropout)
-		self.decoder = Decoder(node_latent_channels, decoder_hidden_channels, dropout)
+		self.node_encoder = NodeEncoder(node_in_channels, num_encoder_layers, node_latent_channels, dropout)
+		self.decoder = Decoder(node_latent_channels, num_decoder_layers, dropout)
 
 	def forward(self, x, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix):
 		# Encode nodes
@@ -283,36 +279,18 @@ def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimize
 	else:
 		conditional_backward = lambda loss: None  # No-op for validation
 
-	# Forward pass
-	# Encode
-	node_mu, node_std = model.node_encoder(data.node_features)
-	nodes_latent = reparameterize(node_mu, node_std)
-
-	nbr_mu, nbr_std = model.neighborhood_encoder(
-		data.node_features,
-		data.message_edges,
-		data.message_edgestrs
-	)
-	nbr_latent = reparameterize(nbr_mu, nbr_std)
-
-	# Decode supervision edges
-
-	edge_prob_logits, edge_strengths, edge_contributions = model.decoder(
-	nodes_latent,
-	nbr_latent,
-	data.supervision_train_edges
-	)
+	edge_prob_logits, edge_strengths, edge_contributions, node_mu, node_std = model(data.node_representations, data.supervision_edges, data.neighborhood_matrix, data.neighborhood_strength_matrix)
 
 	# Compute losses
 
 	bce_edge_classification_loss = bce_logits_loss(edge_prob_logits, data.supervision_labels)
 
 	positve_edges = data.supervision_labels.bool()
+	
 	mse_edge_strength_loss = F.mse_loss(edge_strengths[positve_edges], data.supervision_edgestrs[positve_edges])
-	KL_loss_node = KL_loss(node_mu, node_std)
-	KL_loss_nbr = KL_loss(nbr_mu, nbr_std)
+	
 
-	loss = bce_edge_classification_loss + mse_edge_strength_loss + KL_loss_node + KL_loss_nbr
+	loss = bce_edge_classification_loss + mse_edge_strength_loss + KL_loss(node_mu, node_std)
 	
 	# loss = calculate_loss(model_output, data, head_weights)
 	conditional_backward(loss)
