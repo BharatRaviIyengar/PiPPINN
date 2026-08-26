@@ -226,11 +226,10 @@ def reparameterize(mu, std):
 
 
 class GVAE_Model(nn.Module):
-	def __init__(self, node_in_channels, num_encoder_layers, node_latent_channels,
-				 num_decoder_layers, dropout=0.0):
+	def __init__(self, input_dimension, num_encoder_layers, latent_dimension,num_decoder_layers, dropout=0.0):
 		super().__init__()
-		self.node_encoder = NodeEncoder(node_in_channels, num_encoder_layers, node_latent_channels, dropout)
-		self.decoder = Decoder(node_latent_channels, num_decoder_layers, dropout)
+		self.node_encoder = NodeEncoder(input_dimension, num_encoder_layers, latent_dimension, dropout)
+		self.decoder = Decoder(latent_dimension, num_decoder_layers, dropout)
 
 	def forward(self, x, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix):
 		# Encode nodes
@@ -247,12 +246,12 @@ class GVAE_Model(nn.Module):
 		return edge_prob_logits, edge_strengths, edge_contributions, node_mu, node_std
 	
 def KL_loss(mu, std):
-	num_nodes = mu.size(0)
+	# num_nodes = mu.size(0)
 	kld = -0.5 * torch.sum(1 + torch.log(std.pow(2) + 1e-8) - mu.pow(2) - std.pow(2))
-	return kld / num_nodes
+	return kld / mu.numel()  # Normalize by the number of elements in mu
 	
 
-def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, is_training=False, return_output=False):
+def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, mse_coefficient=1.0, kld_coefficient=1.0, is_training=False, return_output=False):
 	"""
 	Processes a single batch for training or validation.
 
@@ -279,19 +278,29 @@ def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimize
 	else:
 		conditional_backward = lambda loss: None  # No-op for validation
 
-	edge_prob_logits, edge_strengths, edge_contributions, node_mu, node_std = model(data.node_representations, data.supervision_edges, data.neighborhood_matrix, data.neighborhood_strength_matrix)
+	edge_prob_logits, edge_strengths, edge_contributions, node_mu, node_std = model(
+    data.node_features,
+    data.supervision_edges,
+    data.neighborhood_matrix,
+    data.neighborhood_weights,
+)
 
 	# Compute losses
 
 	bce_edge_classification_loss = bce_logits_loss(edge_prob_logits, data.supervision_labels)
+	
+	mse_edge_strength_loss = F.mse_loss(
+    edge_strengths[:data.num_positive_supervision_edges],
+    data.supervision_edgewts,
+)
+	
 
-	positve_edges = data.supervision_labels.bool()
-	
-	mse_edge_strength_loss = F.mse_loss(edge_strengths[positve_edges], data.supervision_edgestrs[positve_edges])
-	
+	loss = (
+		bce_edge_classification_loss +
+		mse_coefficient * mse_edge_strength_loss +
+		kld_coefficient * KL_loss(node_mu, node_std)
+	)
 
-	loss = bce_edge_classification_loss + mse_edge_strength_loss + KL_loss(node_mu, node_std)
-	
 	# loss = calculate_loss(model_output, data, head_weights)
 	conditional_backward(loss)
 

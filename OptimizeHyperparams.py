@@ -2,8 +2,8 @@ import argparse as ap
 from pathlib import Path
 import sys
 import torch
-import TrainUtils as TUtils
-import GVAE_model as GVAE
+import TrainUtils as TU
+from GVAE_model import GVAE_model as GVAE, process_data_GVAE as process_data
 import optuna
 from optuna.samplers import TPESampler
 from optuna.storages import JournalStorage
@@ -17,36 +17,60 @@ import gc
 def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, max_epochs = 200, threads:int=1):
 	""" Run training for a single trial with the given parameters."""
 
-	centrality_fraction = params['centrality_fraction']
+	learning_rate = params['learning_rate']
 	dropout = params['dropout']
 	weight_decay = params['weight_decay']
 	patience = 15
 	scheduler_factor = params['scheduler_factor']
-	nbr_wt_intensity = params['nbr_weight_intensity']
-	hidden_channels = params['hidden_channels']
-	network_skip_factor = params['network_skip_factor']
-	latent_channels = params['latent_channels']
+	latent_dimension = params['latent_dimension']
+	num_encoder_layers = params['num_encoder_layers']
+	num_decoder_layers = params['num_decoder_layers']
+	kld_coefficient = params['kld_coefficient']
+	mse_coefficient = params['mse_coefficient']
+
+
+	median_centralities = [data.node_degree.median().item() for data in dataset]
+	reference_centrality = sum(median_centralities)/len(median_centralities)
+
+	batch_loader_params = {
+		"centrality_fraction": params['centrality_fraction'],
+		"nbr_weight_intensity": params['nbr_weight_intensity'],
+		"reference_centrality": reference_centrality,
+		"reference_adjustment": params['reference_adjustment'],
+		"negative_label_hardness": params['negative_label_hardness'],
+		"false_negative_threshold": 0.47,
+		"max_neighbors": params['max_neighbors'],
+		"threads" : threads
+	}
 	
-	data_for_training = [TUtils.generate_batch(data, num_batches, batch_size, centrality_fraction, nbr_wt_intensity=nbr_wt_intensity, device=device, threads=threads) for data in dataset]
+	data_for_training = [
+		TU.generate_batch(
+			data=data,
+			batch_size=batch_size,
+			num_batches=num_batches,
+			optional_paramters = batch_loader_params
+		)
+		  for data in dataset]
 
 	del dataset
 	gc.collect()
 	torch.cuda.empty_cache()
 
 	# Initialize model and optimizer
-	model = GVAE.GVAE_Model(
-			node_in_channels=data_for_training[0]["input_channels"],
-			nbr_in_channels=data_for_training[0]["input_channels"],
-			node_latent_channels=latent_channels,
-			nbr_latent_channels=latent_channels,
-			node_hidden_channels=hidden_channels,
-			nbr_hidden_channels=hidden_channels,
-			hidden_channels=hidden_channels,
-			dropout=dropout,
-			network_skip=0.5
-		).to(device)
-	
-	optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=weight_decay)
+	model = GVAE(
+		input_dimension = data_for_training[0]["Val"].x.size(1),
+		num_encoder_layers = num_encoder_layers,
+		latent_dimension = latent_dimension,
+		num_decoder_layers = num_decoder_layers,
+		dropout = dropout,
+	).to(device)
+
+	optimizer = torch.optim.Adam(
+		model.parameters(),
+		lr=learning_rate,
+		weight_decay=weight_decay
+	)
+
 	scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 		optimizer= optimizer,
 		mode='min',
@@ -55,8 +79,6 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		cooldown=2,
 		min_lr=1e-6
 	)
-
-	network_skip_scheduler = TUtils.DecayScheduler(model, 'network_skip', initial_value=0.6, factor=network_skip_factor, cooldown=2, min_value=0.001)
 
 	total_val_samples = sum([(data["val_sampler"].num_supervision_edges + data["val_sampler"].num_negative_edges)*data["val_sampler"].num_batches for data in data_for_training])
 
@@ -70,11 +92,8 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	auc_at_best_score = float('-inf')
 	epochs_without_improvement = 0
 	best_score_epoch = max_epochs
-	network_skip_at_best_score = 0.6
 	best_auc = float('-inf')
 	best_auc_epoch = max_epochs
-	# netskip_decay_completed = False
-	epochs_since_curriculum_completed = 0
 	
 	for epoch in range(max_epochs):
 		total_train_loss = 0.0  # Reset total training loss for the epoch
@@ -88,7 +107,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 			model.train()
 			for batch in data["train_batch_loader"]:
 				train_batch_count += 1
-				train_loss = utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=True, return_output=False)
+				train_loss = process_data(batch, model=model, optimizer=optimizer, device=device, mse_coefficient=mse_coefficient, kld_coefficient=kld_coefficient, is_training=True, return_output=False)
 				total_train_loss += train_loss # type: ignore
 
 			# Validation
@@ -96,7 +115,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 			with torch.no_grad():
 				for batch in data["val_batch_loader"]:
 					val_batch_count += 1
-					val_loss, edge_prob, edge_labels = utils.process_data(batch, model=model, optimizer=optimizer, device=device, is_training=False, return_output=True) # type: ignore
+					val_loss, edge_prob, edge_labels = process_data(batch, model=model, optimizer=optimizer, device=device, mse_coefficient=mse_coefficient, kld_coefficient=kld_coefficient, is_training=False, return_output=True) # type: ignore
 					total_val_loss += val_loss
 					n = edge_prob.size(0)
 					preds_buf[fill_idx:fill_idx+n] = edge_prob
@@ -106,10 +125,6 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		# Average losses
 		average_train_loss = total_train_loss / train_batch_count
 		average_val_loss = total_val_loss / val_batch_count
-
-		if model.network_skip <= network_skip_scheduler.min_value + 1e-6:
-			epochs_since_curriculum_completed += 1
-			# netskip_decay_completed = True
 		
 		# Early stopping logic
 		if epochs_since_curriculum_completed > 2:
@@ -132,7 +147,6 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 			
 			yield {
 			"epoch": epoch + 1,
-			"epochs_since_curriculum_completed": epochs_since_curriculum_completed,
 			"average_train_loss": average_train_loss,
 			"average_val_loss": average_val_loss,
 			"val_loss_at_best_score": val_loss_at_best_score,
@@ -140,7 +154,6 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 			"best_score_epoch": best_score_epoch,
 			"learning_rate": optimizer.param_groups[0]['lr'],
 			"auc_at_best_score": auc_at_best_score,
-			"network_skip_at_best_score": network_skip_at_best_score,
 			"best_auc": best_auc,
 			"best_auc_epoch": best_auc_epoch,
 			"composite_score": composite_score,
@@ -149,7 +162,6 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 
 		# Step the schedulers
 		scheduler.step(average_val_loss)
-		network_skip_scheduler.step()
 		
 		if epochs_without_improvement >= patience:
 			print(f"Early stopping triggered after {epoch + 1} epochs.")
@@ -196,8 +208,8 @@ if __name__ == "__main__":
 	torch.cuda.manual_seed_all(SEED)
 
 	args = parser.parse_args()
-	torch.num_threads = args.threads
-	torch.num_interop_threads = args.threads
+	torch.set_num_threads(args.threads)
+	torch.set_num_interop_threads(args.threads)
 
 	gpu_yes = torch.cuda.is_available()
 
@@ -257,20 +269,18 @@ if __name__ == "__main__":
 		best_auc_epoch = 0
 		network_skip_at_best_score = 0.0
 		composite_score = float('inf')
-		depth = trial.suggest_categorical("depth", [3, 4, 5])
-		last_layer_size = trial.suggest_categorical("last_layer_size", [768, 1024, 1536, 2048])
-		hidden_channels = generate_hidden_dims(input_channels, depth, last_layer_size) + [last_layer_size]
 		params = {
-			"centrality_fraction": trial.suggest_float("centrality_fraction", 0.2, 0.69, log=True),
+			"learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
+			"scheduler_factor": trial.suggest_float("scheduler_factor", 0.1, 0.5),
 			"dropout": trial.suggest_float("dropout", 0.1, 0.35),
 			"weight_decay": trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True),
-			"scheduler_factor": trial.suggest_float("scheduler_factor", 0.1, 0.5),
-			"nbr_weight_intensity": trial.suggest_float("nbr_weight_intensity", 0.4, 2.5, log=True),
-			"network_skip_factor": trial.suggest_float("network_skip_factor", 0.1, 0.9),
-			"margin": trial.suggest_float("margin", 0.1, 1.0),
-			"margin_loss_coef": trial.suggest_float("margin_loss_coef", 0.01, 0.1, log=True),
-			"entropy_coef": trial.suggest_float("entropy_coef", 0.001, 0.01, log=True),
-			"hidden_channels" : hidden_channels
+			"centrality_fraction": trial.suggest_float("centrality_fraction", 0.2, 0.69, log=True),
+			"nbr_weight_intensity": trial.suggest_float("nbr_weight_intensity", 0.25, 3.0, log=True),
+			"latent dimension": trial.suggest_categorical("latent_dimension", [64, 128, 256, 512]),
+			"num_encoder_layers": trial.suggest_int("num_encoder_layers", 2, 4),
+			"num_decoder_layers": trial.suggest_int("num_decoder_layers", 2, 3),
+			"kld_coefficient": trial.suggest_float("kld_coefficient", 0.01, 1.0, log=True),
+			"mse_coefficient": trial.suggest_float("mse_coefficient", 0.01, 1.0, log=True)
 		}
 		try:
 			for result in run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads):

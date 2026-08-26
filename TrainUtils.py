@@ -1,23 +1,20 @@
+from pyparsing import Dict
 import torch
 import torch.nn as nn
-from torch.nn.functional import relu as ReLU, binary_cross_entropy_with_logits as bce_logit_loss, binary_cross_entropy as bce_loss, mse_loss, softplus, cosine_similarity as cosim
 from torch_geometric.data import Data
 from torch_geometric.utils import degree
 from torch_geometric.utils.map import map_index
-from torch_scatter import scatter_add, scatter_mean
-from torch_scatter.composite import scatter_softmax
 from warnings import warn
 from pathlib import Path
 from NeighborhoodRestriction import restrict_neighborhood
 
-def generate_hidden_dims(input_dim, depth, last_layer_size):
-	n_layers = depth - 1  # intermediate layers count (excluding first)
-	
-	if n_layers == 0:
+def generate_hidden_dims(input_dim, num_layers, output_dim):
+		
+	if num_layers == 0:
 		return []  # no intermediate layers, just input and last layer
 
-	decay_factor = (last_layer_size / input_dim) ** (1 / n_layers)
-	hidden_dims = [int(input_dim * decay_factor ** i) for i in range(n_layers)]
+	decay_factor = (output_dim / input_dim) ** (1 / num_layers)
+	hidden_dims = [int(input_dim * decay_factor ** i) for i in range(num_layers)]
 
 	return hidden_dims
 
@@ -35,32 +32,6 @@ def build_MLP(dims, activation=nn.ReLU, dropout=0.0, use_layernorm=False, normal
 				layers.append(nn.Dropout(dropout))
 	return nn.Sequential(*layers)
 
-
-def hinge_loss(margin: float, positive_logits, negative_logits):
-	loss_margin = torch.relu(margin - positive_logits).mean() + torch.relu(margin + negative_logits).mean()
-	return loss_margin
-
-def total_entropy(logits):
-	log_p = -softplus(-logits)
-	log_1mp = -softplus(logits)
-	p = torch.exp(log_p)
-	entropy = -(p * log_p + (1 - p) * log_1mp).mean()
-	return entropy
-
-class Margin_and_Entropy():
-	def __init__(self, num_positive_edges = 12000, margin = 0.5, margin_loss_coef = 0.05, entropy_coef = 0.005):
-		self.num_positive_edges = num_positive_edges
-		self.margin = margin
-		self.margin_loss_coef = margin_loss_coef
-		self.entropy_coef = entropy_coef
-	def __call__(self, logits):
-		positive_logits = logits[:self.num_positive_edges]
-		negative_logits = logits[self.num_positive_edges:]
-		loss_margin = hinge_loss(self.margin, positive_logits, negative_logits)
-		entropy = total_entropy(logits)
-		return self.margin_loss_coef * loss_margin - self.entropy_coef * entropy
-
-
 class EdgeSampler(torch.utils.data.IterableDataset):
 	"""
 	Samples minibatches of edges based on centrality or uniform probability.
@@ -77,7 +48,8 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		max_neighbors (int, optional): Maximum number of neighbors per node in the batch. Defaults to 60.
 		frac_sample_from_unsampled (float, optional): Fraction of edges to sample from unsampled edges. Defaults to 0.1.
 		nbr_weight_intensity (float, optional): Intensity for neighborhood weight computation. Defaults to 1.0.
-		max_neg_edge_centrality (float, optional): Maximum centrality score for negative edges. Defaults to None (in this case it will be computed from the negative edges).
+		reference_centrality (float, optional): Reference centrality value to estimate data coverage. Defaults to None.
+		reference_adjustment (float, optional): Adjustment factor for reference centrality. Defaults to 1.0.
 		negative_label_hardness (float, optional): Hardness factor for generating soft negative labels. Defaults to 1.
 		false_negative_threshold (float, optional): Threshold for generating soft negative labels. Defaults to 0.45.
 
@@ -101,7 +73,8 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			  nbr_weight_intensity=1.0,
 			  device=None,
 			  threads=1,
-				max_neg_edge_centrality=None,
+				reference_centrality=None,
+				reference_adjustment=1.0,
 				negative_label_hardness=1,
 				false_negative_threshold=0.45
 				):  
@@ -124,10 +97,17 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.num_positive_sup_edges = int(self.batch_size * self.supervision_fraction)
 		self.num_message_edges = self.batch_size - self.num_positive_sup_edges
 		self.threads = threads
-		self.false_negative_threshold = false_negative_threshold
+		
 
 		assert self.batch_size < self.total_positive_edges
 		assert 0.0 <= self.centrality_fraction < 1.0
+		assert 0.0 <= reference_adjustment <= 1.0
+		assert negative_label_hardness > 0
+		assert 0.0 <= false_negative_threshold < 1.0
+		assert 0.0 < supervision_fraction < 1.0
+		assert 0.0 <= frac_sample_from_unsampled <= 1.0
+		assert max_neighbors > 0
+		assert threads > 0
 
 		assert (1 - self.centrality_fraction) >= self.supervision_fraction, "Supervision edges should always be sampled uniformly. The number of uniformly sampled edges in the batch should be at least as much as the number of supervision edges"
 
@@ -140,9 +120,9 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		# Compute edge probabilities for sampling  
 		if centrality is None or self.total_positive_nodes > centrality.size(0):
 			warn("Centrality not provided or incompatible with edge list. Recalculating using torch_geometric.utils.degree.") 
-			centrality = degree(self.positive_edges.flatten(), num_nodes=self.total_positive_nodes).to(self.device)
+			centrality = degree(self.positive_edges.flatten(), num_nodes=self.total_positive_nodes).to(self.device) # type: ignore
 
-		self.centrality = centrality
+		self.centrality = centrality.to(self.device)
 		self.edge_centrality_scores = self.get_edge_centrality(self.positive_edges)
 			
 		if negative_edges is not None:  
@@ -159,29 +139,33 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 
 		# Define sampling method for negative edges  
-		if self.negative_batch_size >= self.num_negative_edges:  
-			self.sample_negative_edges = lambda : torch.arange(self.num_negative_edges)  
-		else:
-			self.negative_sampling_weights = torch.ones(self.num_negative_edges, device=self.device)
+		assert self.negative_batch_size < self.num_negative_edges, "Use a larger negative graph than the batch size"
 
-			self.sample_negative_edges = lambda: torch.multinomial(  
-			self.negative_sampling_weights,  
-			self.negative_batch_size,  
-			replacement=False
-			)
+		self.negative_sampling_weights = torch.ones(self.num_negative_edges, device=self.device)
+
+		self.sample_negative_edges = lambda: torch.multinomial(  
+		self.negative_sampling_weights,  
+		self.negative_batch_size,
+		replacement=False
+		)
 
 		self.max_nodes = max(self.negative_edges.max().item() + 1, self.total_positive_nodes)
 
-		self.max_neg_edge_centrality = max_neg_edge_centrality if max_neg_edge_centrality is not None else self.get_edge_centrality(self.negative_edges).max().item()
-
-		self.min_centrality = 2
-
+		# Normalization of PU labels based on graph density #
+		self.min_centrality = 2.0
+		self.false_negative_threshold = false_negative_threshold
 		self.negative_label_hardness = negative_label_hardness
-		
+		if reference_centrality is not None:
+			self.reference_centrality = (reference_adjustment * reference_centrality + (1.0 - reference_adjustment) * self.centrality.median())*2
+		else:
+			self.reference_centrality = 2*self.centrality.median()
+
+		assert self.reference_centrality > self.min_centrality, "Reference centrality must exceed minimum centrality"
+
 		# Preallocate tensors
 		
 		# Node mask to track nodes in the batch
-		self.node_mask = torch.zeros(self.max_nodes, dtype=torch.bool, device=self.device)  
+		self.node_mask = torch.zeros(self.max_nodes, dtype=torch.bool, device=self.device) # type: ignore
 
 		# Track unsampled edges
 		self.unsampled_edges = torch.ones(self.total_positive_edges, dtype=torch.bool, device = self.device)
@@ -223,13 +207,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		# Bidirectional message edge weights for training
 		self.bidirectional_message_edgewts = torch.zeros(self.num_message_edges*2, dtype=torch.float, device = self.device)
 
-		# Define sampling method for positive edges  
-		# if self.batch_size >= self.total_positive_edges:  
-		# 	self.sampling_fn = lambda: torch.arange(self.total_positive_edges)  
-		# elif self.centrality_fraction == 1.0:
-		# 	self.sampling_fn = self.sample_edges_basic  
-		# else:  
-		# 	self.sampling_fn = self.sample_edges_strata_with_unsampled_tracking
+		self.sampling_fn = self.sample_edges_strata_with_unsampled_tracking
 
 	def get_edge_centrality(self,edge_list):  
 		return self.centrality[edge_list[0]] + self.centrality[edge_list[1]]  
@@ -239,9 +217,13 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		# Generate soft negative labels based on edge centrality. Edges with higher centrality get harder labels (closer to 0), while edges with lower centrality get softer labels (closer to the false negative threshold). This is based on the assumption that high centrality nodes are more likley to be well represented in data, and randomly sampled negative edges between them are more likely to be true negatives. Conversely, low centrality nodes are less likely to be well represented, and absence of edges between them could be due to sparse data.
 
 		edge_centrality = self.get_edge_centrality(negative_edges)
-		negative_probs = self.false_negative_threshold * ((self.max_neg_edge_centrality - edge_centrality) / (self.max_neg_edge_centrality - self.min_centrality + 1e-8)).pow(self.negative_label_hardness)
 
-		return negative_probs.clamp(min=0.0, max=self.false_negative_threshold)
+		normalized_uncertainty = (
+			(self.reference_centrality - edge_centrality) / 
+			(self.reference_centrality - self.min_centrality + 1e-8)
+			).clamp(0.0, 1.0)
+
+		return self.false_negative_threshold * normalized_uncertainty.pow(self.negative_label_hardness)
 	
 	def sample_edges_basic(self):
 		return torch.multinomial(self.uniform_probs, self.batch_size, replacement=False) 
@@ -279,11 +261,10 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.positive_batch_indices[:uniform_batch_size] = uniform_sampled_edges
 		self.is_uniform_edge[:uniform_batch_size] = True
 		self.positive_batch_indices[uniform_batch_size:sample_size] = centrality_sampled_edges
-		return self.positive_batch_indices  
+
 
 	def sample_edges_strata_total(self):  
-		sampled_edges = self.sample_edges_strata(self.batch_size)
-		return sampled_edges  
+		self.sample_edges_strata(self.batch_size) 
 		
 	def sample_edges_strata_with_unsampled_tracking(self):  
 		"""
@@ -299,7 +280,8 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			torch.Tensor: Indices of sampled positive edges for the batch.
 		"""
 		# Sample from total	
-		sampled_from_total = self.sample_edges_strata(self.num_sample_from_total)  
+		self.sample_edges_strata(self.num_sample_from_total)
+		sampled_from_total = self.positive_batch_indices[:self.num_sample_from_total]
 		self.unsampled_edges[sampled_from_total] = False  
 
 		# Sampling from unsampled   
@@ -348,7 +330,6 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 				self.is_uniform_edge[-num_resample_from_total:] = True
 				self.uniform_probs[self.positive_batch_indices[:-num_resample_from_total]] = 1
 
-		return self.positive_batch_indices
 
 
 	def create_output_batch(self):  
@@ -367,7 +348,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			batch (torch_geometric.data.Data): Data object containing batch edges (message and supervision), labels and weights, and node features.
 		"""
 		# Sample positive edges  
-		self.sample_edges_strata_with_unsampled_tracking()
+		self.sampling_fn()
 
 		positive_batch = self.positive_edges.index_select(1,self.positive_batch_indices).to(self.device)
 
@@ -399,6 +380,15 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 		self.supervision_labels[-self.negative_batch_size:] = self.generate_soft_negative_labels(negative_batch_edges)
 
+		# Select edge weights
+
+		self.supervision_edgewts.zero_()
+		sampled_positive_edgewts = self.edge_attr[self.positive_batch_indices]
+		message_edgewts = sampled_positive_edgewts[~self.supervision_edge_mask]
+		
+		# Assign positive supervision edge weights (negative edges are not used)
+		self.supervision_edgewts.copy_(sampled_positive_edgewts[supervision_positive_idx])
+
 		# Relabel batch edges #  
 		
 		self.node_mask.fill_(False)
@@ -420,16 +410,9 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		self.bidirectional_message_edges[:, :self.num_message_edges] = tentative_message_edges
 		self.bidirectional_message_edges[:, self.num_message_edges:] = tentative_message_edges.flip(0)
 
-		self.supervision_edgewts.zero_()
+		
 		self.bidirectional_message_edgewts.zero_()
 
-		# Subset edge attributes if available  
-		sampled_positive_edgewts = self.edge_attr[self.positive_batch_indices]
-		message_edgewts = sampled_positive_edgewts[~self.supervision_edge_mask]
-
-		# Assign positive supervision edge weights (negative edges are not used)
-		self.supervision_edgewts.copy_(sampled_positive_edgewts[self.supervision_edge_mask])
-		
 		self.bidirectional_message_edgewts[:self.num_message_edges] = message_edgewts
 		self.bidirectional_message_edgewts[self.num_message_edges:] = message_edgewts
 		
@@ -457,7 +440,8 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			neighborhood_matrix = neighborhood_matrix,
 			neighborhood_weights = neighborhood_weights,
 			node_features = self.node_embeddings[self.node_mask, :].to(self.device),
-			supervision_edgewts = self.supervision_edgewts
+			supervision_edgewts = self.supervision_edgewts,
+			num_positive_supervision_edges = self.num_positive_sup_edges
 		).to(self.device)
 
 		return batch  
@@ -651,7 +635,6 @@ def generate_negative_edges(positive_graph: Data, negative_positive_ratio=2, dev
 	# Return negative edges
 	return torch.stack([valid_src, valid_dst], dim=0)
 
-ME_loss = Margin_and_Entropy()
 
 def auc_score(preds: torch.Tensor, labels: torch.Tensor):
 	"""
@@ -747,7 +730,7 @@ def load_data(input_graphs_filenames, val_fraction, save_graphs_to=None, device=
 	return data_to_save
 	
 
-def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, nbr_wt_intensity=1.0, device = None, threads=1):
+def generate_batch(data, num_batches, batch_size, optional_paramters = None):
 	"""
 	Generates training and validation batch loaders and samplers.
 
@@ -755,8 +738,7 @@ def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, nbr_w
 		data (dict): Dictionary containing 'Train', 'Train_Neg', 'Val', 'Val_Neg' Data objects.
 		num_batches (int): Number of batches for training.
 		batch_size (int): Batch size for training.
-		centrality_fraction (float): Fraction of edges to sample by centrality.
-		device (torch.device, optional): Device for computation.
+		optional_paramters (dict, optional): Dictionary containing optional parameters for the batch loader.
 
 	Returns:
 		dict: Contains train/val samplers, loaders, and input channel size.
@@ -765,15 +747,16 @@ def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, nbr_w
 	if num_batches is None:
 		num_batches = data["Train"].edge_index.size(1)//int(batch_size*0.8) # type: ignore 
 
+	optional_paramters = {} if optional_paramters is None else optional_paramters
+
+
 	train_data_sampler = EdgeSampler(
 		positive_graph=data["Train"],
 		batch_size=batch_size,
 		num_batches=num_batches,
 		centrality=data["Train"].node_degree,
-		centrality_fraction=centrality_fraction,
 		negative_edges=data["Train_Neg"],
-		nbr_weight_intensity=nbr_wt_intensity,
-		threads=threads
+		**optional_paramters
 	)
 	train_loader = torch.utils.data.DataLoader(train_data_sampler, batch_size=None)
 
@@ -786,10 +769,8 @@ def generate_batch(data, num_batches, batch_size, centrality_fraction=0.6, nbr_w
 		batch_size=val_batch_size,
 		num_batches=num_val_batches,
 		centrality=data["Val"].node_degree,
-		centrality_fraction=centrality_fraction,
 		negative_edges=data["Val_Neg"],
-		nbr_weight_intensity=nbr_wt_intensity,
-		threads=threads
+		**optional_paramters
 		)
 
 	val_loader = torch.utils.data.DataLoader(val_data_sampler, batch_size=None)
