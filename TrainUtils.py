@@ -18,15 +18,15 @@ def generate_hidden_dims(input_dim, num_layers, output_dim):
 
 	return hidden_dims
 
-def build_MLP(dims, activation=nn.ReLU, dropout=0.0, use_layernorm=False, normalize_input=False):
+def build_MLP(dims, activation=nn.ReLU, dropout=0.0, use_layernorm=True, normalize_input=False):
 	layers = []
 	if normalize_input:
 		layers.append(nn.LayerNorm(dims[0]))
 	for i in range(len(dims) - 1):
 		layers.append(nn.Linear(dims[i], dims[i + 1]))
-		if use_layernorm:
-			layers.append(nn.LayerNorm(dims[i + 1]))
-		if i < len(dims) - 1:
+		if i < len(dims) - 2:
+			if use_layernorm:
+				layers.append(nn.LayerNorm(dims[i + 1]))
 			layers.append(activation())
 			if dropout > 0:
 				layers.append(nn.Dropout(dropout))

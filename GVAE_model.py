@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data
 from TrainUtils import build_MLP, generate_hidden_dims
+from torch.utils.checkpoint import checkpoint
 
 bce_logits_loss = F.binary_cross_entropy_with_logits
 cosim = F.cosine_similarity
@@ -68,7 +69,7 @@ class NodeEncoder(nn.Module):
 		return mu, std
 	
 class Decoder(nn.Module):
-	def __init__(self, in_channels, num_decoder_layers, dropout=0.0):
+	def __init__(self, in_channels, num_decoder_layers, dropout=0.0, similarity_block_size = 15, edge_chunk_size = 3000, return_individual_contributions=False):
 		super().__init__()
 		self.in_channels = in_channels
 		self.hidden_channels = [in_channels] * num_decoder_layers
@@ -77,6 +78,9 @@ class Decoder(nn.Module):
 		self.edge_embedder = build_MLP(dims=self.dims, dropout=self.dropout, use_layernorm=True, normalize_input=False)
 		self.edge_wt_head = nn.Linear(self.dims[-1], 1)
 		self.edge_prob_head = nn.Linear(self.dims[-1],1)
+		self.similarity_block_size = similarity_block_size
+		self.edge_chunk_size = edge_chunk_size
+		self.return_individual_contributions = return_individual_contributions
 
 		# Initialize learnable monotonic non-linear functions that can translate similarity scores to edge probabilities and edge strengths.
 		# This ensures that the higher scores always mean higher edge probabilities and strengths, while allowing the model to learn the optimal nonlinear mapping from similarity to edge properties.
@@ -88,7 +92,7 @@ class Decoder(nn.Module):
 		self.transitivity_sharpness = 1.0
 		self.congruence_sharpness = 1.0
 
-	def Transitivity_and_Congruence(self, node_latent, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix):
+	def Transitivity_and_Congruence(self, normalized_latents, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix):
 		'''
 		Compute the likelihood of edge existence and strength based on transitivity and congruence.
 
@@ -107,6 +111,8 @@ class Decoder(nn.Module):
 		nbrs_u = neighborhood_matrix[u] # neighbors of u. Dimension = [num_edges, max_neighbors]
 		nbrs_v = neighborhood_matrix[v] # neighbors of v. Dimension = [num_edges, max_neighbors]
 
+		num_edges = u.size(0)
+		max_neighbors = neighborhood_matrix.size(1)
 
 		nbrs_u_mask = (nbrs_u != -1) # mask for valid neighbors of u
 		nbrs_v_mask = (nbrs_v != -1) # mask for valid neighbors of v
@@ -117,29 +123,38 @@ class Decoder(nn.Module):
 		nbrs_u_safe = nbrs_u.clamp_min(0)
 		nbrs_v_safe = nbrs_v.clamp_min(0)
 
-		latents_Nu = F.normalize(node_latent[nbrs_u_safe], p=2, dim=-1) # latent features of neighbors of u. Normalized along the feature (last) dimension for cosine similarity computation.
-		latents_Nv = F.normalize(node_latent[nbrs_v_safe], p=2, dim=-1) # latent features of neighbors of v. Normalized along the feature (last) dimension for cosine similarity computation.
+		latents_Nu = normalized_latents[nbrs_u_safe] # latent features of neighbors of u. 
+		latents_Nv = normalized_latents[nbrs_v_safe] # latent features of neighbors of v. 
 
-		latents_u	= F.normalize(node_latent[u], p=2, dim=-1).unsqueeze(1) # latent features of u
-		latents_v	= F.normalize(node_latent[v], p=2, dim=-1).unsqueeze(1) # latent features of v
+		latents_u	= normalized_latents[u].unsqueeze(1) # latent features of u
+		latents_v	= normalized_latents[v].unsqueeze(1) # latent features of v
 
 		# Calculate pairwise cosine similarity between neighbors of u and neighbors of v (Transitivity)
-		
-		nsim = torch.bmm(latents_Nu, latents_Nv.transpose(1, 2)) # shape: (num_edges, max_neighbors, max_neighbors)
-
-		# Mask out invalid pairs of neighbors (i.e., where either neighbor is invalid)
-
-		pair_mask = nbrs_u_mask.unsqueeze(2) & nbrs_v_mask.unsqueeze(1) # shape: (num_edges, max_neighbors, max_neighbors)
-
-		nsim.masked_fill_(~pair_mask, float('-inf')) # mask out invalid pairs
-		
 		# Compute the neighborhood similarity scores for u and v based on their neighbors' similarities
 		# LogSumExp is used to aggregate the similarity scores such that higher similarity scores dominate the aggregation, while still allowing for contributions from lower scores.
 		# This is biologically reasonable as it allows for the possibility that even if most neighbors are dissimilar, a few highly similar neighbors can still indicate a strong relationship. At the same time, more similar neighbors will increase the score, reflecting the idea that having more similar neighbors strengthens the evidence for a connection.
 
-		Nu_to_Nv = self.transitivity_sharpness * torch.logsumexp(nsim / self.transitivity_sharpness, dim=2)  # [num_edges, max_nbrs]
-		Nv_to_Nu = self.transitivity_sharpness * torch.logsumexp(nsim / self.transitivity_sharpness, dim=1)  # [num_edges, max_nbrs]
+		Nu_to_Nv = torch.full((num_edges, max_neighbors), -torch.inf, device=normalized_latents.device, dtype=torch.float32) 
 
+		Nv_to_Nu = torch.full((num_edges, max_neighbors), -torch.inf, device=normalized_latents.device, dtype=torch.float32)
+
+		for start in range(0, max_neighbors, self.similarity_block_size):
+			end = min(start + self.similarity_block_size, max_neighbors)
+
+			block_sim = torch.bmm(latents_Nu, latents_Nv[:, start:end].transpose(1,2)) # shape: (num_edges, max_neighbors, block_size)
+
+			block_mask = nbrs_u_mask.unsqueeze(2) & nbrs_v_mask[:, start:end].unsqueeze(1) # shape: (num_edges, max_neighbors, block_size)
+
+			block_sim.masked_fill_(~block_mask, -torch.inf)
+			block_sim.mul_(self.transitivity_sharpness)
+
+			Nu_to_Nv = torch.logaddexp(Nu_to_Nv, torch.logsumexp(block_sim, dim = 2))
+			Nv_to_Nu[:,start:end] = torch.logsumexp(block_sim, dim=1)
+
+		
+		Nu_to_Nv.div_(self.transitivity_sharpness)
+		Nv_to_Nu.div_(self.transitivity_sharpness)
+		
 		num_Nu = nbrs_u_mask.sum(dim=-1).clamp_min(1)
 		num_Nv = nbrs_v_mask.sum(dim=-1).clamp_min(1)
 
@@ -162,7 +177,7 @@ class Decoder(nn.Module):
 		assert combined_mask.any(dim=1).all(), \
     "Congruence calculation requires at least one valid neighbor per supervision edge."
 
-		combined_sim = torch.cat([sim_u_to_Nv, sim_v_to_Nu], dim=1) # shape: (num_edges, 2*max_neighbors)
+		combined_sim = torch.cat([sim_u_to_Nv, sim_v_to_Nu], dim=1).to(torch.float32) # shape: (num_edges, 2*max_neighbors)
 
 		combined_edge_strengths = torch.cat([neighborhood_strength_matrix[u], neighborhood_strength_matrix[v]], dim=1) # shape: (num_edges, 2*max_neighbors)
 		
@@ -170,7 +185,7 @@ class Decoder(nn.Module):
 
 		# Compute attention weights using softmax over the combined similarity scores. This allows the model to focus on the most relevant neighbor pairs when aggregating information for edge existence and strength predictions. A softmax is better choice than logsumexp here because we just want to find one good evidence of a congruent neighbor pair, rather than aggregating all the evidence. The softmax will assign higher weights to the most similar pairs, while still allowing for contributions from less similar pairs.
 
-		attention = torch.softmax(combined_sim / self.congruence_sharpness, dim=1)
+		attention = torch.softmax(combined_sim * self.congruence_sharpness, dim=1)
 
 		combined_sim.masked_fill_(~combined_mask, 0.0) # set invalid pairs to 0 for aggregation
 
@@ -185,13 +200,50 @@ class Decoder(nn.Module):
 		# Translate the neighborhood similarity and congruence scores into edge existence probabilities and edge strengths using the learnable monotonic mappings. This ensures that higher similarity scores always correspond to higher probabilities and strengths, while allowing the model to learn the optimal nonlinear mapping from similarity to edge properties.
 		ExistenceByTransitivity = self.monomap_EdgeExistence_NbrSimilarity(neighborhood_score.unsqueeze(-1)).squeeze(-1)
 
-		ExistenceByTransitivity[transitivity_impossible] = 0.0 # if transitivity is not possible (i.e., one of the nodes has no neighbors), we explicitly set the existence probability to 0.0, as we have no evidence to support the existence of an edge based on transitivity.
+		ExistenceByTransitivity = ExistenceByTransitivity.masked_fill(
+    transitivity_impossible, 0.0) # if transitivity is not possible (i.e., one of the nodes has no neighbors), we explicitly set the existence probability to 0.0, as we have no evidence to support the existence of an edge based on transitivity.
 
 		ExistenceByCongruence = self.monomap_EdgeExistence_Congruence(congruence_score.unsqueeze(-1)).squeeze(-1)
 
 		StrengthByCongruence = self.monomap_EdgeStrength_Congruence(congruence_strength.unsqueeze(-1)).squeeze(-1)
 
 		return ExistenceByTransitivity, ExistenceByCongruence, StrengthByCongruence
+
+	def chunked_Transitivity_and_Congruence(self, node_latent, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix):
+		num_edges = supervision_edges.size(1)
+		ExistenceByTransitivity = torch.empty(num_edges, device=node_latent.device, dtype=torch.float32)
+		ExistenceByCongruence = torch.empty(num_edges, device=node_latent.device, dtype=torch.float32)
+		StrengthByCongruence = torch.empty(num_edges, device=node_latent.device, dtype=torch.float32)
+
+		normalized_latents = F.normalize(node_latent, p=2, dim=-1).to(torch.bfloat16)
+
+		for start in range(0, num_edges, self.edge_chunk_size):
+			end = min(start + self.edge_chunk_size, num_edges)
+			edge_chunk = supervision_edges[:, start:end]
+
+			if self.training and torch.is_grad_enabled():
+				ET, EC, SC = checkpoint(
+					self.Transitivity_and_Congruence,
+					normalized_latents,
+					edge_chunk,
+					neighborhood_matrix,
+					neighborhood_strength_matrix,
+					use_reentrant=False
+				)
+			else:
+				ET, EC, SC = self.Transitivity_and_Congruence(
+					normalized_latents,
+					edge_chunk,
+					neighborhood_matrix,
+					neighborhood_strength_matrix
+				)
+
+
+			ExistenceByTransitivity[start:end] = ET
+			ExistenceByCongruence[start:end] = EC
+			StrengthByCongruence[start:end] = SC
+
+		return ExistenceByTransitivity, ExistenceByCongruence, StrengthByCongruence 
 
 	def forward(self, nodes_latent, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix):
 
@@ -201,7 +253,7 @@ class Decoder(nn.Module):
 		combined = torch.cat([additive, multiplicative], dim=-1)
 		edge_features = self.edge_embedder(combined)
 
-		ExistenceByTransitivity, ExistenceByCongruence, StrengthByCongruence = self.Transitivity_and_Congruence(nodes_latent, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix)
+		ExistenceByTransitivity, ExistenceByCongruence, StrengthByCongruence = self.chunked_Transitivity_and_Congruence(nodes_latent, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix)
 
 		ExistenceViaDecoder = self.edge_prob_head(edge_features).squeeze(-1)
 
@@ -211,14 +263,17 @@ class Decoder(nn.Module):
 
 		edge_strengths = StrengthViaDecoder + StrengthByCongruence
 
-		individual_contributions = {
+		if not self.return_individual_contributions:
+			return edge_prob_logits, edge_strengths
+		else:
+			individual_contributions = {
 			"ExistenceByCongruence": ExistenceByCongruence.detach().cpu(),
 			"ExistenceByTransitivity": ExistenceByTransitivity.detach().cpu(),
 			"ExistenceViaDecoder": ExistenceViaDecoder.detach().cpu(),
 			"StrengthByCongruence": StrengthByCongruence.detach().cpu(),
 			"StrengthViaDecoder": StrengthViaDecoder.detach().cpu()
-		}
-		return edge_prob_logits, edge_strengths, individual_contributions
+			}
+			return edge_prob_logits, edge_strengths, individual_contributions
 	
 def reparameterize(mu, std):
 	eps = torch.randn_like(std)
@@ -237,13 +292,17 @@ class GVAE_Model(nn.Module):
 		nodes_latent = reparameterize(node_mu, node_std)
 
 		# Decode edges
-		edge_prob_logits, edge_strengths, edge_contributions = self.decoder(
+		output = self.decoder(
 			nodes_latent,
 			supervision_edges,
 			neighborhood_matrix,
 			neighborhood_strength_matrix
 		)
-		return edge_prob_logits, edge_strengths, edge_contributions, node_mu, node_std
+		
+		if self.decoder.return_individual_contributions:
+			return output[0], output[1], node_mu, node_std, output[2]
+		else:
+			return output[0], output[1], node_mu, node_std
 	
 def KL_loss(mu, std):
 	# num_nodes = mu.size(0)
@@ -251,7 +310,7 @@ def KL_loss(mu, std):
 	return kld / mu.numel()  # Normalize by the number of elements in mu
 	
 
-def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, device:torch.device, mse_coefficient=1.0, kld_coefficient=1.0, is_training=False, return_output=False):
+def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, mse_coefficient=1.0, kld_coefficient=1.0, is_training=False, return_output=False):
 	"""
 	Processes a single batch for training or validation.
 
@@ -260,7 +319,7 @@ def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimize
 
 	Args:
 		data (torch_geometric.data.Data): Batch data object.
-		model (nn.Module): The GraphSAGE model.
+		model (nn.Module): The GVAE model.
 		optimizer (torch.optim.Optimizer): Optimizer.
 		device (torch.device): Device for computation.
 		is_training (bool): If True, performs training steps.
@@ -269,22 +328,23 @@ def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimize
 		float: Loss value for the batch.
 	"""
 	# Move data to the correct device
-	data = data.to(device)
+	data = data.to(model.device)
 
 	# Set model mode and optimizer behavior
 	if is_training:
-		optimizer.zero_grad()  # Zero gradients before backward calls
+		optimizer.zero_grad(set_to_none=True)  # Zero gradients before backward calls
 		conditional_backward = lambda loss: loss.backward()  # Define backpropagation
 	else:
 		conditional_backward = lambda loss: None  # No-op for validation
 
-	edge_prob_logits, edge_strengths, edge_contributions, node_mu, node_std = model(
+	output = model(
     data.node_features,
     data.supervision_edges,
     data.neighborhood_matrix,
     data.neighborhood_weights,
-)
-
+	)
+	edge_prob_logits, edge_strengths, node_mu, node_std = output[0:4]
+	
 	# Compute losses
 
 	bce_edge_classification_loss = bce_logits_loss(edge_prob_logits, data.supervision_labels)
@@ -308,6 +368,10 @@ def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimize
 		optimizer.step()
 
 	if return_output:
-		return loss.item(), edge_prob_logits.detach().cpu(), data.supervision_labels.detach().cpu()
+		if model.decoder.return_individual_contributions:
+			return loss.item(), edge_prob_logits.detach().cpu(), data.supervision_labels.detach().cpu(), output[-1]
+		else:
+			return loss.item(), edge_prob_logits.detach().cpu(), data.supervision_labels.detach().cpu()
+		 
 	else:
 		return loss.item()

@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 import torch
 import TrainUtils as TU
-from GVAE_model import GVAE_model as GVAE, process_data_GVAE as process_data
+from GVAE_model import GVAE_Model as GVAE, process_data_GVAE as process_data
 import optuna
 from optuna.samplers import TPESampler
 from optuna.storages import JournalStorage
@@ -29,7 +29,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	mse_coefficient = params['mse_coefficient']
 
 
-	median_centralities = [data.node_degree.median().item() for data in dataset]
+	median_centralities = [data["Train"].node_degree.median().item() for data in dataset]
 	reference_centrality = sum(median_centralities)/len(median_centralities)
 
 	batch_loader_params = {
@@ -58,7 +58,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 
 	# Initialize model and optimizer
 	model = GVAE(
-		input_dimension = data_for_training[0]["Val"].x.size(1),
+		input_dimension = data_for_training[0]["input_channels"],
 		num_encoder_layers = num_encoder_layers,
 		latent_dimension = latent_dimension,
 		num_decoder_layers = num_decoder_layers,
@@ -80,10 +80,16 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		min_lr=1e-6
 	)
 
-	total_val_samples = sum([(data["val_sampler"].num_supervision_edges + data["val_sampler"].num_negative_edges)*data["val_sampler"].num_batches for data in data_for_training])
+	total_val_samples = sum(
+		[
+			data["val_sampler"].num_all_sup_edges * data["val_sampler"].num_batches 
 
-	preds_buf = torch.zeros(total_val_samples, dtype=torch.float32)
-	labels_buf = torch.zeros(total_val_samples, dtype=torch.int8)
+	 	for data in data_for_training
+	 	]
+	 )
+
+	preds_buf = torch.zeros(total_val_samples, dtype=torch.float32, device="cpu")
+	labels_buf = torch.zeros(total_val_samples, dtype=torch.float32, device="cpu")
 
 	# Training loop
 	best_composite_score = float('inf')
@@ -127,38 +133,36 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		average_val_loss = total_val_loss / val_batch_count
 		
 		# Early stopping logic
-		if epochs_since_curriculum_completed > 2:
-			auc = utils.auc_score(preds_buf, labels_buf)
-			auc_penalty = 1 / (1 + math.exp(-20*(0.9 - auc)))
-			composite_score = average_val_loss*(1 + auc_penalty)
-			if auc > best_auc:
-				best_auc = auc
-				best_auc_epoch = epoch + 1
-			if best_composite_score > composite_score:
-				best_composite_score = composite_score
-				val_loss_at_best_score = average_val_loss
-				train_loss_at_best_score = average_train_loss
-				epochs_without_improvement = 0
-				best_score_epoch = epoch + 1
-				auc_at_best_score = auc
-				network_skip_at_best_score = model.network_skip
-			else:
-				epochs_without_improvement += 1
+		auc = TU.auc_score(preds_buf, labels_buf)
+		auc_penalty = 1 / (1 + math.exp(-20*(0.9 - auc)))
+		composite_score = average_val_loss*(1 + auc_penalty)
+		if auc > best_auc:
+			best_auc = auc
+			best_auc_epoch = epoch + 1
+		if best_composite_score > composite_score:
+			best_composite_score = composite_score
+			val_loss_at_best_score = average_val_loss
+			train_loss_at_best_score = average_train_loss
+			epochs_without_improvement = 0
+			best_score_epoch = epoch + 1
+			auc_at_best_score = auc
+		else:
+			epochs_without_improvement += 1
 			
-			yield {
-			"epoch": epoch + 1,
-			"average_train_loss": average_train_loss,
-			"average_val_loss": average_val_loss,
-			"val_loss_at_best_score": val_loss_at_best_score,
-			"train_loss_at_best_score": train_loss_at_best_score,
-			"best_score_epoch": best_score_epoch,
-			"learning_rate": optimizer.param_groups[0]['lr'],
-			"auc_at_best_score": auc_at_best_score,
-			"best_auc": best_auc,
-			"best_auc_epoch": best_auc_epoch,
-			"composite_score": composite_score,
-			"best_composite_score": best_composite_score
-			}
+		yield {
+		"epoch": epoch + 1,
+		"average_train_loss": average_train_loss,
+		"average_val_loss": average_val_loss,
+		"val_loss_at_best_score": val_loss_at_best_score,
+		"train_loss_at_best_score": train_loss_at_best_score,
+		"best_score_epoch": best_score_epoch,
+		"learning_rate": optimizer.param_groups[0]['lr'],
+		"auc_at_best_score": auc_at_best_score,
+		"best_auc": best_auc,
+		"best_auc_epoch": best_auc_epoch,
+		"composite_score": composite_score,
+		"best_composite_score": best_composite_score
+		}
 
 		# Step the schedulers
 		scheduler.step(average_val_loss)
@@ -188,8 +192,8 @@ if __name__ == "__main__":
 	)
 	parser.add_argument("--training_data",
 		type=str,
-		help="Save split data and negative edges to file (.pt)",
-		default=None
+		help="Load split data and negative edges from file (.pt)",
+		required=True
 	)
 	parser.add_argument("--num_trials","-n",
 		type=int,
@@ -199,7 +203,7 @@ if __name__ == "__main__":
 	parser.add_argument("--journal_file",
 		type=str,
 		help="Path to the Optuna journal file for storing study results",
-		default=None
+		required=True
 	)
 
 	SEED = 48149
@@ -223,19 +227,6 @@ if __name__ == "__main__":
 		sys.exit(0)
 
 
-	# if args.journal_file is not None:
-	# 	journal_file = args.journal_file
-	# else:
-	# 	journal_file = f"{Path(__file__).parent.resolve()}/OptunaJournal.log"
-
-	# storage = JournalStorage(JournalFileBackend(args.journal_file))
-	# study = optuna.load_study(study_name="PiPPINN_HPO",storage=storage)
-	# best_trials = choose_best_trials(study)
-
-	# best_trials = [x for x in best_trials if x.params["depth"] > 3]
-
-	# new_study_file = f"{Path(args.journal_file).with_suffix('')}_from_BestTrials.log"
-
 	storage = JournalStorage(JournalFileBackend(args.journal_file))
 
 	pruner = HyperbandPruner(min_resource=15, reduction_factor=3)
@@ -251,32 +242,27 @@ if __name__ == "__main__":
 	dataset = torch.load(args.training_data, weights_only = False)
 	input_channels = dataset[0]["Val"].x.size(1)
 
-	# def early_stop_callback(study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
-	# 	if len(study.trials) > 10:
-	# 		recent = [t.value for t in study.trials[-10:] if t.value is not None]
-	# 		if max(recent) - min(recent) < 1e-4:
-	# 			raise optuna.exceptions.OptunaError("Stopping: Converged")
-
 	def objective(trial):
 		val_loss_at_best_score = float('inf')
 		train_loss_at_best_score = float('inf')
 		composite_score = float('inf')
 		best_composite_score = float('inf')
-		epoch_since_curriculum_completed = 0
 		best_score_epoch = 0
 		auc_at_best_score = float('-inf')
 		best_auc = float('-inf')
 		best_auc_epoch = 0
-		network_skip_at_best_score = 0.0
 		composite_score = float('inf')
 		params = {
 			"learning_rate": trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
 			"scheduler_factor": trial.suggest_float("scheduler_factor", 0.1, 0.5),
 			"dropout": trial.suggest_float("dropout", 0.1, 0.35),
 			"weight_decay": trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True),
-			"centrality_fraction": trial.suggest_float("centrality_fraction", 0.2, 0.69, log=True),
+			"centrality_fraction": trial.suggest_float("centrality_fraction", 0.2, 0.69),
 			"nbr_weight_intensity": trial.suggest_float("nbr_weight_intensity", 0.25, 3.0, log=True),
-			"latent dimension": trial.suggest_categorical("latent_dimension", [64, 128, 256, 512]),
+			"max_neighbors": trial.suggest_categorical("max_neighbors", [30, 45, 60, 75, 90]),
+			"reference_adjustment": trial.suggest_float("reference_adjustment", 0.0, 1.0),
+			"negative_label_hardness": trial.suggest_float("negative_label_hardness", 0.1, 3.0, log=True),
+			"latent_dimension": trial.suggest_categorical("latent_dimension", [64, 128, 256, 512]),
 			"num_encoder_layers": trial.suggest_int("num_encoder_layers", 2, 4),
 			"num_decoder_layers": trial.suggest_int("num_decoder_layers", 2, 3),
 			"kld_coefficient": trial.suggest_float("kld_coefficient", 0.01, 1.0, log=True),
@@ -290,10 +276,8 @@ if __name__ == "__main__":
 				train_loss_at_best_score = result["train_loss_at_best_score"]
 				best_score_epoch = result["best_score_epoch"]
 				auc_at_best_score = result["auc_at_best_score"]
-				network_skip_at_best_score = result["network_skip_at_best_score"]
 				best_auc = result["best_auc"]
 				best_auc_epoch = result["best_auc_epoch"]
-				epoch_since_curriculum_completed = result["epochs_since_curriculum_completed"]
 				best_composite_score = result["best_composite_score"]
 				trial.report(composite_score, step=epoch)
 				if trial.should_prune():
@@ -303,8 +287,6 @@ if __name__ == "__main__":
 			trial.set_user_attr("train_loss_at_best_score", train_loss_at_best_score)
 			trial.set_user_attr("val_loss_at_best_score", val_loss_at_best_score)
 			trial.set_user_attr("auc_at_best_score", auc_at_best_score)
-			trial.set_user_attr("network_skip_at_best_score", network_skip_at_best_score)
-			trial.set_user_attr("epoch_since_curriculum_completed", epoch_since_curriculum_completed)
 			trial.set_user_attr("best_auc", best_auc)
 			trial.set_user_attr("best_auc_epoch", best_auc_epoch)
 		except RuntimeError as e:
