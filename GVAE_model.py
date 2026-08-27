@@ -164,8 +164,19 @@ class Decoder(nn.Module):
 		score_u = Nu_to_Nv.sum(dim=1) / num_Nu
 		score_v = Nv_to_Nu.sum(dim=1) / num_Nv
 
-		# Determine the neighborhood score based on the number of neighbors for u and v. The score is taken from the node with fewer neighbors to avoid biasing towards nodes with more neighbors, which could artificially deflate similarity scores.
-		neighborhood_score = torch.where(num_Nu <= num_Nv, score_u, score_v)
+		# Use directed containment from the smaller neighborhood into the larger one.
+		# When both neighborhoods have the same size, average the two directional
+		# scores so an undirected edge is invariant to swapping u and v.
+		equal_neighborhood_sizes = num_Nu == num_Nv
+		neighborhood_score = torch.where(
+			num_Nu < num_Nv,
+			score_u,
+			torch.where(
+				equal_neighborhood_sizes,
+				0.5 * (score_u + score_v),
+				score_v,
+			),
+		)
 
 		# Perform pairwise cosine similarity between u and neighbors of v, and v and neighbors of u (Congruence)
 
