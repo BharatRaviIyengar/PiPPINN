@@ -4,13 +4,14 @@ import torch.nn.functional as F
 from torch_geometric.data import Data
 from TrainUtils import build_MLP, generate_hidden_dims
 from torch.utils.checkpoint import checkpoint
+from dataclasses import dataclass
 
 bce_logits_loss = F.binary_cross_entropy_with_logits
 cosim = F.cosine_similarity
 
 # PositiveLinear ensures weight >= 0
 class PositiveLinear(nn.Module):
-	def __init__(self, in_features, out_features, bias=True, epsilon=1e-6):
+	def __init__(self, in_features, out_features, bias=True, epsilon=1e-6, initial_row_sum = 1.0):
 		super().__init__()
 		self.epsilon = epsilon
 		self.raw_weight = nn.Parameter(torch.randn(out_features, in_features) * 0.01)
@@ -19,9 +20,17 @@ class PositiveLinear(nn.Module):
 		else:
 			self.register_parameter('bias', None)
 
+		target_weight = initial_row_sum/in_features
+		assert target_weight > epsilon
+
+		offset = torch.tensor(target_weight - epsilon, dtype=torch.float32)
+		offset.expm1_().log_()
+
+		self.register_buffer("initialization_offset", offset)
+
 	def forward(self, x):
 		# softplus ensures strictly positive weights
-		weight = F.softplus(self.raw_weight) + self.epsilon
+		weight = F.softplus(self.raw_weight + self.inialization_offset) + self.epsilon
 		return F.linear(x, weight, self.bias)
 
 # MonotoneMap using PositiveLinear layers
@@ -60,13 +69,22 @@ class NodeEncoder(nn.Module):
 		self.transform = build_MLP(self.channels, dropout=dropout, use_layernorm=True)
 		self.gaussian_mu_head = nn.Linear(output_dimension, output_dimension)
 		self.gaussian_logvar_head = nn.Linear(output_dimension, output_dimension)
+		nn.init.zeros_(self.gaussian_logvar_head.weight)
+		nn.init.zeros_(self.gaussian_logvar_head.bias)
+
+	def smooth_clamp(self, raw_logvar, lower=-10.0, upper=6.0):
+		return (
+				lower
+				+ F.softplus(raw_logvar - lower)
+				- F.softplus(raw_logvar - upper)
+		)
 
 	def forward(self, x):
 		x = self.transform(x)
 		mu = self.gaussian_mu_head(x)
 		logvar = self.gaussian_logvar_head(x)
-		std = torch.exp(0.5 * logvar)
-		return mu, std
+		logvar = self.smooth_clamp(logvar)
+		return mu, logvar
 	
 class Decoder(nn.Module):
 	def __init__(self, in_channels, num_decoder_layers, dropout=0.0, similarity_block_size = 15, edge_chunk_size = 3000, return_individual_contributions=False):
@@ -216,7 +234,7 @@ class Decoder(nn.Module):
 
 		ExistenceByCongruence = self.monomap_EdgeExistence_Congruence(congruence_score.unsqueeze(-1)).squeeze(-1)
 
-		StrengthByCongruence = self.monomap_EdgeStrength_Congruence(congruence_strength.unsqueeze(-1)).squeeze(-1)
+		StrengthByCongruence = F.softplus(self.monomap_EdgeStrength_Congruence(congruence_strength.unsqueeze(-1)).squeeze(-1))
 
 		return ExistenceByTransitivity, ExistenceByCongruence, StrengthByCongruence
 
@@ -286,21 +304,40 @@ class Decoder(nn.Module):
 			}
 			return edge_prob_logits, edge_strengths, individual_contributions
 	
-def reparameterize(mu, std):
-	eps = torch.randn_like(std)
-	return mu + eps * std
+def reparameterize(mu, logvar):
+	eps = torch.randn_like(mu)
+	return mu + eps * torch.exp(0.5 * logvar)
 
+def KL_loss(mu, logvar):
+	KL =  0.5 * (mu.square() + torch.expm1(logvar) - logvar)
+	return KL.mean()
 
 class GVAE_Model(nn.Module):
 	def __init__(self, input_dimension, num_encoder_layers, latent_dimension,num_decoder_layers, dropout=0.0):
 		super().__init__()
-		self.node_encoder = NodeEncoder(input_dimension, num_encoder_layers, latent_dimension, dropout)
-		self.decoder = Decoder(latent_dimension, num_decoder_layers, dropout)
+
+		self.node_encoder = NodeEncoder(
+			input_dimension = input_dimension,
+			num_layers = num_encoder_layers,
+			output_dimension = latent_dimension,
+			dropout = dropout
+			)
+		
+		self.decoder = Decoder(
+			in_channels = latent_dimension,
+			num_decoder_layers = num_decoder_layers,
+			dropout=dropout,
+			similarity_block_size = 15,
+			edge_chunk_size = 3000 
+			)
 
 	def forward(self, x, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix):
 		# Encode nodes
-		node_mu, node_std = self.node_encoder(x)
-		nodes_latent = reparameterize(node_mu, node_std)
+		node_mu, node_logvar = self.node_encoder(x)
+		if self.training:
+			nodes_latent = reparameterize(node_mu, node_logvar)
+		else:
+			nodes_latent = node_mu
 
 		# Decode edges
 		output = self.decoder(
@@ -311,17 +348,16 @@ class GVAE_Model(nn.Module):
 		)
 		
 		if self.decoder.return_individual_contributions:
-			return output[0], output[1], node_mu, node_std, output[2]
+			return output[0], output[1], node_mu, node_logvar, output[2]
 		else:
-			return output[0], output[1], node_mu, node_std
+			return output[0], output[1], node_mu, node_logvar
 	
-def KL_loss(mu, std):
-	# num_nodes = mu.size(0)
-	kld = -0.5 * torch.sum(1 + torch.log(std.pow(2) + 1e-8) - mu.pow(2) - std.pow(2))
-	return kld / mu.numel()  # Normalize by the number of elements in mu
-	
+@dataclass
+class TrainingParameters:
+		mse_coefficient: float = 1.0
+		kld_coefficient: float = 1.0
 
-def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, mse_coefficient=1.0, kld_coefficient=1.0, is_training=False, return_output=False):
+def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimizer, training_parameters:TrainingParameters, return_output=False):
 	"""
 	Processes a single batch for training or validation.
 
@@ -332,17 +368,16 @@ def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimize
 		data (torch_geometric.data.Data): Batch data object.
 		model (nn.Module): The GVAE model.
 		optimizer (torch.optim.Optimizer): Optimizer.
-		device (torch.device): Device for computation.
 		is_training (bool): If True, performs training steps.
 
 	Returns:
 		float: Loss value for the batch.
 	"""
-	# Move data to the correct device
-	data = data.to(model.device)
+	# Check if data is in correct device
+	assert data.device == next(model.parameters()).device
 
 	# Set model mode and optimizer behavior
-	if is_training:
+	if model.training:
 		optimizer.zero_grad(set_to_none=True)  # Zero gradients before backward calls
 		conditional_backward = lambda loss: loss.backward()  # Define backpropagation
 	else:
@@ -354,7 +389,7 @@ def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimize
     data.neighborhood_matrix,
     data.neighborhood_weights,
 	)
-	edge_prob_logits, edge_strengths, node_mu, node_std = output[0:4]
+	edge_prob_logits, edge_strengths, node_mu, node_logvar = output[0:4]
 	
 	# Compute losses
 
@@ -368,14 +403,14 @@ def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimize
 
 	loss = (
 		bce_edge_classification_loss +
-		mse_coefficient * mse_edge_strength_loss +
-		kld_coefficient * KL_loss(node_mu, node_std)
+		training_parameters.mse_coefficient * mse_edge_strength_loss +
+		training_parameters.kld_coefficient * KL_loss(node_mu, node_logvar)
 	)
 
 	# loss = calculate_loss(model_output, data, head_weights)
 	conditional_backward(loss)
 
-	if is_training:
+	if model.training:
 		optimizer.step()
 
 	if return_output:

@@ -1,0 +1,586 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=25mm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{microtype}
+\usepackage{parskip}
+
+\definecolor{accent}{HTML}{244A73}
+\definecolor{codebg}{HTML}{F4F6F8}
+\definecolor{codegreen}{HTML}{276749}
+\definecolor{codegray}{HTML}{5F6B76}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=accent,
+  urlcolor=accent,
+  pdftitle={PiPPINN Encoder-Decoder Design Notes},
+  pdfsubject={Interpretability, reliability, PU learning, monotone maps, and KL stabilization}
+}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codebg},
+  keywordstyle=\color{accent}\bfseries,
+  commentstyle=\color{codegreen},
+  stringstyle=\color{codegray},
+  breaklines=true,
+  showstringspaces=false,
+  columns=fullflexible,
+  xleftmargin=0.5em,
+  xrightmargin=0.5em,
+  aboveskip=0.8em,
+  belowskip=0.8em
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{PiPPINN Model Design Notes}
+\rhead{Encoder-Decoder Architecture}
+\cfoot{\thepage}
+\setlength{\headheight}{14pt}
+
+\setlist[itemize]{leftmargin=1.5em,itemsep=0.25em,topsep=0.35em}
+\setlist[enumerate]{leftmargin=1.7em,itemsep=0.35em,topsep=0.35em}
+
+\title{\textcolor{accent}{PiPPINN Encoder-Decoder Design Notes}\\
+\large Interpretable Evidence, Coverage-Aware PU Learning, Monotone Maps, and KL Stabilization}
+\author{Technical discussion exported for offline reading}
+\date{August 2026}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{fancy}
+
+\begin{abstract}
+This document explains several conceptual improvements to the PiPPINN
+encoder-decoder while treating the upstream ESM-derived node features as fixed.
+The focus is on the interpretation of additive decoder branches, evidence
+reliability, positive-unlabeled learning under species-dependent coverage,
+stable monotone mappings, and stable variational training. The unfinished
+\texttt{HPO\_stage2.py} and \texttt{Evaluate\_Trained.py} workflows are outside
+the scope of this discussion.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{What ``not statistically identifiable or reliability-aware'' means}
+
+These are two separate limitations. They do not imply that the biological
+motivation of the transitivity or congruence branches is invalid.
+
+\subsection{Statistical identifiability of branch contributions}
+
+The current existence logit has the additive form
+
+\begin{equation}
+  \ell_{uv}
+  = C_{\mathrm{trans}}(u,v)
+  + C_{\mathrm{cong}}(u,v)
+  + C_{\mathrm{MLP}}(u,v).
+\end{equation}
+
+Only the total is supervised. For example, a model could produce
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+Branch & Decomposition A & Decomposition B \\
+\midrule
+Transitivity & $+3$ & $+5$ \\
+Congruence & $+2$ & $+1$ \\
+Direct MLP & $-1$ & $-2$ \\
+\midrule
+Total logit & $+4$ & $+4$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The binary cross-entropy loss cannot distinguish these decompositions. This
+ambiguity is possible because:
+
+\begin{itemize}
+  \item each branch can contain a trainable bias;
+  \item the unrestricted MLP can learn signals correlated with homology or
+        neighborhood evidence;
+  \item only the final sum receives an interaction target.
+\end{itemize}
+
+The reported values are therefore exact computational contributions under the
+current parameterization, but their allocation among branches may change across
+training runs.
+
+\subsubsection*{Minimal improvement: anchor each named branch}
+
+Use one global baseline and make each named evidence function zero at a defined
+neutral input:
+
+\begin{equation}
+  C_t(s) = f_t(s) - f_t(s_{t,\mathrm{neutral}}).
+\end{equation}
+
+The combined model becomes
+
+\begin{equation}
+  \ell_{uv}
+  = b + C_{\mathrm{MLP}}(u,v)
+  + g_t C_t(u,v) + g_c C_c(u,v),
+\end{equation}
+
+where $b$ is the only global prevalence baseline. For the deliberately
+unnormalized transitivity score, a reasonable neutral reference is the expected
+score of one random cosine comparison, approximately zero. This preserves the
+intended interpretation that a larger number of supporting comparisons can add
+evidence.
+
+Anchoring removes arbitrary branch-baseline offsets. It does not remove every
+possible redundancy with the MLP. Branch dropout, ablation tests, and
+contribution-stability measurements across random seeds can quantify the
+remaining redundancy.
+
+\section{Evidence-reliability gates}
+
+A reliability gate answers the question:
+
+\begin{quote}
+Given that an evidence branch produced a particular contribution, how strongly
+should that contribution be trusted in this neighborhood context?
+\end{quote}
+
+It is not another interaction predictor. It scales evidence using information
+about the support and precision of the evidence calculation.
+
+Conceptually:
+
+\begin{lstlisting}[language=Python]
+transitivity_contribution = (
+    transitivity_available
+    * transitivity_reliability
+    * centered_transitivity_evidence
+)
+\end{lstlisting}
+
+The reliability is constrained to $[0,1]$. Multiplication attenuates both
+positive and negative evidence when the underlying estimate is unreliable.
+
+\subsection{Why a gate can help}
+
+Similar aggregate scores can arise from contexts with different certainty:
+
+\begin{itemize}
+  \item a very small neighborhood with one strong match;
+  \item many members of the smaller neighborhood consistently matching the
+        larger neighborhood;
+  \item a calculation based on a heavily truncated neighborhood;
+  \item a score that changes substantially under a different sampled message
+        context.
+\end{itemize}
+
+The unnormalized transitivity score represents the amount of supporting
+similarity. The gate represents uncertainty in that amount. These are distinct
+quantities.
+
+\subsection{A simple analytical gate}
+
+Let
+
+\begin{equation}
+  m = \min\bigl(|N(u)|,|N(v)|\bigr).
+\end{equation}
+
+A saturating count-reliability function is
+
+\begin{equation}
+  g_{\mathrm{count}} = \frac{m}{m+k},
+\end{equation}
+
+where $k$ is the amount of support that yields half reliability. If $k=5$,
+then $m=1$, $m=5$, and $m=20$ yield approximately $0.17$, $0.50$, and $0.80$.
+
+If the full known degree is available before neighborhood restriction, define
+
+\begin{equation}
+  q_u =
+  \frac{|N_{\mathrm{retained}}(u)|}
+       {\min\bigl(|N_{\mathrm{known}}(u)|,\mathrm{max\_neighbors}\bigr)},
+\end{equation}
+
+and analogously for $q_v$. A simple transitivity reliability is then
+
+\begin{equation}
+  g_t =
+  \mathbf{1}_{\mathrm{available}}
+  \frac{m}{m+k}\sqrt{q_uq_v}.
+\end{equation}
+
+An analytical gate is a good initial implementation. If it is learned, its
+inputs should be limited to reliability variables such as counts, truncation
+fractions, and sampling stability. Feeding latent similarity into the gate
+would allow it to become an additional hidden interaction predictor.
+
+An especially useful reliability measurement is context stability. A small
+subset of candidate edges can occasionally be evaluated under two independently
+sampled neighborhoods. Their contribution variance provides a direct estimate
+of sampling uncertainty without doubling the cost for every edge.
+
+\section{Complementary interactions and the direct decoder}
+
+The deep direct decoder MLP does not assume latent similarity. Its sum and
+elementwise-product representation is symmetric under endpoint exchange, while
+the resulting function can remain arbitrary and non-monotonic. It can learn:
+
+\begin{itemize}
+  \item similar-role interactions;
+  \item complementary-role interactions;
+  \item incompatibilities;
+  \item nonlinear combinations of latent properties.
+\end{itemize}
+
+A separate complementary expert is therefore unnecessary for predictive
+expressiveness. Such an expert would only be useful if complementarity itself
+needed to become another explicitly named explanatory mechanism.
+
+There is one interpretive subtlety. The similarity branches and the MLP operate
+on the same learned node latent. Gradients from transitivity and congruence pass
+through the node encoder. Consequently, cosine similarity in that space is not
+guaranteed to remain a pure measure of biological homology; it is a supervised
+transformation of the ESM features. Unless this is validated against known
+families or homology annotations, ``learned homology-like similarity'' is the
+more precise description.
+
+\section{Positive-unlabeled learning with coverage assumptions}
+
+The intended reasoning is coherent:
+
+\begin{itemize}
+  \item an absent edge between well-covered proteins is stronger evidence of
+        non-interaction;
+  \item absence involving poorly covered proteins is weak evidence;
+  \item node centrality is a proxy for local experimental coverage;
+  \item species-level dataset quality changes how centrality should be
+        interpreted.
+\end{itemize}
+
+Without negatives or external coverage data, true interaction probability and
+observation probability cannot be learned independently. Some coverage
+assumption is unavoidable. The improvement is to express that assumption as an
+observation process rather than assigning an unlabeled pair an artificial
+positive target.
+
+\subsection{Separate biological truth from observation}
+
+Let
+
+\begin{itemize}
+  \item $Y_{uv}=1$ mean that the true biological interaction exists;
+  \item $O_{uv}=1$ mean that the interaction occurs in the observed dataset;
+  \item $p_{uv}=P(Y_{uv}=1)$;
+  \item $\pi_{uv}=P(O_{uv}=1\mid Y_{uv}=1)$ be the observation propensity.
+\end{itemize}
+
+Assuming recorded edges are genuine,
+
+\begin{equation}
+  P(O_{uv}=1) = \pi_{uv}p_{uv}.
+\end{equation}
+
+The negative log likelihood is
+
+\begin{equation}
+L_{uv}=
+\begin{cases}
+  -\log(\pi_{uv}p_{uv}), & O_{uv}=1,\\[4pt]
+  -\log(1-\pi_{uv}p_{uv}), & O_{uv}=0.
+\end{cases}
+\end{equation}
+
+If $\pi$ is fixed by the coverage model, $-\log\pi$ is constant for observed
+positives. The effective interaction-model losses are
+
+\begin{align}
+  L_{\mathrm{positive}} &= -\log p,\\
+  L_{\mathrm{unlabeled}} &= -\log(1-\pi p).
+\end{align}
+
+This has the desired behavior:
+
+\begin{itemize}
+  \item high $\pi$: a missing edge pushes $p$ downward strongly;
+  \item low $\pi$: absence supplies little negative evidence;
+  \item poor coverage does not imply that a missing pair is positive; it means
+        that the observation is uninformative.
+\end{itemize}
+
+That last distinction matters. A soft target near $0.5$ tells the model that an
+unobserved pair has high positive probability. The observation likelihood only
+reduces the negative information supplied by its absence.
+
+\subsection{Local coverage within each species}
+
+Normalize degree within species so that high centrality means high coverage
+relative to that organism:
+
+\begin{equation}
+  c_i^{(s)} =
+  \operatorname{sigmoid}\left(
+    a\frac{\log(1+d_i)-\operatorname{median}_s}
+           {\operatorname{IQR}_s+\epsilon}
+  \right).
+\end{equation}
+
+A percentile rank is a simpler alternative. A smooth pair-level coverage score
+is
+
+\begin{equation}
+  c_{uv}^{(s)} = \sqrt{c_u^{(s)}c_v^{(s)}}.
+\end{equation}
+
+The geometric mean says that absence is highly reliable only if both proteins
+are well covered. A sum encodes a different assumption: one highly studied
+endpoint may be sufficient to make absence informative.
+
+\subsection{Species-level coverage}
+
+Introduce a species-specific coverage ceiling $g_s$:
+
+\begin{equation}
+  \pi_{uv}=g_s c_{uv}^{(s)}.
+\end{equation}
+
+A highly central Arabidopsis pair may have $c_{uv}\simeq1$, but a lower $g_s$
+still prevents it from being treated as equally covered as a corresponding
+human pair.
+
+Without external information, the absolute $g_s$ values remain unidentified.
+Practical options are:
+
+\begin{enumerate}
+  \item construct a fixed proxy from median degree, edges per protein, or
+        another dataset-coverage statistic;
+  \item specify plausible low, medium, and high coverage scenarios;
+  \item check whether the important predictions remain stable across those
+        scenarios;
+  \item if $g_s$ is learned, constrain it strongly with priors and an externally
+        selected reference species.
+\end{enumerate}
+
+Giving every species a freely learned propensity is risky: the model could
+explain missing edges by reducing $g_s$, making interaction truth and observation
+coverage inseparable.
+
+\subsection{Simpler weighted-loss approximation}
+
+If changing the likelihood is initially too invasive, use hard-zero unlabeled
+targets and weight their loss by observation propensity:
+
+\begin{equation}
+  L_{\mathrm{unlabeled}}
+  = -\pi_{uv}\log(1-p_{uv}).
+\end{equation}
+
+This approximates the observation likelihood when $p$ is not too large and is
+more faithful to the coverage assumption than moving the unlabeled target
+toward $0.5$.
+
+\section{Monotone-map stabilization}
+
+There are three distinct stabilization concerns: initialization, anchoring, and
+path amplification.
+
+\subsection{Initialization through inverse softplus}
+
+The effective positive weight is currently
+
+\begin{lstlisting}[language=Python]
+weight = F.softplus(raw_weight) + epsilon
+\end{lstlisting}
+
+However,
+
+\begin{equation}
+  \operatorname{softplus}(0)\simeq0.693.
+\end{equation}
+
+Because all weights have the same sign, contributions from the many network
+paths accumulate instead of canceling as they can under ordinary Xavier-style
+initialization. Width-eight layers can therefore produce unexpectedly large
+initial outputs.
+
+To initialize the effective positive weight at $w_0$, initialize its raw value
+with inverse softplus:
+
+\begin{equation}
+  r_0=\log\left(e^{w_0-\epsilon}-1\right).
+\end{equation}
+
+For example, an effective weight of approximately $0.1$ requires a raw value
+near $-2.25$, not zero.
+
+\subsection{Anchoring the output}
+
+Softplus hidden activations are positive even for zero input. Small weights alone
+therefore do not ensure zero output at neutral evidence. Explicit centering
+provides that guarantee:
+
+\begin{lstlisting}[language=Python]
+contribution = monotone_map(score) - monotone_map(neutral_score)
+\end{lstlisting}
+
+This preserves monotonicity while preventing arbitrary branch-baseline drift.
+
+\subsection{Controlling path amplification}
+
+Because every path has the same sign, wide monotone networks can acquire large
+slopes. Possible controls are:
+
+\begin{itemize}
+  \item normalize each positive weight row and learn a separate positive scale;
+  \item penalize excessive derivatives;
+  \item reduce the number of hidden units;
+  \item replace the scalar monotone MLP with a one-dimensional monotonic
+        piecewise-linear spline.
+\end{itemize}
+
+All relevant monotone inputs and outputs are scalar, so a monotonic spline is a
+particularly transparent alternative: its knots directly show how an evidence
+score changes the log odds.
+
+The existence maps should be interpreted as logit contributions, not as
+probabilities. They are unbounded and become probabilities only after the final
+sigmoid.
+
+\section{KL-divergence stabilization}
+
+The current Gaussian parameterization can become unstable when
+
+\begin{lstlisting}[language=Python]
+std = torch.exp(0.5 * logvar)
+\end{lstlisting}
+
+is evaluated at extreme log variance. Large positive values generate large
+samples and KL penalties; very negative values make the posterior nearly
+deterministic.
+
+\subsection{Stabilize the posterior scale}
+
+One option is bounded log variance:
+
+\begin{lstlisting}[language=Python]
+logvar = logvar.clamp(-10, 6)
+std = torch.exp(0.5 * logvar)
+\end{lstlisting}
+
+A smoother alternative predicts scale directly:
+
+\begin{lstlisting}[language=Python]
+std = F.softplus(raw_scale) + 1e-4
+logvar = 2 * torch.log(std)
+\end{lstlisting}
+
+\subsection{Compute KL directly from log variance}
+
+For a diagonal Gaussian posterior and standard normal prior:
+
+\begin{lstlisting}[language=Python]
+kl = 0.5 * (
+    mu.square() + logvar.exp() - 1.0 - logvar
+)
+kl = kl.mean()
+\end{lstlisting}
+
+This avoids reconstructing log variance through
+\texttt{log(std.pow(2) + epsilon)}.
+
+\subsection{Warm up the KL coefficient}
+
+Early in training, the decoder is poor. Applying the full KL penalty immediately
+can encourage $\mu\rightarrow0$ and $\sigma\rightarrow1$ before the latent
+variables become useful. Increase the coefficient gradually:
+
+\begin{equation}
+  \beta_t = \beta_{\mathrm{target}}
+  \min\left(1,\frac{t}{T_{\mathrm{warmup}}}\right).
+\end{equation}
+
+A warm-up covering approximately the first 10--30 percent of training is a
+reasonable starting point. Hyperparameter optimization can still choose the
+final coefficient; the schedule determines how it is reached.
+
+\subsection{Use free bits to preserve active dimensions}
+
+Compute KL per latent dimension and do not penalize the first small information
+allowance:
+
+\begin{lstlisting}[language=Python]
+kl_per_dim = 0.5 * (
+    mu.square() + logvar.exp() - 1.0 - logvar
+).mean(dim=0)
+
+kl = torch.relu(kl_per_dim - free_bits).mean()
+\end{lstlisting}
+
+This lets each dimension carry a modest amount of information before the KL
+regularizer pushes against it.
+
+\subsection{Use deterministic routine validation}
+
+For ordinary validation, use the posterior mean:
+
+\begin{lstlisting}[language=Python]
+nodes_latent = node_mu
+\end{lstlisting}
+
+For uncertainty estimation, draw several latent samples and report their mean
+prediction and dispersion. A single new sample during each validation pass adds
+noise without producing a reliable uncertainty estimate.
+
+\subsection{Diagnostics}
+
+Track the following during training:
+
+\begin{itemize}
+  \item mean KL per latent dimension;
+  \item number of active latent dimensions;
+  \item mean and range of posterior standard deviation;
+  \item reconstruction or prediction loss;
+  \item predictions obtained from $\mu$ versus sampled $z$.
+\end{itemize}
+
+If KL approaches zero while $\mu\simeq0$ and $\sigma\simeq1$, the posterior has
+collapsed. Rapidly increasing KL or posterior scale indicates variance
+instability.
+
+\section{Recommended implementation order}
+
+The most immediately useful sequence is:
+
+\begin{enumerate}
+  \item initialize monotone weights through inverse softplus;
+  \item anchor named monotone contributions at explicit neutral inputs;
+  \item introduce an analytical evidence-reliability gate;
+  \item replace degree-based soft targets with a fixed or strongly constrained
+        observation propensity;
+  \item add KL warm-up and stable variance parameterization;
+  \item use posterior means for routine validation and Monte Carlo samples only
+        for uncertainty estimation;
+  \item test contribution stability through branch ablations and repeated
+        training seeds.
+\end{enumerate}
+
+These changes preserve the model's distinctive decoder logic. They primarily
+improve the meaning, calibration, and stability of the existing mechanisms
+rather than replacing them with a less interpretable architecture.
+
+\end{document}

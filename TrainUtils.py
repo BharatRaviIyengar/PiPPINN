@@ -784,3 +784,49 @@ def generate_batch(data, num_batches, batch_size, optional_paramters = None):
 	}
 
 	return data_for_training
+
+class ParameterScheduler:
+		def __init__(self, class_object, attr_name, initial_value, final_value, linear_change = True, factor=1.1, warmup_epochs=0):
+				assert factor > 1.0
+				assert initial_value != final_value
+				assert warmup_epochs >= 0
+				self.increasing = final_value > initial_value
+				if linear_change:
+					self.factor = (final_value - initial_value)/factor
+					self.change_fn = lambda value: value + self.factor
+				else:
+					self.factor = factor if self.increasing else 1.0 / factor
+					if initial_value == 0 and self.increasing:
+						raise ValueError(
+								"Multiplicative scheduling cannot increase from zero"
+						)
+					self.change_fn = lambda value: value * self.factor
+				
+				self.class_object = class_object
+				self.attr_name = attr_name
+				self.initial_value = initial_value
+				self.final_value = final_value
+				self.warmup_epochs = warmup_epochs
+				self.epoch = 0
+				self.current_value = initial_value
+
+				setattr(class_object, attr_name, initial_value)
+
+		def step(self):
+				self.epoch += 1
+
+				if self.epoch <= self.warmup_epochs:
+						return self.current_value
+
+				candidate = self.change_fn(self.current_value)
+
+				if self.increasing:
+						new_value = min(candidate, self.final_value)
+				else:
+						new_value = max(candidate, self.final_value)
+
+				if new_value != self.current_value:
+						self.current_value = new_value
+						setattr(self.class_object, self.attr_name, new_value)
+
+				return self.current_value

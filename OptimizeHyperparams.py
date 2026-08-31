@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 import torch
 import TrainUtils as TU
-from GVAE_model import GVAE_Model as GVAE, process_data_GVAE as process_data
+from GVAE_model import GVAE_Model as GVAE, process_data_GVAE as process_data, TrainingParameters
 import optuna
 from optuna.samplers import TPESampler
 from optuna.storages import JournalStorage
@@ -28,6 +28,10 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 	kld_coefficient = params['kld_coefficient']
 	mse_coefficient = params['mse_coefficient']
 
+	training_parameters = TrainingParameters(
+		mse_coefficient = mse_coefficient,
+		kld_coefficient = 0.0
+	)
 
 	median_centralities = [data["Train"].node_degree.median().item() for data in dataset]
 	reference_centrality = sum(median_centralities)/len(median_centralities)
@@ -80,6 +84,15 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		min_lr=1e-6
 	)
 
+	kl_warmup = TU.ParameterScheduler(
+		class_object = training_parameters,
+		attr_name = "kld_coefficient",
+		initial_value = 0.0,
+		final_value = kld_coefficient,
+		linear_change = True,
+		factor = 10.0 
+		)
+
 	total_val_samples = sum(
 		[
 			data["val_sampler"].num_all_sup_edges * data["val_sampler"].num_batches 
@@ -113,7 +126,13 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 			model.train()
 			for batch in data["train_batch_loader"]:
 				train_batch_count += 1
-				train_loss = process_data(batch, model=model, optimizer=optimizer, device=device, mse_coefficient=mse_coefficient, kld_coefficient=kld_coefficient, is_training=True, return_output=False)
+				train_loss = process_data(
+					batch,
+					model=model,
+					optimizer=optimizer,
+					training_parameters=training_parameters,
+					return_output=False
+					)
 				total_train_loss += train_loss # type: ignore
 
 			# Validation
@@ -121,7 +140,14 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 			with torch.no_grad():
 				for batch in data["val_batch_loader"]:
 					val_batch_count += 1
-					val_loss, edge_prob, edge_labels = process_data(batch, model=model, optimizer=optimizer, device=device, mse_coefficient=mse_coefficient, kld_coefficient=kld_coefficient, is_training=False, return_output=True) # type: ignore
+					val_loss, edge_prob, edge_labels = process_data(
+						batch,
+						model=model,
+						optimizer=optimizer,
+						training_parameters=training_parameters,
+						return_output=True
+						) # type: ignore
+					
 					total_val_loss += val_loss
 					n = edge_prob.size(0)
 					preds_buf[fill_idx:fill_idx+n] = edge_prob
@@ -166,6 +192,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 
 		# Step the schedulers
 		scheduler.step(average_val_loss)
+		kl_warmup.step()
 		
 		if epochs_without_improvement >= patience:
 			print(f"Early stopping triggered after {epoch + 1} epochs.")
