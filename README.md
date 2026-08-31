@@ -1,249 +1,244 @@
 # PiPPINN
 
-PiPPINN is a framework for protein-protein interaction (PPI) prediction using Graph Neural Networks (GNNs). This repository provides a pipeline to encode protein sequences, construct graphs suitable for PyTorch Geometric, and train a custom GNN model to predict interactions.
+**An interpretable variational framework for protein–protein interaction prediction**
 
-## Table of Contents
+PiPPINN predicts whether two proteins interact and estimates the strength of that interaction by combining protein-language-model representations with explicit evidence from a known interaction network.
 
-- [Overview](#overview)
-- [Features](#features)
-- [Installation](#installation)
-- [Pipeline](#pipeline)
-  - [1. Protein Encoding](#1-protein-encoding)
-  - [2. Graph Preparation](#2-graph-preparation)
-  - [3. Training the GNN](#3-training-the-gnn)
-- [Usage](#usage)
-- [License](#license)
+The framework is designed around a simple premise: a useful PPI model should do more than return a score. It should expose *why* an interaction is plausible. PiPPINN therefore keeps three sources of evidence separate until the final prediction:
 
-## Overview
+- direct evidence learned from the two protein representations;
+- transitivity evidence from similarity between their interaction neighborhoods; and
+- congruence evidence from similarity to each other's known interaction partners.
 
-This project is designed for in silico evolution of proteins towards structure and function prediction. It leverages ESM-2 protein language models to generate embeddings for protein sequences, constructs graphs representing PPI networks, and applies a GraphSAGE-style GNN for edge (interaction) prediction and edge weight estimation.
+> [!IMPORTANT]
+> PiPPINN is research software under active development. The current repository captures the evolving model and optimization framework; a stable installation, command-line workflow, pretrained model, and benchmark release will be added when the project is ready for publication.
 
-## Features
+## Research objective
 
-- **Flexible protein encoding** using ESM-2 models (15B, 3B, 650M).
-- **Graph construction** using protein embeddings and custom edge input.
-- **Extendable GNN architecture** focused on edge prediction and weight regression.
-- **Customizable training pipeline** with negative edge sampling, batching, and split configuration.
-- **PyTorch and PyTorch Geometric** powered.
+Protein interaction data are incomplete, unevenly sampled, and strongly biased toward well-studied proteins. At the same time, sequence similarity and network topology contain complementary information. PiPPINN explores how to combine these signals while retaining interpretable intermediate contributions and uncertainty-aware protein representations.
 
-## Highlights
-- GNN training pipeline (GraphSAGE / Pool_SAGEConv variants).
-- Edge sampling with stratified sampling and unsampled tracking (EdgeSampler).
-- Curriculum learning support to enable training with and without graph-based predictions.
-- Optuna-based HPO orchestration with JournalStorage for distributed runs.
-- Surrogate-based HPO helpers (RandomForest) to leverage prior results.
-- Final inference model is under development and will be published to a public model repo (e.g., Hugging Face).
+For a candidate pair of proteins `(u, v)`, the model produces:
 
----
+1. an interaction-existence logit, converted to a probability with a sigmoid; and
+2. a non-negative estimate of interaction strength or confidence.
 
-## Installation
-### **Installation Guide for PiPPINN**
+The current implementation is an interpretable variational link predictor with a graph-aware decoder. It is not a conventional message-passing GNN: the node encoder operates on protein features, while graph context enters through explicitly constructed and sampled neighborhoods in the decoder.
 
-This guide provides step-by-step instructions to set up the environment and install all necessary dependencies for the **PiPPINN** project.
+## Framework at a glance
 
----
+```mermaid
+flowchart LR
+    S[Protein sequences] --> E[ESM-2 embeddings]
+    E --> F[Mean-pooled sequence representation<br/>+ log protein length]
+    F --> V[Variational node encoder<br/>mu and log-variance]
+    V --> Z[Protein latent space]
 
-### **1. Prerequisites**
-Before proceeding, ensure the following are installed on your system:
-- **Python**: Version 3.8 or higher (tested with Python 3.9).
-- **CUDA**: If you plan to use a GPU, ensure CUDA is installed and properly configured. Check your CUDA version with:
-  ```bash
-  nvcc --version
-  ```
-- **pip**: Ensure you have the latest version of `pip`:
-  ```bash
-  python -m pip install --upgrade pip
-  ```
+    G[Known PPI graph<br/>with edge strengths] --> N[Sampled, bounded neighborhoods]
 
----
+    Z --> D[Direct pair decoder]
+    Z --> T[Transitivity branch]
+    Z --> C[Congruence branch]
+    N --> T
+    N --> C
 
-### **2. Clone the Repository**
-Clone the repository to your local machine:
-```bash
-git clone https://github.com/your-repo/PiPPINN.git
-cd PiPPINN
+    D --> P[Interaction-existence logit]
+    T --> P
+    C --> P
+
+    D --> W[Interaction-strength estimate]
+    C --> W
 ```
 
----
+## Model architecture
 
-### **3. Create a Virtual Environment**
-It is recommended to use a virtual environment to manage dependencies:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Linux/Mac
-venv\Scripts\activate     # On Windows
-```
+### 1. Protein representations
 
----
+Protein sequences are encoded with an ESM-2 model. The final-layer residue embeddings are averaged into one representation per protein, and a centered log-transformed protein-length feature is appended.
 
-### **4. Install Dependencies**
-Install the required Python packages using `pip`.
+Sequences longer than the ESM-2 context window are divided into overlapping windows. Each window is encoded independently and the resulting window representations are averaged. The current encoder supports the 650M, 3B, and 15B ESM-2 variants.
 
-#### **4.1 Install PyTorch**
-Install PyTorch with the appropriate CUDA version. Visit the [PyTorch installation page](https://pytorch.org/get-started/locally/) for the latest instructions.
+These embeddings are treated as fixed input features during PiPPINN training.
 
-For example:
-- **For CUDA 12.4**:
-  ```bash
-  pip install torch --index-url https://download.pytorch.org/whl/cu124
-  ```
-- **For CPU-only**:
-  ```bash
-  pip install torch --index-url https://download.pytorch.org/whl/cpu
-  ```
+### 2. Variational node encoder
 
-#### **4.2 Install PyTorch Geometric and Dependencies**
-Install PyTorch Geometric and its dependencies. Use the appropriate command based on your PyTorch and CUDA versions.
-
-For example, if using PyTorch 2.5.1 with CUDA 12.4:
-```bash
-pip install torch-scatter torch-sparse torch-cluster torch-spline-conv pyg-lib torch-geometric -f https://data.pyg.org/whl/torch-2.5.1+cu124.html
-```
-
-#### **4.3 Install Additional Dependencies**
-Install the remaining dependencies listed in the repository:
-```bash
-pip install -r requirements.txt
-```
-
-If a `requirements.txt` file is not present, create one with the following content based on the imports in the repository:
+An MLP maps each protein feature vector to the parameters of a diagonal Gaussian latent distribution:
 
 ```text
-argparse
-fair-esm
-torch
-torch-geometric
-torch-scatter
-torch-sparse
-torch-cluster
-torch-spline-conv
-pyg-lib
-optuna
+q(z | x) = Normal(mu(x), diag(exp(logvar(x))))
 ```
 
----
+The log-variance is smoothly bounded for numerical stability. During training, latent vectors are sampled with the reparameterization trick; during evaluation, the posterior mean is used. A KL-divergence term regularizes the latent space toward a unit Gaussian prior.
 
-### **5. Verify Installation**
-Run the following commands to verify that all dependencies are installed correctly:
-```bash
-python -c "import torch; print('PyTorch version:', torch.__version__)"
-python -c "import torch_geometric; print('PyTorch Geometric version:', torch_geometric.__version__)"
-python -c "import torch_sparse; print('torch-sparse installed successfully!')"
+This stage provides a compact, uncertainty-aware representation learned from the fixed ESM-derived features. Because the decoder also shapes this latent space through supervision, cosine similarity in the learned space should be interpreted as *task-adapted, homology-like similarity*, not as a direct measurement of biological homology.
+
+### 3. Interpretable decoder
+
+The decoder combines three complementary mechanisms.
+
+#### Direct pair decoder
+
+For proteins `u` and `v`, the model forms a symmetric pair representation from:
+
+```text
+z_u + z_v
+z_u * z_v
 ```
 
----
+Their concatenation is passed through an MLP with separate heads for interaction existence and interaction strength. This branch can learn nonlinear or complementary relationships that are not captured by explicit similarity rules.
 
-### **6. Run the Project**
-Once all dependencies are installed, you can run the project scripts. For example:
-```bash
-python OptimizeHyperparams.py --input <path-to-data> --output <output-path>
-python Retrain.py --input_data <path-to-data> --parameters <path-to-best-params>
+#### Transitivity branch
+
+The transitivity branch asks whether the neighborhoods of `u` and `v` occupy similar regions of the learned protein space.
+
+It compares the latent representations of members of `N(u)` with members of `N(v)`, aggregates the pairwise cosine similarities with a log-sum-exp operation, and measures directed containment from the smaller neighborhood into the larger one. Equal-sized neighborhoods are handled symmetrically so the result is invariant to swapping the endpoints.
+
+The resulting neighborhood score is passed through a learned monotone map, ensuring that stronger neighborhood similarity cannot reduce the branch's interaction-existence contribution.
+
+#### Congruence branch
+
+The congruence branch asks whether either candidate protein resembles a known partner of the other:
+
+```text
+u resembles a member of N(v), or
+v resembles a member of N(u)
 ```
 
----
+Attention over endpoint-to-neighbor cosine similarities focuses the branch on the most relevant supporting partners. The same attention pattern transfers known neighbor-edge strengths into a congruence-based strength estimate.
 
-### **7. Troubleshooting**
-- **Missing Dependencies**:
-  If you encounter missing dependencies, ensure you have installed all required libraries using the commands above.
-- **Version Mismatch**:
-  Ensure that the versions of PyTorch, CUDA, and PyTorch Geometric are compatible. Refer to the [PyTorch Geometric installation guide](https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html) for compatibility details.
-- **CUDA Issues**:
-  If CUDA is not detected, ensure that your GPU drivers and CUDA toolkit are properly installed.
+Learned monotone maps convert the aggregated evidence into:
 
+- an interaction-existence contribution; and
+- a non-negative interaction-strength contribution.
 
----
+### 4. Prediction composition
 
-### **9. Deactivate the Virtual Environment**
-When you're done, deactivate the virtual environment:
-```bash
-deactivate
+Interaction existence is modeled as an additive logit:
+
+```text
+existence_logit = direct + transitivity + congruence
+interaction_probability = sigmoid(existence_logit)
 ```
 
----
+Interaction strength is also additive:
 
-### **Conclusion**
-You are now ready to use the **PiPPINN** project. If you encounter any issues, feel free to reach out or consult the documentation.
-
-## Pipeline
-
-### Key files
-- `TrainUtils.py` — core models, EdgeSampler, Decoders, training and batch utilities.
-- `OptimizeHyperparams.py` — Optuna study controller, objective wrapper, surrogate support.
-  - Create study with sampler and pruner:
-    ```py
-    sampler = TPESampler(seed=SEED, multivariate=True)
-    pruner = HyperbandPruner(...)
-    study = optuna.create_study(study_name=..., direction="minimize", sampler=sampler, pruner=pruner, storage=JournalStorage(JournalFileBackend(journal_file)), load_if_exists=True)
-    ```
-  - For distributed runs, ensure every worker uses the same `journal_file`, `study_name`, and search-space code.
-  - To resume: pass `load_if_exists=True` and run `study.optimize(objective, n_trials=ADDITIONAL_TRIALS)`.
-- `Retrain.py` — small retrain helper.
-- `Evaluate_Trained.py` — batch loader / evaluation.
-
----
-
-### 1. Protein Encoding
-
-Encode protein sequences into embeddings using the ESM-2 model.
-
-**Script:** `EncodeProteins.py`
-
-**Usage:**
-```bash
-python EncodeProteins.py --input <sequence_file.tsv> --modelname 3B --outfile <output_embeddings.pt>
-```
-- `--input/-i`: Tab-separated file (ID, sequence).
-- `--modelname/-m`: ESM-2 model [15B, 3B, 650M].
-- `--outfile/-o`: Output file for embeddings.
-
-### 2. Graph Preparation
-
-Build a PyTorch Geometric graph from embeddings and an edge list.
-
-**Script:** `Generate_PyG_Graph_Data.py`
-
-**Usage:**
-```bash
-python Generate_PyG_Graph_Data.py --node-embeddings <output_embeddings.pt> --edges <edge_list.tsv> --output <graph.pt>
-```
-- `--node-embeddings/-n`: Output of previous step.
-- `--edges/-e`: Tab-separated edge file (node1, node2 [,weight]).
-- `--output/-o`: Output PyG graph file.
-
-### 3. Training the GNN
-
-Train a GraphSAGE-based GNN on your constructed graph.
-
-#### 3.21 Hyperparameter optimization (HPO)
-- HPO controller: `OptimizeHyperparams.py`.
-- Supports Optuna with `JournalStorage` + `JournalFileBackend` for distributed workers.
-- Recommended setup for distributed Bayesian HPO:
-```py
-from optuna.samplers import TPESampler
-from optuna.pruners import HyperbandPruner
-from optuna.storages import JournalStorage
-from optuna.storages.journal import JournalFileBackend
-
-sampler = TPESampler(seed=SEED, multivariate=True)
-pruner = HyperbandPruner(min_resource=15, reduction_factor=3)
-storage = JournalStorage(JournalFileBackend("/shared/optuna_journal.log"))
-study = optuna.create_study(study_name="PiPPINN_HPO", direction="minimize",
-                            sampler=sampler, pruner=pruner, storage=storage, load_if_exists=True)
-study.optimize(objective, n_trials=NUM_TRIALS)
+```text
+interaction_strength = direct_strength + congruence_strength
 ```
 
-  #### 3.1 Train / Retrain
-- For fine-tuning or retraining a saved model, use `Retrain.py`:
-```bash
-python Retrain.py --input_data <graph.pt> --parameters <best_params.json> --output <retrained_model.pt>
+The decoder can return each contribution separately, enabling per-edge inspection and branch-level ablation. These values are exact contributions under the current parameterization, although they should not yet be interpreted as statistically unique causal explanations: only their sum is supervised, so correlated branches may redistribute evidence between runs.
+
+## Training framework
+
+### Positive–unlabeled supervision
+
+Known PPIs are treated as positive observations. Randomly sampled non-edges are unlabeled rather than guaranteed biological negatives.
+
+The current training strategy assigns coverage-aware soft labels to sampled non-edges. Node degree acts as a proxy for how thoroughly a protein has been studied:
+
+- missing edges between high-degree proteins receive harder, more negative labels;
+- missing edges involving low-degree proteins receive softer labels because they are more likely to reflect incomplete coverage.
+
+This is a pragmatic PU-learning approximation, not a full observation-propensity model. Replacing it with an explicit model of interaction truth and observation probability is part of the planned methodology.
+
+### Edge minibatching and neighborhood control
+
+PiPPINN separates positive edges used for supervision from positive edges used as neighborhood context within each minibatch, preventing the target edge from trivially appearing in its own evidence graph.
+
+The sampler combines:
+
+- uniform positive-edge sampling for broad graph coverage;
+- centrality-weighted sampling to retain information around hubs;
+- explicit tracking of previously unsampled edges; and
+- random non-edge sampling for PU supervision.
+
+Neighborhood size is capped to control memory and runtime. When a node has more neighbors than the configured limit, a compiled C++/OpenMP extension performs weighted sampling without replacement. Selection depends on relative endpoint degree, observed edge strength, and a tunable intensity parameter.
+
+Similarity computation is chunked, uses reduced-precision normalized latents, and applies activation checkpointing during training to reduce memory pressure.
+
+### Objective
+
+The model is trained with a weighted sum of three losses:
+
+```text
+L = BCE_existence + lambda_strength * MSE_strength + beta_KL * KL
 ```
 
-### Perform predictions
+- binary cross-entropy supervises interaction existence using positive and coverage-aware soft labels;
+- mean squared error supervises interaction strength on known positive edges only; and
+- KL divergence regularizes the variational node representation.
 
-## Usage
+The KL coefficient is warmed up during training. Hyperparameters are optimized with Optuna using a TPE sampler, Hyperband pruning, journal-backed storage, early stopping, and a validation score that combines loss with an ROC-AUC penalty.
 
-See the above pipeline for step-by-step commands. For each script, use the `--help` flag for detailed options and descriptions.
+## Data flow
+
+The current repository follows this conceptual flow:
+
+```text
+tab-separated protein sequences
+        |
+        v
+ESM-2 protein embeddings + length feature
+        |
+        v
+PyTorch Geometric graph from a weighted PPI edge list
+        |
+        v
+train/validation graph split + sampled non-edges
+        |
+        v
+edge minibatches with bounded neighborhood context
+        |
+        v
+variational encoding + interpretable edge decoding
+        |
+        v
+interaction probability, strength, and branch contributions
+```
+
+The graph representation uses:
+
+- `x`: protein feature matrix;
+- `edge_index`: known protein pairs;
+- `edge_attr`: normalized interaction strengths; and
+- `node_degree`: graph degree used by the sampling and coverage heuristics.
+
+## Repository map
+
+| File | Role |
+| --- | --- |
+| `GVAE_model.py` | Variational node encoder, monotone evidence maps, interpretable decoder, and training loss |
+| `TrainUtils.py` | Graph splitting, negative sampling, PU labels, edge minibatching, neighborhood construction, and schedulers |
+| `Neighborhood_restriction.cpp` | Weighted, bounded neighborhood sampling implemented as a PyTorch C++ extension |
+| `EncodeProteins.py` | ESM-2 sequence encoding, including long-sequence windowing and the protein-length feature |
+| `Generate_PyG_Graph_Data.py` | Conversion of embeddings and weighted edge lists into PyTorch Geometric graphs |
+| `OptimizeHyperparams.py` | Optuna-based hyperparameter search for the current variational model |
+
+`Retrain.py`, `Evaluate_Trained.py`, and `HPO_stage2.py` currently reflect earlier or unfinished workflows and are being brought into alignment with the variational framework.
+
+## Interpretation and scope
+
+PiPPINN is intended to support questions such as:
+
+- Is a prediction driven mainly by the protein pair itself or by network context?
+- Which known interaction partners provide congruence evidence?
+- Does the model find one neighborhood approximately contained within another?
+- How does incomplete graph coverage affect the treatment of an absent edge?
+- How stable are the prediction and its evidence components across latent samples, graph samples, and training runs?
+
+Several boundaries are important:
+
+- A high predicted score is a model hypothesis, not experimental confirmation.
+- Absence from a PPI database does not establish non-interaction.
+- Degree is only a proxy for experimental coverage and can also reflect real biology.
+- Truncated or sparsely observed neighborhoods provide less reliable graph evidence.
+- Additive decoder contributions are inspectable but are not yet statistically identifiable explanations.
+
+## Installation and usage
+
+Detailed installation and end-to-end usage documentation are intentionally deferred until the training and release workflow is stable.
+
+At present, the framework is built around Python, PyTorch, PyTorch Geometric, ESM-2, Optuna, and a small C++/OpenMP PyTorch extension. The main workflow stages are sequence encoding, graph construction, dataset preparation, hyperparameter optimization, retraining, and evaluation.
 
 ## License
 
-This repository is licensed under the terms of the [LICENSE](LICENSE) file.
+See [LICENSE](LICENSE).
