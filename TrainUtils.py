@@ -6,7 +6,7 @@ from torch_geometric.utils import degree
 from torch_geometric.utils.map import map_index
 from warnings import warn
 from pathlib import Path
-from NeighborhoodRestriction import restrict_neighborhood
+from BatchUtils import restrict_neighborhood, relabel_edges_
 
 def generate_hidden_dims(input_dim, num_layers, output_dim):
 		
@@ -79,10 +79,15 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 				false_negative_threshold=0.45
 				):  
 		super().__init__()
-		self.device = device if device is not None else positive_graph.edge_index.device
+		self.device = torch.device('cpu')
+		self.output_device = (
+    torch.device(device)
+    if device is not None
+    else positive_graph.edge_index.device
+)
 		self.positive_edges = positive_graph.edge_index.to(self.device)
 		self.num_batches = num_batches  
-		self.edge_attr = positive_graph.edge_attr.to(self.device)
+		self.edge_attr = positive_graph.edge_attr.to(self.device) 
 		self.node_embeddings = positive_graph.x.to(self.device)
 		self.batch_size = batch_size 
 		self.centrality_fraction = centrality_fraction  
@@ -165,7 +170,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		# Preallocate tensors
 		
 		# Node mask to track nodes in the batch
-		self.node_mask = torch.zeros(self.max_nodes, dtype=torch.bool, device=self.device) # type: ignore
+		# self.node_mask = torch.zeros(self.max_nodes, dtype=torch.bool, device=self.device) # type: ignore
 
 		# Track unsampled edges
 		self.unsampled_edges = torch.ones(self.total_positive_edges, dtype=torch.bool, device = self.device)
@@ -391,19 +396,18 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 		# Relabel batch edges #  
 		
-		self.node_mask.fill_(False)
-		self.node_mask[self.batch_edges.flatten()] = True  
-		nodes_in_batch = self.node_mask.nonzero(as_tuple=False).view(-1)
+		# self.node_mask.fill_(False)
+		# self.node_mask[self.batch_edges.flatten()] = True  
+		# nodes_in_batch = self.node_mask.nonzero(as_tuple=False).view(-1)
 
-		remapped_edge_index, _ = map_index(
-			self.batch_edges.view(-1),
-			nodes_in_batch,
-			max_index = nodes_in_batch.max()+1,
-			inclusive=True
-		)  
-		remapped_edge_index = remapped_edge_index.view(2, -1)  
-		
-		tentative_message_edges = remapped_edge_index[:,:self.num_message_edges]
+		# remapped_edge_index, _ = map_index(
+		# 	self.batch_edges.view(-1),
+		# 	nodes_in_batch,
+		# 	max_index = nodes_in_batch.max()+1,
+		# 	inclusive=True
+		# )  
+		nodes_in_batch = relabel_edges_(self.batch_edges, self.max_nodes)
+		tentative_message_edges = self.batch_edges[:,:self.num_message_edges]
 
 		# Make messages directional  
 		self.bidirectional_message_edges.zero_()
@@ -419,7 +423,7 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 		# Apply neighborhood restriction
 		
 		src, dst = self.bidirectional_message_edges
-		num_nodes_in_batch = self.node_mask.sum().item()
+		num_nodes_in_batch = nodes_in_batch.numel()
 		
 		# Compute degrees for message nodes  
 		degrees = degree(src, num_nodes = num_nodes_in_batch) 
@@ -435,14 +439,14 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 		# Create a PyG Data object  
 		batch = Data(  
-			supervision_edges = remapped_edge_index[:, -self.num_all_sup_edges:], 
+			supervision_edges = self.batch_edges[:, -self.num_all_sup_edges:], 
 			supervision_labels = self.supervision_labels,  
 			neighborhood_matrix = neighborhood_matrix,
 			neighborhood_weights = neighborhood_weights,
-			node_features = self.node_embeddings[self.node_mask, :].to(self.device),
+			node_features = self.node_embeddings.index_select(0, nodes_in_batch),
 			supervision_edgewts = self.supervision_edgewts,
 			num_positive_supervision_edges = self.num_positive_sup_edges
-		).to(self.device)
+		).to(self.output_device)
 
 		return batch  
 	

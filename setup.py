@@ -8,12 +8,12 @@ ROOT = Path(__file__).resolve().parent
 
 
 setup(
-	name="pippinn-neighborhood-restriction",
+	name="PiPPINN-BatchGenerator-Utils",
 	version="0.1.0",
 	ext_modules=[
 		CppExtension(
 			name="NeighborhoodRestriction",
-			sources=[str(ROOT / "Neighborhood_restriction.cpp")],
+			sources=[str(ROOT / "BatchUtils.cpp")],
 			extra_compile_args=["-O3", "-std=c++17", "-fopenmp"],
 			extra_link_args=["-fopenmp"],
 		)

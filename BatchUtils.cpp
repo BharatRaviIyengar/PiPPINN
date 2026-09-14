@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 #include <cstdint>
+#include <vector>
 
 std::tuple<torch::Tensor, torch::Tensor>
 restrict_neighborhood(
@@ -176,6 +177,63 @@ restrict_neighborhood(
 	return std::make_tuple(neighborhood_matrix.to(output_device), neighbor_strength_matrix.to(output_device));
 }
 
+torch::Tensor relabel_edges(
+	torch::Tensor original_edges,
+	int64_t max_nodes
+){
+
+	TORCH_CHECK(original_edges.device().is_cpu(), "original_edges must be on CPU");
+	TORCH_CHECK(original_edges.dtype() == torch::kInt64, "original_edges must be int64");
+	TORCH_CHECK(original_edges.dim() == 2 && original_edges.size(0) == 2,
+							"original_edges must have shape [2, num_edges]");
+	TORCH_CHECK(original_edges.is_contiguous(),
+    "original_edges must be contiguous for in-place relabeling");
+	TORCH_CHECK(max_nodes > 0, "max_nodes must be positive");
+	TORCH_CHECK(
+    max_nodes <= std::numeric_limits<int32_t>::max(),
+    "max_nodes exceeds int32 label capacity"
+);
+
+	std::vector<int32_t> new_labels(max_nodes, -1);
+	std::vector<int64_t> nodes_in_batch;
+
+	auto* edges_ptr = original_edges.data_ptr<int64_t>();
+	auto num_edges = original_edges.size(1);
+
+	auto* src_ptr = edges_ptr;
+	auto* dst_ptr = edges_ptr + num_edges;
+
+	int32_t next_label = 0;
+
+	for (int64_t e = 0; e < num_edges; ++e) {
+
+		const int64_t src = src_ptr[e];
+		const int64_t dst = dst_ptr[e];
+
+		TORCH_CHECK(
+		src >= 0 && src < max_nodes &&
+		dst >= 0 && dst < max_nodes,
+		"Node index outside valid range"
+		);
+
+		if(new_labels[src] == -1){
+			new_labels[src] = next_label++;
+			nodes_in_batch.push_back(src);
+		}
+		if(new_labels[dst] == -1){
+			new_labels[dst] = next_label++;
+			nodes_in_batch.push_back(dst);
+		}
+
+		src_ptr[e] = new_labels[src_ptr[e]];
+		dst_ptr[e] = new_labels[dst_ptr[e]];
+	}
+
+	auto nodes_tensor = torch::from_blob(nodes_in_batch.data(), {static_cast<int64_t>(nodes_in_batch.size())}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU)).clone();
+	
+	return nodes_tensor;
+}
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	m.def("restrict_neighborhood", &restrict_neighborhood, "Restrict Neighborhood",
@@ -185,5 +243,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		py::arg("intensity") = 1.0,
 		py::arg("max_neighbors") = 60,
 		py::arg("nthreads") = 1
+	);
+		m.def(
+		"relabel_edges_", &relabel_edges, "Relabel batch edges in place to have contiguous node indices starting from 0",
+		py::arg("original_edges"),
+		py::arg("max_nodes_in_graph")
 	);
 }
