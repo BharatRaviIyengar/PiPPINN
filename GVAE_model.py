@@ -30,7 +30,7 @@ class PositiveLinear(nn.Module):
 
 	def forward(self, x):
 		# softplus ensures strictly positive weights
-		weight = F.softplus(self.raw_weight + self.inialization_offset) + self.epsilon
+		weight = F.softplus(self.raw_weight + self.initialization_offset) + self.epsilon
 		return F.linear(x, weight, self.bias)
 
 # MonotoneMap using PositiveLinear layers
@@ -202,29 +202,35 @@ class Decoder(nn.Module):
 		sim_v_to_Nu = torch.bmm(latents_v, latents_Nu.transpose(1, 2)).squeeze(1) # shape: (num_edges, max_neighbors)
 
 		combined_mask = torch.cat([nbrs_v_mask, nbrs_u_mask], dim=1) # shape: (num_edges, 2*max_neighbors)
-
-		assert combined_mask.any(dim=1).all(), \
-    "Congruence calculation requires at least one valid neighbor per supervision edge."
+		congruence_impossible = ~combined_mask.any(dim=1)
 
 		combined_sim = torch.cat([sim_u_to_Nv, sim_v_to_Nu], dim=1).to(torch.float32) # shape: (num_edges, 2*max_neighbors)
 
 		combined_edge_strengths = torch.cat([neighborhood_strength_matrix[u], neighborhood_strength_matrix[v]], dim=1) # shape: (num_edges, 2*max_neighbors)
-		
-		combined_sim.masked_fill_(~combined_mask, float('-inf')) # mask out invalid pairs
+
+		# Mask invalid neighbors before softmax. An all-masked row would otherwise
+		# produce NaNs, so use finite zero logits for edges with no neighborhood
+		# evidence and explicitly zero their final congruence contributions below.
+		attention_logits = combined_sim.masked_fill(~combined_mask, float('-inf'))
+		attention_logits = attention_logits.masked_fill(
+			congruence_impossible.unsqueeze(1), 0.0
+		)
 
 		# Compute attention weights using softmax over the combined similarity scores. This allows the model to focus on the most relevant neighbor pairs when aggregating information for edge existence and strength predictions. A softmax is better choice than logsumexp here because we just want to find one good evidence of a congruent neighbor pair, rather than aggregating all the evidence. The softmax will assign higher weights to the most similar pairs, while still allowing for contributions from less similar pairs.
 
-		attention = torch.softmax(combined_sim * self.congruence_sharpness, dim=1)
+		attention = torch.softmax(attention_logits * self.congruence_sharpness, dim=1)
 
-		combined_sim.masked_fill_(~combined_mask, 0.0) # set invalid pairs to 0 for aggregation
+		combined_sim = combined_sim.masked_fill(~combined_mask, 0.0) # set invalid pairs to 0 for aggregation
 
-		combined_edge_strengths.masked_fill_(~combined_mask, 0.0) # set invalid pairs to 0 for aggregation
+		combined_edge_strengths = combined_edge_strengths.masked_fill(~combined_mask, 0.0) # set invalid pairs to 0 for aggregation
 
 		# Scalar evidence for edge existence
 		congruence_score = (attention * combined_sim).sum(dim=1)
+		congruence_score = congruence_score.masked_fill(congruence_impossible, 0.0)
 
 		# Strength evidence, preserving the same local congruence structure
 		congruence_strength = (attention * combined_edge_strengths).sum(dim=1)
+		congruence_strength = congruence_strength.masked_fill(congruence_impossible, 0.0)
 
 		# Translate the neighborhood similarity and congruence scores into edge existence probabilities and edge strengths using the learnable monotonic mappings. This ensures that higher similarity scores always correspond to higher probabilities and strengths, while allowing the model to learn the optimal nonlinear mapping from similarity to edge properties.
 		ExistenceByTransitivity = self.monomap_EdgeExistence_NbrSimilarity(neighborhood_score.unsqueeze(-1)).squeeze(-1)
@@ -233,8 +239,14 @@ class Decoder(nn.Module):
     transitivity_impossible, 0.0) # if transitivity is not possible (i.e., one of the nodes has no neighbors), we explicitly set the existence probability to 0.0, as we have no evidence to support the existence of an edge based on transitivity.
 
 		ExistenceByCongruence = self.monomap_EdgeExistence_Congruence(congruence_score.unsqueeze(-1)).squeeze(-1)
+		ExistenceByCongruence = ExistenceByCongruence.masked_fill(
+			congruence_impossible, 0.0
+		)
 
 		StrengthByCongruence = F.softplus(self.monomap_EdgeStrength_Congruence(congruence_strength.unsqueeze(-1)).squeeze(-1))
+		StrengthByCongruence = StrengthByCongruence.masked_fill(
+			congruence_impossible, 0.0
+		)
 
 		return ExistenceByTransitivity, ExistenceByCongruence, StrengthByCongruence
 
@@ -327,8 +339,8 @@ class GVAE_Model(nn.Module):
 			in_channels = latent_dimension,
 			num_decoder_layers = num_decoder_layers,
 			dropout=dropout,
-			similarity_block_size = 15,
-			edge_chunk_size = 3000 
+			similarity_block_size = 90,
+			edge_chunk_size = 12000 
 			)
 
 	def forward(self, x, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix):

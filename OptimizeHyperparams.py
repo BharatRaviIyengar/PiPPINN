@@ -14,7 +14,7 @@ import math
 import gc
 
 
-def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, device:torch.device, max_epochs = 200, threads:int=1):
+def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max_epochs = 200, threads:int=1):
 	""" Run training for a single trial with the given parameters."""
 
 	learning_rate = params['learning_rate']
@@ -46,7 +46,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		"max_neighbors": params['max_neighbors'],
 		"threads" : threads
 	}
-	
+
 	data_for_training = [
 		TU.generate_batch(
 			data=data,
@@ -67,7 +67,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, dev
 		latent_dimension = latent_dimension,
 		num_decoder_layers = num_decoder_layers,
 		dropout = dropout,
-	).to(device)
+	).cuda()
 
 	optimizer = torch.optim.Adam(
 		model.parameters(),
@@ -235,23 +235,21 @@ if __name__ == "__main__":
 
 	SEED = 48149
 	torch.manual_seed(SEED)
-	torch.cuda.manual_seed(SEED)
-	torch.cuda.manual_seed_all(SEED)
 
 	args = parser.parse_args()
 	torch.set_num_threads(args.threads)
 	torch.set_num_interop_threads(args.threads)
-
-	gpu_yes = torch.cuda.is_available()
 
 	if len(sys.argv) == 1:
 		print("Error: essential arguments not provided.")
 		parser.print_help() # Print the help message
 		sys.exit(1)
 
-	if not gpu_yes:
-		print("GPU not available: Quitting")
-		sys.exit(0)
+	if not torch.cuda.is_available():
+		raise RuntimeError("PiPPINN training requires an available CUDA GPU.")
+
+	torch.cuda.manual_seed(SEED)
+	torch.cuda.manual_seed_all(SEED)
 
 
 	storage = JournalStorage(JournalFileBackend(args.journal_file))
@@ -263,10 +261,9 @@ if __name__ == "__main__":
 	for arg, value in vars(args).items():
 		print(f"{arg}: {value}")
 
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	print(f"Using device: {device}")
+	print("Using device: cuda")
 
-	dataset = torch.load(args.training_data, weights_only = False)
+	dataset = torch.load(args.training_data, map_location="cpu", weights_only=False)
 	input_channels = dataset[0]["Val"].x.size(1)
 
 	def objective(trial):
@@ -296,7 +293,7 @@ if __name__ == "__main__":
 			"mse_coefficient": trial.suggest_float("mse_coefficient", 0.01, 1.0, log=True)
 		}
 		try:
-			for result in run_training(params, args.num_batches, args.batch_size, dataset, device, threads=args.threads):
+			for result in run_training(params, args.num_batches, args.batch_size, dataset, threads=args.threads):
 				epoch = result["epoch"]
 				composite_score = result["composite_score"]
 				val_loss_at_best_score = result["val_loss_at_best_score"]

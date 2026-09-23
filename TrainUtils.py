@@ -71,7 +71,6 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 			  max_neighbors = 60,
 			  frac_sample_from_unsampled=0.1,
 			  nbr_weight_intensity=1.0,
-			  device=None,
 			  threads=1,
 				reference_centrality=None,
 				reference_adjustment=1.0,
@@ -79,12 +78,11 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 				false_negative_threshold=0.45
 				):  
 		super().__init__()
+		if not torch.cuda.is_available():
+			raise RuntimeError("EdgeSampler requires an available CUDA GPU.")
+
 		self.device = torch.device('cpu')
-		self.output_device = (
-    torch.device(device)
-    if device is not None
-    else positive_graph.edge_index.device
-)
+		self.output_device = torch.device('cuda')
 		self.positive_edges = positive_graph.edge_index.to(self.device)
 		self.num_batches = num_batches  
 		self.edge_attr = positive_graph.edge_attr.to(self.device) 
@@ -174,6 +172,9 @@ class EdgeSampler(torch.utils.data.IterableDataset):
 
 		# Track unsampled edges
 		self.unsampled_edges = torch.ones(self.total_positive_edges, dtype=torch.bool, device = self.device)
+
+		# Track unsupervised edges (track positive edges that haven't yet been used for supervision)
+		self.unsupervised_edges = torch.ones(self.total_positive_edges, dtype=torch.bool, device = self.device)
 
 		# Tensor of ones for uniform random sampling
 		self.uniform_probs = torch.ones(self.total_positive_edges, device = self.device) 

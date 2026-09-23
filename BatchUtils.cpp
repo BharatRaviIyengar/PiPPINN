@@ -6,6 +6,68 @@
 #include <limits>
 #include <cstdint>
 #include <vector>
+#include <ATen/Parallel.h>
+
+const auto int64_options = torch::TensorOptions()
+		.device(torch::kCPU)
+		.dtype(torch::kInt64);
+
+const auto float_options = torch::TensorOptions()
+		.device(torch::kCPU)
+		.dtype(torch::kFloat32);
+
+torch::Tensor sample_batch(
+	torch::Tensor positive_edges,
+	int64_t batch_size,
+	int64_t num_supervision_edges,
+	int64_t num_SFU, // number of supervision edges to sample exclusively from previously unsupervised
+	int64_t* start_SFU, // current index of the first unsupervised edge
+	float uniform_bernoulli_probability, // decides how many edges to sample uniformly
+	torch::Tensor centrality_scores,
+	bool* coverage_incomplete
+){
+		const int64_t num_edges = positive_edges.size(1);
+		const auto uniform_random = torch::rand({2, num_edges}, float_options);
+		const float* rand_weights_ptr = uniform_random[0].data_ptr<float>();
+		const float* rand_uniform_ptr = rand_weights_ptr + num_edges;
+		const float* centrality_ptr = centrality_scores.data_ptr<float>();
+
+		torch::Tensor sampled_edge_indices = torch::empty({2, batch_size}, int64_options);
+
+		if (*coverage_incomplete){
+			sampled_edge_indices.slice(1, 0, num_SFU).copy_(positive_edges.slice(1, *start_SFU, *start_SFU + num_SFU));
+		} else{
+			num_SFU = 0;
+		}
+
+		auto keys = torch::empty({num_edges}, float_options);
+		for(int64_t e=0; e < num_edges; ++e){
+			if(e >= start_SFU && e < start_SFU + num_SFU && *coverage_incomplete){
+			keys[e] = std::numeric_limits<float>::infinity(); // Assign a very high key to ensure these edges are always excluded
+			continue;
+			}
+			if(rand_uniform_ptr[e] < uniform_bernoulli_probability){
+				keys[e] = -rand_weights_ptr[e];
+			} else {
+				keys[e] = -std::log(std::max(rand_weights_ptr[e], std::numeric_limits<float>::epsilon())) / centrality_ptr[e];
+			}
+		}
+
+		auto remaining_batch_indices = std::nth_element(
+			std::begin(keys),
+			std::begin(keys) + (batch_size - num_SFU),
+			std::end(keys)
+		);
+
+		start_SFU += num_SFU;
+		if(start_SFU + num_SFU >= num_edges){
+			*coverage_incomplete = false;
+		}
+		
+
+		return sampled_edge_indices;
+
+}
 
 std::tuple<torch::Tensor, torch::Tensor>
 restrict_neighborhood(
