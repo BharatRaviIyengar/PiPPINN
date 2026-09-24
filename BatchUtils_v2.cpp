@@ -5,6 +5,7 @@
 #include <limits>
 #include <cstdint>
 #include <vector>
+#include <numeric>
 #include <ATen/Parallel.h>
 
 const auto int64_options = torch::TensorOptions()
@@ -19,6 +20,8 @@ const auto bool_options = torch::TensorOptions()
 		.device(torch::kCPU)
 		.dtype(torch::kBool);
 
+constexpr float min_uniform =	std::numeric_limits<float>::min();
+
 class BatchGenerator {
 	public:
 		BatchGenerator(
@@ -30,14 +33,14 @@ class BatchGenerator {
 			int64_t batch_size,
 			int64_t negative_batch_size,
 			double supervision_fraction,
-			double centrality_fraction,
+			double uniform_message_fraction,
 			double fraction_from_unsupervised,
 			int64_t max_neighbors,
 			double neighborhood_intensity,
 			double reference_centrality,
 			double false_negative_threshold,
 			double negative_label_hardness,
-			bool track_coverage_once = true
+			bool track_coverage_multiple = false
 		) :
 			// A class member ends in "_". These tensors remain alive for as long as
 			// the BatchGenerator object remains alive.
@@ -49,15 +52,13 @@ class BatchGenerator {
 			batch_size_(batch_size),
 			negative_batch_size_(negative_batch_size),
 			supervision_fraction_(supervision_fraction),
-			centrality_fraction_(centrality_fraction),
-			fraction_from_unsupervised_(fraction_from_unsupervised),
 			max_neighbors_(max_neighbors),
 			neighborhood_intensity_(neighborhood_intensity),
 			reference_centrality_(reference_centrality),
+			min_centrality_(2.0),
 			false_negative_threshold_(false_negative_threshold),
 			negative_label_hardness_(negative_label_hardness),
-			min_centrality_(2.0),
-			track_coverage_once_(track_coverage_once)
+			track_coverage_multiple_(track_coverage_multiple)
 		{
 			validate_inputs();
 
@@ -76,26 +77,24 @@ class BatchGenerator {
 				"supervision_fraction produces zero positive supervision edges"
 			);
 			TORCH_CHECK(
-				(1.0 - centrality_fraction_) >= supervision_fraction_,
-				"The uniform fraction must be at least the supervision fraction"
-			);
-			TORCH_CHECK(
+				std::isfinite(fraction_from_unsupervised) &&
 				fraction_from_unsupervised >= 0.0 &&
 				fraction_from_unsupervised <= 1.0,
-				"fraction_from_unsupervised must be in [0, 1]"
+				"fraction_from_unsupervised must be finite and in [0, 1]"
 			);
 
-			// Quantities that never change between batches.
-			positive_edge_indices_ = torch::arange(num_positive_edges_, int64_options);
+			TORCH_CHECK(
+				std::isfinite(uniform_message_fraction) &&
+				uniform_message_fraction >= 0.05 &&
+				uniform_message_fraction <= 1.0,
+				"uniform_message_fraction must be finite and in [0.05, 1]"
+			);
 
 			supervision_order_ = torch::randperm(num_positive_edges_, int64_options);
 
 			supervision_cursor_ = 0;
 
-			mandatory_supervision_block_size = static_cast<int64_t>(num_positive_supervision_edges_ * fraction_from_unsupervised_);
-
-			// Fixed-size scratch buffers. Private methods will fill these later.
-			sampled_positive_indices_ = torch::empty({batch_size_}, int64_options);
+			mandatory_supervision_block_size_ = static_cast<int64_t>(num_positive_supervision_edges_ * fraction_from_unsupervised);
 
 			batch_edges_ = torch::empty(
 				{2, batch_size_ + negative_batch_size_}, int64_options
@@ -103,7 +102,7 @@ class BatchGenerator {
 
 			supervision_labels_ = torch::ones({num_all_supervision_edges_}, float_options);
 
-			positive_edge_strengths_ = torch::empty({batch_size_}, float_options);
+			positive_batch_edge_wts_ = torch::empty({batch_size_}, float_options);
 
 			bidirectional_message_edges_ = torch::empty(
 				{2, 2 * num_message_edges_}, int64_options
@@ -125,28 +124,57 @@ class BatchGenerator {
 			new_labels_.assign(num_nodes_, -1);
 			num_nodes_in_batch_ = 0;
 
-			positive_edge_centrality_ = get_edge_centrality(positive_edges_); 
+			TORCH_CHECK(
+				node_centrality_.dtype() == torch::kFloat32 &&
+				node_centrality_.dim() == 1 &&
+				node_centrality_.size(0) == node_features_.size(0) &&
+				(node_centrality_ > 0).all().item<bool>() &&
+				torch::isfinite(node_centrality_).all().item<bool>(),
+				"node_centrality must be float32 with one value per node, finite and all positive"
+			);
+
+			positive_edge_centrality_ = get_edge_centrality(positive_edges_);
+
+			const int64_t num_uniform_message_edges = static_cast<int64_t>(num_message_edges_ * uniform_message_fraction);
+
+			TORCH_CHECK(
+				num_uniform_message_edges > 0,
+				"uniform_message_fraction produces zero uniformly sampled message edges"
+			);
+
+			uniformly_sampled_count_ =
+					num_positive_supervision_edges_
+					+ num_uniform_message_edges;
+
+			TORCH_CHECK(
+					uniformly_sampled_count_ > max_neighbors_,
+					"uniformly_sampled_count must be greater than max_neighbors"
+			);
+
+			TORCH_CHECK(
+					uniformly_sampled_count_ <= batch_size_,
+					"uniformly_sampled_count must not exceed batch_size"
+			);
+
+		 	positive_edge_indices_.resize(num_positive_edges_);
+			sampling_keys_.resize(num_positive_edges_);
+			std::iota(positive_edge_indices_.begin(), positive_edge_indices_.end(), 0);
+
+			const int64_t num_randnum = 2 * num_positive_edges_ - uniformly_sampled_count_;
+
+			urand_batch_ = torch::empty({num_randnum}, float_options);
 
 		}
 
-		// Public methods are the operations Python is allowed to request.
-
-		int64_t batch_size() const
-		{
-			return batch_size_;
-		}
-
-		int64_t num_message_edges() const
-		{
-			return num_message_edges_;
-		}
-
-		int64_t num_positive_supervision_edges() const
-		{
-			return num_positive_supervision_edges_;
-		}
-
-		void next_batch();
+		std::tuple<
+			torch::Tensor,
+			torch::Tensor,
+			torch::Tensor,
+			torch::Tensor,
+			int64_t,
+			torch::Tensor,
+			torch::Tensor
+			> next_batch();
 
 	private:
 		// Private methods and data can only be used by BatchGenerator itself.
@@ -165,43 +193,70 @@ class BatchGenerator {
 			TORCH_CHECK(
 				positive_edge_weights_.dtype() == torch::kFloat32 &&
 				positive_edge_weights_.dim() == 1 &&
-				positive_edge_weights_.size(0) == positive_edges_.size(1),
+				positive_edge_weights_.size(0) == positive_edges_.size(1) &&
+				torch::isfinite(positive_edge_weights_).all().item<bool>() &&
+				(positive_edge_weights_ > 0).all().item<bool>(),
 				"positive_edge_weights must be float32 with length num_positive_edges"
 			);
 			TORCH_CHECK(
-				node_features_.dtype() == torch::kFloat32 && node_features_.dim() == 2,
-				"node_features must be a 2D float32 tensor"
-			);
-			TORCH_CHECK(
-				node_centrality_.dtype() == torch::kFloat32 &&
-				node_centrality_.dim() == 1 &&
-				node_centrality_.size(0) == node_features_.size(0),
-				"node_centrality must be float32 with one value per node"
+				node_features_.dtype() == torch::kFloat32 &&
+				node_features_.dim() == 2 &&
+				node_features_.size(0) > 0 &&
+				node_features_.size(1) > 0 &&
+				torch::isfinite(node_features_).all().item<bool>(),
+				"node_features must be a nonempty 2D float32 tensor"
 			);
 			TORCH_CHECK(
 				positive_edges_.size(1) > 0 && negative_edges_.size(1) > 0,
 				"positive_edges and negative_edges must not be empty"
 			);
 			TORCH_CHECK(
-				batch_size_ > 0 && batch_size_ < positive_edges_.size(1),
+				batch_size_ > 0 &&
+				batch_size_ < positive_edges_.size(1),
 				"batch_size must be positive and smaller than num_positive_edges"
 			);
+
 			TORCH_CHECK(
-				negative_batch_size_ > 0 && negative_batch_size_ < negative_edges_.size(1),
-				"negative_batch_size must be positive and smaller than num_negative_edges"
+				negative_batch_size_ > 0 &&
+				negative_batch_size_ <= negative_edges_.size(1),
+				"negative_batch_size must be positive and no larger than num_negative_edges"
 			);
+
 			TORCH_CHECK(
-				supervision_fraction_ > 0.0 && supervision_fraction_ < 1.0,
-				"supervision_fraction must be between 0 and 1"
+				std::isfinite(supervision_fraction_) &&
+				supervision_fraction_ > 0.0 &&
+				supervision_fraction_ < 1.0,
+				"supervision_fraction must be finite and in (0, 1)"
 			);
+
 			TORCH_CHECK(
-				centrality_fraction_ >= 0.0 && centrality_fraction_ < 1.0,
-				"centrality_fraction must be in [0, 1)"
+				max_neighbors_ > 0,
+				"max_neighbors must be strictly positive"
 			);
+
 			TORCH_CHECK(
-				max_neighbors_ > 0 &&
-				std::isfinite(neighborhood_intensity_),
-				"max_neighbors and neighborhood_intensity must be positive; neighborhood_intensity must be finite"
+				std::isfinite(neighborhood_intensity_) &&
+				neighborhood_intensity_ > 0.0,
+				"neighborhood_intensity must be finite and strictly positive"
+			);
+
+			TORCH_CHECK(
+				std::isfinite(reference_centrality_) &&
+				reference_centrality_ > min_centrality_,
+				"reference_centrality must be finite and greater than min_centrality"
+			);
+
+			TORCH_CHECK(
+				std::isfinite(false_negative_threshold_) &&
+				false_negative_threshold_ >= 0.0 &&
+				false_negative_threshold_ < 1.0,
+				"false_negative_threshold must be finite and in [0, 1)"
+			);
+
+			TORCH_CHECK(
+				std::isfinite(negative_label_hardness_) &&
+				negative_label_hardness_ > 0.0,
+				"negative_label_hardness must be finite and strictly positive"
 			);
 
 			const int64_t total_nodes = node_features_.size(0);
@@ -223,60 +278,49 @@ class BatchGenerator {
 		torch::Tensor node_features_;
 		torch::Tensor node_centrality_;
 		torch::Tensor negative_edges_;
-		torch::Tensor positive_edge_indices_;
 		torch::Tensor uniform_negative_wts_;
 		torch::Tensor positive_edge_centrality_;
 
 		// Scratch buffers.
-		torch::Tensor sampled_positive_indices_;
 		torch::Tensor batch_edges_;
 		torch::Tensor bidirectional_message_edges_;
 		torch::Tensor bidirectional_message_weights_;
 		torch::Tensor batch_negative_indices_;
 		torch::Tensor supervision_labels_;
-		torch::Tensor positive_edge_strengths_;
+		torch::Tensor positive_batch_edge_wts_;
+		torch::Tensor urand_batch_;
 	
 		// Configuration and derived sizes.
 		int64_t batch_size_;
 		int64_t negative_batch_size_;
 		double supervision_fraction_;
-		double centrality_fraction_;
 		int64_t max_neighbors_;
 		double neighborhood_intensity_;
+		double reference_centrality_;
+		double min_centrality_;
+		double false_negative_threshold_;
+		double negative_label_hardness_;
+		bool track_coverage_multiple_;
 		int64_t num_positive_edges_;
 		int64_t num_negative_edges_;
 		int64_t num_nodes_;
 		int64_t num_positive_supervision_edges_;
 		int64_t num_message_edges_;
 		int64_t num_all_supervision_edges_;
-		int64_t mandatory_supervision_block_size;
+		int64_t mandatory_supervision_block_size_;
+		int64_t uniformly_sampled_count_;
 
 		int64_t supervision_cursor_;
 		torch::Tensor supervision_order_;
 
-		bool track_coverage_once_;
-
-		double reference_centrality_;
-		double min_centrality_;
-		double false_negative_threshold_;
-		double negative_label_hardness_;
-
 		std::vector<int32_t> new_labels_;
 		std::vector<int64_t> nodes_in_batch_;
+		std::vector<int64_t> positive_edge_indices_;
+		std::vector<float> sampling_keys_;
+
 		int64_t num_batch_edges_;
 		int64_t max_nodes_per_batch_;
 		int64_t num_nodes_in_batch_;
-
-
-		void shuffle_order()
-		{
-			if (track_coverage_once_) {
-				return; // Do not reshuffle if we only want to track coverage once
-			} else {
-				supervision_order_ = torch::randperm(num_positive_edges_, int64_options);
-				supervision_cursor_ = 0; // Reset the cursor to the beginning
-			}
-		}
 
 		torch::Tensor get_edge_centrality(const torch::Tensor& edges) const{
 			return (node_centrality_.index_select(0, edges.select(0, 0)) +
@@ -324,58 +368,104 @@ class BatchGenerator {
 		torch::Tensor relabel_edges();
 };
 
-
-// The sampling function is still an unfinished draft. Keep it available in
-// the source file, but do not compile it until it becomes a private class
-// method. This lets us compile and test the class skeleton independently.
-#if 0
-void BatchGenerator::sample_batch(){
+void BatchGenerator::sample_positive_edges(){
 		
-
-		const int64_t random_width = batch_size_ + 1;
-		const auto uniform_random = torch::rand({2, random_width}, float_options);
-		
-		const float* centrality_random_ptr = uniform_random[0].data_ptr<float>();
-		const float* shuffle_random_ptr = centrality_random_ptr + random_width;
 		const float* centrality_ptr = positive_edge_centrality_.data_ptr<float>();
+		
+		int64_t* batch_edges_ptr = batch_edges_.data_ptr<int64_t>();
+		auto* batch_src = batch_edges_ptr + negative_batch_size_;
+		auto* batch_dst = batch_src + negative_batch_size_ + batch_size_;
 
-		torch::Tensor sampled_edge_indices = torch::empty({2, batch_size}, int64_options);
+		const int64_t* positive_edges_ptr = positive_edges_.data_ptr<int64_t>();
+		auto* src = positive_edges_ptr;
+		auto* dst = src + num_positive_edges_;
 
-		if (*coverage_incomplete){
-			sampled_edge_indices.slice(1, 0, num_SFU).copy_(positive_edges.slice(1, *start_SFU, *start_SFU + num_SFU));
-		} else{
-			num_SFU = 0;
-		}
+		auto* batch_strength_ptr = positive_batch_edge_wts_.data_ptr<float>();
 
-		auto keys = torch::empty({num_edges}, float_options);
-		for(int64_t e=0; e < num_edges; ++e){
-			if(e >= start_SFU && e < start_SFU + num_SFU && *coverage_incomplete){
-			keys[e] = std::numeric_limits<float>::infinity(); // Assign a very high key to ensure these edges are always excluded
-			continue;
+		const auto* positive_weights_ptr =  positive_edge_weights_.data_ptr<float>();
+
+		urand_batch_.uniform_(0.0f,1.0f);
+
+		const float* uniform_sampling_ptr = urand_batch_.data_ptr<float>();
+		auto* centrality_sampling_ptr = uniform_sampling_ptr + num_positive_edges_;
+
+		at::parallel_for(0, num_positive_edges_, 4096, [&](int64_t begin, int64_t end){
+			for (int64_t e = begin; e < end; ++e){
+				sampling_keys_[e] = uniform_sampling_ptr[e];
 			}
-			if(rand_uniform_ptr[e] < uniform_bernoulli_probability){
-				keys[e] = -rand_weights_ptr[e];
-			} else {
-				keys[e] = -std::log(std::max(rand_weights_ptr[e], std::numeric_limits<float>::epsilon())) / centrality_ptr[e];
+		});
+
+		if (track_coverage_multiple_ && supervision_cursor_ >= num_positive_edges_){
+			supervision_order_ = torch::randperm(num_positive_edges_, int64_options);
+			supervision_cursor_ = 0;
+		}
+		
+		const int64_t mandatory_block_end = std::min(supervision_cursor_ + mandatory_supervision_block_size_, num_positive_edges_);
+
+		const int64_t* supervision_order_ptr = supervision_order_.data_ptr<int64_t>();
+
+		const bool mandatory_coverage_active =  mandatory_supervision_block_size_ > 0 &&  supervision_cursor_ < num_positive_edges_;
+
+		if (mandatory_coverage_active){
+			for (int64_t e = supervision_cursor_; e < mandatory_block_end; ++e){
+				sampling_keys_[supervision_order_ptr[e]] = -std::numeric_limits<float>::infinity();
 			}
 		}
-
-		auto remaining_batch_indices = std::nth_element(
-			std::begin(keys),
-			std::begin(keys) + (batch_size - num_SFU),
-			std::end(keys)
+		
+		std::nth_element(
+			positive_edge_indices_.begin(),
+			positive_edge_indices_.begin() + uniformly_sampled_count_,
+			positive_edge_indices_.end(),
+			[this](int64_t a, int64_t b){
+				return sampling_keys_[a] < sampling_keys_[b];
+			}
 		);
 
-		start_SFU += num_SFU;
-		if(start_SFU + num_SFU >= num_edges){
-			*coverage_incomplete = false;
+		if (mandatory_coverage_active){
+			std::nth_element(
+				positive_edge_indices_.begin(),
+				positive_edge_indices_.begin() + num_positive_supervision_edges_,
+				positive_edge_indices_.begin() + uniformly_sampled_count_,
+				[this](int64_t a, int64_t b){
+					return sampling_keys_[a] < sampling_keys_[b];
+				}
+			);
+			supervision_cursor_ = mandatory_block_end;
 		}
-		
 
-		return sampled_edge_indices;
+		at::parallel_for(uniformly_sampled_count_, num_positive_edges_, 4096, [&](int64_t begin, int64_t end){
+			for (int64_t pos = begin; pos < end; ++pos){
+				const int64_t eid = positive_edge_indices_[pos];
+				const float u = std::max(
+					centrality_sampling_ptr[pos - uniformly_sampled_count_],
+					min_uniform
+				);
+				sampling_keys_[eid] = -std::log(u)/centrality_ptr[eid];
+			}
+		});
+		
+		auto centrality_begin = positive_edge_indices_.begin() + uniformly_sampled_count_;
+		auto centrality_end = positive_edge_indices_.begin() + batch_size_;
+		std::nth_element(
+			centrality_begin,
+			centrality_end,
+			positive_edge_indices_.end(),
+			[this](int64_t a, int64_t b){
+				return sampling_keys_[a] < sampling_keys_[b];
+			}
+		);
+
+		at::parallel_for(0, batch_size_, 2048, [&](int64_t begin, int64_t end){
+			for (int64_t pos = begin; pos < end; ++pos){
+				const int64_t eid = positive_edge_indices_[pos];
+				batch_src[pos] = src[eid];
+				batch_dst[pos] = dst[eid];
+				batch_strength_ptr[pos] = positive_weights_ptr[eid];
+			}
+		});
 
 }
-#endif
+
 
 torch::Tensor BatchGenerator::relabel_edges(){
 
@@ -404,26 +494,31 @@ torch::Tensor BatchGenerator::relabel_edges(){
 		if(new_labels_[src] == -1){
 			new_labels_[src] = next_label++;
 			nodes_in_batch_.push_back(src);
-			num_nodes_in_batch_++;
 		}
 		if(new_labels_[dst] == -1){
 			new_labels_[dst] = next_label++;
 			nodes_in_batch_.push_back(dst);
 		}
 
-		src_ptr[e] = new_labels_[src_ptr[e]];
-		dst_ptr[e] = new_labels_[dst_ptr[e]];
+		src_ptr[e] = new_labels_[src];
+		dst_ptr[e] = new_labels_[dst];
 	}
 
-	auto nodes_tensor = torch::from_blob(nodes_in_batch_.data(), {static_cast<int64_t>(nodes_in_batch_.size())}, int64_options).clone();
-
-	for (const int64_t node : nodes_in_batch_) {
-    new_labels_[node] = -1;
-	}
-	
 	num_nodes_in_batch_ = static_cast<int64_t>(nodes_in_batch_.size());
 
-	return nodes_tensor;
+	for (const int64_t node : nodes_in_batch_){
+		new_labels_[node] = -1;
+	}
+
+	auto node_indices = torch::from_blob(
+    nodes_in_batch_.data(),
+    {num_nodes_in_batch_},
+    int64_options
+	);
+
+	auto batch_node_features =	node_features_.index_select(0, node_indices);
+	
+	return batch_node_features;
 }
 
 std::tuple<torch::Tensor, torch::Tensor> BatchGenerator::generate_neighborhood() {
@@ -436,8 +531,8 @@ std::tuple<torch::Tensor, torch::Tensor> BatchGenerator::generate_neighborhood()
     num_all_supervision_edges_ + num_message_edges_
 	);
 
-	auto message_weights = batch_edges_.slice(
-		1,
+	auto message_weights = positive_batch_edge_wts_.slice(
+		0,
 		num_positive_supervision_edges_,
 		batch_size_
 	);
@@ -516,8 +611,6 @@ std::tuple<torch::Tensor, torch::Tensor> BatchGenerator::generate_neighborhood()
 	const auto* uniform_ptr = uniform_random.data_ptr<float>();
 	auto* key_ptr = keys.data_ptr<float>();
 
-	constexpr float min_uniform =	std::numeric_limits<float>::min();
-
 	// Generate keys for sampling based on the uniform random numbers and edge weights. The keys are computed as -log(u) / w, where u is a uniform random number and w is the weight of the edge. This transformation allows for sampling edges based on their weights. This is a common technique in weighted random sampling where the final weight describes the Poisson rate (waiting time) of choosing an edge.
 
 	at::parallel_for(0, num_edges, 4096, [&](int64_t begin, int64_t end){
@@ -533,7 +626,7 @@ std::tuple<torch::Tensor, torch::Tensor> BatchGenerator::generate_neighborhood()
 			weight *= edge_str_ptr[e];
 
 			// Control the weight intensity.
-			weight = std::pow(weight, intensity);
+			weight = std::pow(weight, neighborhood_intensity_);
 
 			TORCH_CHECK(std::isfinite(weight) && weight > 0.0, "Edge weight must be positive and finite");
 
@@ -545,9 +638,9 @@ std::tuple<torch::Tensor, torch::Tensor> BatchGenerator::generate_neighborhood()
 
 	// Initialize output variables
 
-	auto neighborhood_matrix = torch::full({num_nodes_in_batch_, max_neighbors}, -1, int64_options); // Initialize a neighborhood tensor with -1, indicating no neighbor
+	auto neighborhood_matrix = torch::full({num_nodes_in_batch_, max_neighbors_}, -1, int64_options); // Initialize a neighborhood tensor with -1, indicating no neighbor
 
-	auto neighbor_strength_matrix = torch::full({num_nodes_in_batch_, max_neighbors}, -1.0, float_options); // Initialize a neighborhood weights tensor with -1.0
+	auto neighbor_strength_matrix = torch::full({num_nodes_in_batch_, max_neighbors_}, -1.0, float_options); // Initialize a neighborhood weights tensor with -1.0
 
 	auto* neighborhood_ptr = neighborhood_matrix.data_ptr<int64_t>();
 	auto* neighbor_strength_ptr = neighbor_strength_matrix.data_ptr<float>();
@@ -556,25 +649,25 @@ std::tuple<torch::Tensor, torch::Tensor> BatchGenerator::generate_neighborhood()
 		for (int64_t node = begin; node < end; ++node) {
 
 			const int64_t start = offsets_ptr[node];
-			const int64_t end = offsets_ptr[node+1];
-			const int64_t num_neighbors = end - start;
+			const int64_t stop = offsets_ptr[node+1];
+			const int64_t num_neighbors = stop - start;
 
 			auto* group_start = grouped_ptr + start;
-			auto* group_end = grouped_ptr + end;
+			auto* group_end = grouped_ptr + stop;
 
 			// This partially sorts the edges such that the first `max_neighbors` edges have the smallest keys, which correspond to the highest weights. This allows us to select the top `max_neighbors` edges for each destination node.
-			if (num_neighbors > max_neighbors) {
+			if (num_neighbors > max_neighbors_) {
 				std::nth_element(
 					group_start,
-					group_start + max_neighbors,
+					group_start + max_neighbors_,
 					group_end,
 					[key_ptr](int64_t a, int64_t b) {
 					return key_ptr[a] < key_ptr[b];
 				});
 			} 
 
-			const int64_t limit = std::min(num_neighbors, max_neighbors);
-			const int64_t row_offset = node * max_neighbors;
+			const int64_t limit = std::min(num_neighbors, max_neighbors_);
+			const int64_t row_offset = node * max_neighbors_;
 			for (int64_t col= 0; col < limit; ++col) {
 				const int64_t edge_index = grouped_ptr[start + col];
 				neighborhood_ptr[row_offset + col] = src_ptr[edge_index]; // Store the source node of the selected edge in the neighborhood matrix
@@ -583,67 +676,84 @@ std::tuple<torch::Tensor, torch::Tensor> BatchGenerator::generate_neighborhood()
 		}
 	});
 
-	return std::make_tuple(neighborhood_matrix.to(output_device), neighbor_strength_matrix.to(output_device));
+	return std::make_tuple(neighborhood_matrix, neighbor_strength_matrix);
 }
 
 
-void BatchGenerator::next_batch() {
-	// This function will be implemented to generate the next batch of edges and their associated data.
-	// It will use the private methods defined above to sample positive and negative edges, generate the neighborhood, and relabel edges as necessary.
-	// The implementation will ensure that the batch is constructed according to the specified parameters and constraints.
+std::tuple<
+	torch::Tensor,
+	torch::Tensor,
+	torch::Tensor,
+	torch::Tensor,
+	int64_t,
+	torch::Tensor,
+	torch::Tensor
+	> BatchGenerator::next_batch() {
+
+	sample_negative_edges();
+	get_negative_edge_data();
+	sample_positive_edges();
+
+	auto batch_node_features = relabel_edges();
+	auto neighborhood = generate_neighborhood();
+
+	auto supervision_edges = batch_edges_.slice(1,0,num_all_supervision_edges_).clone();
+	auto supervision_labels = supervision_labels_.clone();
+	auto supervision_edgewts = positive_batch_edge_wts_.slice(0,0,num_positive_supervision_edges_).clone();
+	int64_t num_positive_supervision_edges = num_positive_supervision_edges_;
+
+	return std::make_tuple(
+		batch_node_features,
+		supervision_edges,
+		supervision_labels,
+		supervision_edgewts,
+		num_positive_supervision_edges,
+		std::get<0>(neighborhood),
+		std::get<1>(neighborhood)
+	);
+
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-	py::class_<BatchGenerator>(m, "BatchGenerator")
-		.def(
-			py::init<
-				torch::Tensor,
-				torch::Tensor,
-				torch::Tensor,
-				torch::Tensor,
-				torch::Tensor,
-				int64_t,
-				int64_t,
-				double,
-				double,
-				double,
-				int64_t,
-				double,
-				int64_t
-			>(),
-			py::arg("positive_edges"),
-			py::arg("positive_edge_weights"),
-			py::arg("node_features"),
-			py::arg("node_centrality"),
-			py::arg("negative_edges"),
-			py::arg("batch_size"),
-			py::arg("negative_batch_size"),
-			py::arg("supervision_fraction") = 0.3,
-			py::arg("centrality_fraction") = 0.5,
-			py::arg("fraction_from_unsampled") = 0.1,
-			py::arg("max_neighbors") = 60,
-			py::arg("neighborhood_intensity") = 1.0,
-			py::arg("nthreads") = 1
-		)
-		.def("reset_tracking", &BatchGenerator::reset_tracking)
-		.def_property_readonly("batch_size", &BatchGenerator::batch_size)
-		.def_property_readonly("num_message_edges", &BatchGenerator::num_message_edges)
-		.def_property_readonly(
-			"num_positive_supervision_edges",
-			&BatchGenerator::num_positive_supervision_edges
-		);
-
-	m.def("restrict_neighborhood", &restrict_neighborhood, "Restrict Neighborhood",
-		py::arg("bidirectional_message_edges"),
-		py::arg("node_degrees"),
-		py::arg("edge_strength"),
-		py::arg("intensity") = 1.0,
-		py::arg("max_neighbors") = 60,
-		py::arg("nthreads") = 1
-	);
-		m.def(
-		"relabel_edges_", &relabel_edges, "Relabel batch edges in place to have contiguous node indices starting from 0",
-		py::arg("original_edges"),
-		py::arg("max_nodes_in_graph")
-	);
+    py::class_<BatchGenerator>(m, "BatchGenerator")
+        .def(
+            py::init<
+                torch::Tensor,
+                torch::Tensor,
+                torch::Tensor,
+                torch::Tensor,
+                torch::Tensor,
+                int64_t,
+                int64_t,
+                double,
+                double,
+                double,
+                int64_t,
+                double,
+                double,
+                double,
+                double,
+                bool
+            >(),
+            py::arg("positive_edges"),
+            py::arg("positive_edge_weights"),
+            py::arg("node_features"),
+            py::arg("node_centrality"),
+            py::arg("negative_edges"),
+            py::arg("batch_size"),
+            py::arg("negative_batch_size"),
+            py::arg("supervision_fraction"),
+            py::arg("uniform_message_fraction"),
+            py::arg("fraction_from_unsupervised"),
+            py::arg("max_neighbors"),
+            py::arg("neighborhood_intensity"),
+            py::arg("reference_centrality"),
+            py::arg("false_negative_threshold"),
+            py::arg("negative_label_hardness"),
+            py::arg("track_coverage_multiple") = false
+        )
+        .def(
+            "next_batch",
+            &BatchGenerator::next_batch
+        );
 }
