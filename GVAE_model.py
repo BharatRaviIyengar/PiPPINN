@@ -408,7 +408,7 @@ def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimize
 	bce_edge_classification_loss = bce_logits_loss(edge_prob_logits, data.supervision_labels)
 	
 	mse_edge_strength_loss = F.mse_loss(
-    edge_strengths[:data.num_positive_supervision_edges],
+    edge_strengths[:data.num_negative_edges:],
     data.supervision_edgewts,
 )
 	

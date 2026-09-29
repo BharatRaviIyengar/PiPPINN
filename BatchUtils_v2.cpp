@@ -37,7 +37,8 @@ class BatchGenerator {
 			double fraction_from_unsupervised,
 			int64_t max_neighbors,
 			double neighborhood_intensity,
-			double reference_centrality,
+			double global_reference_centrality,
+			double global_reference_centrality_wt,
 			double false_negative_threshold,
 			double negative_label_hardness,
 			bool track_coverage_multiple = false
@@ -54,7 +55,6 @@ class BatchGenerator {
 			supervision_fraction_(supervision_fraction),
 			max_neighbors_(max_neighbors),
 			neighborhood_intensity_(neighborhood_intensity),
-			reference_centrality_(reference_centrality),
 			min_centrality_(2.0),
 			false_negative_threshold_(false_negative_threshold),
 			negative_label_hardness_(negative_label_hardness),
@@ -88,6 +88,13 @@ class BatchGenerator {
 				uniform_message_fraction >= 0.05 &&
 				uniform_message_fraction <= 1.0,
 				"uniform_message_fraction must be finite and in [0.05, 1]"
+			);
+
+			TORCH_CHECK(
+				std::isfinite(global_reference_centrality_wt) &&
+				global_reference_centrality_wt >= 0.0 &&
+				global_reference_centrality_wt <= 1.0,
+				"global_reference_centrality_wt must be finite and in [0, 1]"
 			);
 
 			supervision_order_ = torch::randperm(num_positive_edges_, int64_options);
@@ -142,18 +149,22 @@ class BatchGenerator {
 				"uniform_message_fraction produces zero uniformly sampled message edges"
 			);
 
-			uniformly_sampled_count_ =
-					num_positive_supervision_edges_
-					+ num_uniform_message_edges;
+			uniformly_sampled_count_ = num_positive_supervision_edges_ + num_uniform_message_edges;
 
 			TORCH_CHECK(
-					uniformly_sampled_count_ > max_neighbors_,
-					"uniformly_sampled_count must be greater than max_neighbors"
+				uniformly_sampled_count_ > max_neighbors_,
+				"uniformly_sampled_count must be greater than max_neighbors"
 			);
 
 			TORCH_CHECK(
-					uniformly_sampled_count_ <= batch_size_,
-					"uniformly_sampled_count must not exceed batch_size"
+				uniformly_sampled_count_ <= batch_size_,
+				"uniformly_sampled_count must not exceed batch_size"
+			);
+
+			TORCH_CHECK(
+				std::isfinite(global_reference_centrality) &&
+				global_reference_centrality > 0.0,
+				"global_reference_centrality must be finite and positive"
 			);
 
 		 	positive_edge_indices_.resize(num_positive_edges_);
@@ -164,6 +175,20 @@ class BatchGenerator {
 
 			urand_batch_ = torch::empty({num_randnum}, float_options);
 
+			const double local_centrality = node_centrality_.median().item<double>();
+			const double W = global_reference_centrality_wt;
+
+			reference_centrality_ = 2.0 * (
+				W * global_reference_centrality +
+				(1.0 - W) * local_centrality
+			);
+
+			TORCH_CHECK(
+				std::isfinite(reference_centrality_) &&
+				reference_centrality_ > min_centrality_,
+				"derived reference_centrality must be finite and greater than min_centrality"
+			);
+
 		}
 
 		std::tuple<
@@ -171,10 +196,13 @@ class BatchGenerator {
 			torch::Tensor,
 			torch::Tensor,
 			torch::Tensor,
-			int64_t,
 			torch::Tensor,
 			torch::Tensor
 			> next_batch();
+
+		std::tuple<int64_t, int64_t> edge_counts() const{
+			return std::make_tuple(num_all_supervision_edges_, negative_batch_size_);
+		}
 
 	private:
 		// Private methods and data can only be used by BatchGenerator itself.
@@ -241,16 +269,10 @@ class BatchGenerator {
 			);
 
 			TORCH_CHECK(
-				std::isfinite(reference_centrality_) &&
-				reference_centrality_ > min_centrality_,
-				"reference_centrality must be finite and greater than min_centrality"
-			);
-
-			TORCH_CHECK(
 				std::isfinite(false_negative_threshold_) &&
 				false_negative_threshold_ >= 0.0 &&
-				false_negative_threshold_ < 1.0,
-				"false_negative_threshold must be finite and in [0, 1)"
+				false_negative_threshold_ < 0.5,
+				"false_negative_threshold must be finite and in [0, 0.5)"
 			);
 
 			TORCH_CHECK(
@@ -700,14 +722,12 @@ std::tuple<
 	auto supervision_edges = batch_edges_.slice(1,0,num_all_supervision_edges_).clone();
 	auto supervision_labels = supervision_labels_.clone();
 	auto supervision_edgewts = positive_batch_edge_wts_.slice(0,0,num_positive_supervision_edges_).clone();
-	int64_t num_positive_supervision_edges = num_positive_supervision_edges_;
 
 	return std::make_tuple(
 		batch_node_features,
 		supervision_edges,
 		supervision_labels,
 		supervision_edgewts,
-		num_positive_supervision_edges,
 		std::get<0>(neighborhood),
 		std::get<1>(neighborhood)
 	);
@@ -715,45 +735,51 @@ std::tuple<
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    py::class_<BatchGenerator>(m, "BatchGenerator")
-        .def(
-            py::init<
-                torch::Tensor,
-                torch::Tensor,
-                torch::Tensor,
-                torch::Tensor,
-                torch::Tensor,
-                int64_t,
-                int64_t,
-                double,
-                double,
-                double,
-                int64_t,
-                double,
-                double,
-                double,
-                double,
-                bool
-            >(),
-            py::arg("positive_edges"),
-            py::arg("positive_edge_weights"),
-            py::arg("node_features"),
-            py::arg("node_centrality"),
-            py::arg("negative_edges"),
-            py::arg("batch_size"),
-            py::arg("negative_batch_size"),
-            py::arg("supervision_fraction"),
-            py::arg("uniform_message_fraction"),
-            py::arg("fraction_from_unsupervised"),
-            py::arg("max_neighbors"),
-            py::arg("neighborhood_intensity"),
-            py::arg("reference_centrality"),
-            py::arg("false_negative_threshold"),
-            py::arg("negative_label_hardness"),
-            py::arg("track_coverage_multiple") = false
-        )
-        .def(
-            "next_batch",
-            &BatchGenerator::next_batch
-        );
+	py::class_<BatchGenerator>(m, "BatchGenerator")
+		.def(
+				py::init<
+						torch::Tensor,
+						torch::Tensor,
+						torch::Tensor,
+						torch::Tensor,
+						torch::Tensor,
+						int64_t,
+						int64_t,
+						double,
+						double,
+						double,
+						int64_t,
+						double,
+						double,
+						double,
+						double,
+						double,
+						bool
+				>(),
+				py::arg("positive_edges"),
+				py::arg("positive_edge_weights"),
+				py::arg("node_features"),
+				py::arg("node_centrality"),
+				py::arg("negative_edges"),
+				py::arg("batch_size"),
+				py::arg("negative_batch_size"),
+				py::arg("supervision_fraction"),
+				py::arg("uniform_message_fraction"),
+				py::arg("fraction_from_unsupervised"),
+				py::arg("max_neighbors"),
+				py::arg("neighborhood_intensity"),
+				py::arg("global_reference_centrality"),
+				py::arg("global_reference_centrality_weight"),
+				py::arg("false_negative_threshold"),
+				py::arg("negative_label_hardness"),
+				py::arg("track_coverage_multiple") = false
+		)
+		.def(
+				"next_batch",
+				&BatchGenerator::next_batch
+		)
+		.def(
+			"edge_counts",
+			&BatchGenerator::edge_counts
+		);
 }

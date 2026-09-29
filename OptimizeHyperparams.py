@@ -34,17 +34,19 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max
 	)
 
 	median_centralities = [data["Train"].node_degree.median().item() for data in dataset]
-	reference_centrality = sum(median_centralities)/len(median_centralities)
+	global_reference_centrality = sum(median_centralities)/len(median_centralities)
 
 	batch_loader_params = {
-		"centrality_fraction": params['centrality_fraction'],
-		"nbr_weight_intensity": params['nbr_weight_intensity'],
-		"reference_centrality": reference_centrality,
-		"reference_adjustment": params['reference_adjustment'],
-		"negative_label_hardness": params['negative_label_hardness'],
-		"false_negative_threshold": 0.47,
-		"max_neighbors": params['max_neighbors'],
-		"threads" : threads
+		"supervision_fraction": 0.3,
+		"uniform_message_fraction": params["uniform_message_fraction"],
+		"fraction_from_unsupervised": 0.1,
+		"max_neighbors": params["max_neighbors"],
+		"neighborhood_intensity": params["neighborhood_intensity"],
+		"global_reference_centrality": global_reference_centrality,
+		"global_reference_centrality_weight": params["global_reference_centrality_weight"],
+		"false_negative_threshold": params["false_negative_threshold"],
+		"negative_label_hardness": params["negative_label_hardness"],
+		"track_coverage_multiple": False
 	}
 
 	data_for_training = [
@@ -52,7 +54,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max
 			data=data,
 			batch_size=batch_size,
 			num_batches=num_batches,
-			optional_paramters = batch_loader_params
+			batch_parameters=batch_loader_params
 		)
 		  for data in dataset]
 
@@ -95,9 +97,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max
 
 	total_val_samples = sum(
 		[
-			data["val_sampler"].num_all_sup_edges * data["val_sampler"].num_batches 
-
-	 	for data in data_for_training
+			data["num_val_samples"]	for data in data_for_training
 	 	]
 	 )
 
@@ -281,10 +281,10 @@ if __name__ == "__main__":
 			"scheduler_factor": trial.suggest_float("scheduler_factor", 0.1, 0.5),
 			"dropout": trial.suggest_float("dropout", 0.1, 0.35),
 			"weight_decay": trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True),
-			"centrality_fraction": trial.suggest_float("centrality_fraction", 0.2, 0.69),
-			"nbr_weight_intensity": trial.suggest_float("nbr_weight_intensity", 0.25, 3.0, log=True),
+			"uniform_message_fraction": trial.suggest_float("uniform_message_fraction", 0.2, 0.8),
+			"neighborhood_intensity": trial.suggest_float("neighborhood_intensity", 0.25, 3.0, log=True),
 			"max_neighbors": trial.suggest_categorical("max_neighbors", [30, 45, 60, 75, 90]),
-			"reference_adjustment": trial.suggest_float("reference_adjustment", 0.0, 1.0),
+			"global_reference_centrality_weight": trial.suggest_float("global_reference_centrality_weight", 0.0, 1.0),
 			"negative_label_hardness": trial.suggest_float("negative_label_hardness", 0.1, 3.0, log=True),
 			"latent_dimension": trial.suggest_categorical("latent_dimension", [64, 128, 256, 512]),
 			"num_encoder_layers": trial.suggest_int("num_encoder_layers", 2, 4),
