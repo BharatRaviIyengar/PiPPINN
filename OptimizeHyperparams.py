@@ -151,7 +151,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max
 					total_val_loss += val_loss
 					n = edge_prob.size(0)
 					preds_buf[fill_idx:fill_idx+n] = edge_prob
-					labels_buf[fill_idx:fill_idx+n] = edge_labels
+					labels_buf[fill_idx:fill_idx+n] = (edge_labels > 0.5).float()
 					fill_idx += n
 
 		# Average losses
