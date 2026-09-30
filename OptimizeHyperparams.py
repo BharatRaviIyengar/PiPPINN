@@ -14,7 +14,7 @@ import math
 import gc
 
 
-def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max_epochs = 200, threads:int=1):
+def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max_epochs = 200):
 	""" Run training for a single trial with the given parameters."""
 
 	learning_rate = params['learning_rate']
@@ -39,14 +39,14 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max
 	batch_loader_params = {
 		"supervision_fraction": 0.3,
 		"uniform_message_fraction": params["uniform_message_fraction"],
-		"fraction_from_unsupervised": 0.1,
+		"fraction_from_unsupervised": 0.3,
 		"max_neighbors": params["max_neighbors"],
 		"neighborhood_intensity": params["neighborhood_intensity"],
 		"global_reference_centrality": global_reference_centrality,
 		"global_reference_centrality_weight": params["global_reference_centrality_weight"],
-		"false_negative_threshold": params["false_negative_threshold"],
-		"negative_label_hardness": params["negative_label_hardness"],
-		"track_coverage_multiple": False
+		"false_negative_threshold": 0.4,
+		"negative_label_hardness": 1.0,
+		"track_coverage_multiple": True
 	}
 
 	data_for_training = [
@@ -104,7 +104,11 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max
 	preds_buf = torch.zeros(total_val_samples, dtype=torch.float32, device="cpu")
 	labels_buf = torch.zeros(total_val_samples, dtype=torch.float32, device="cpu")
 
-	# Training loop
+	model_device = next(model.parameters()).device
+
+	train_losses_sum = torch.zeros(4, device=model_device)
+	val_losses_sum = torch.zeros(4, device=model_device)
+
 	best_composite_score = float('inf')
 	val_loss_at_best_score = float('inf')
 	train_loss_at_best_score = float('inf')
@@ -113,62 +117,87 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max
 	best_score_epoch = max_epochs
 	best_auc = float('-inf')
 	best_auc_epoch = max_epochs
+	validation_epoch = 0
 	
 	for epoch in range(max_epochs):
-		total_train_loss = 0.0  # Reset total training loss for the epoch
-		total_val_loss = 0.0  # Reset total validation loss for the epoch
-		val_batch_count = 0
+		# Epoch loop BEGIN
+		train_losses_sum.zero_()
 		train_batch_count = 0
-		fill_idx = 0
 
+		kl_is_warmed_up = math.isclose(
+			training_parameters.kld_coefficient,
+			kld_coefficient,
+		)
+
+		model.train()
+		# Training loop BEGIN (cover all datasets)
 		for data in data_for_training:
-			# Training
-			model.train()
 			for batch in data["train_batch_loader"]:
 				train_batch_count += 1
-				train_loss = process_data(
+				train_output = process_data(
 					batch,
 					model=model,
 					optimizer=optimizer,
 					training_parameters=training_parameters,
 					return_output=False
 					)
-				total_train_loss += train_loss # type: ignore
+				train_losses_sum += train_output["loss_values"]
+		# Training loop END
 
-			# Validation
-			model.eval()
-			with torch.no_grad():
+		if not kl_is_warmed_up:
+			kl_warmup.step()
+			continue
+
+		# Validation — only after KL has warmed up #
+		val_losses_sum.zero_()
+		val_batch_count = 0
+		fill_idx = 0
+		model.eval()
+		# Validation loop BEGIN
+		with torch.no_grad():
+			for data in data_for_training:
 				for batch in data["val_batch_loader"]:
 					val_batch_count += 1
-					val_loss, edge_prob, edge_labels = process_data(
+					val_output = process_data(
 						batch,
 						model=model,
 						optimizer=optimizer,
 						training_parameters=training_parameters,
 						return_output=True
-						) # type: ignore
+						)
 					
-					total_val_loss += val_loss
-					n = edge_prob.size(0)
-					preds_buf[fill_idx:fill_idx+n] = edge_prob
-					labels_buf[fill_idx:fill_idx+n] = (edge_labels > 0.5).float()
+					val_losses_sum += val_output["loss_values"]
+
+					edge_logits = val_output["edge_prediction_logits"]
+					edge_labels = val_output["edge_labels"]
+
+					n = edge_logits.size(0)
+
+					preds_buf[fill_idx:fill_idx + n] = edge_logits
+					labels_buf[fill_idx:fill_idx + n] = (edge_labels > 0.5).float()
+
 					fill_idx += n
+		# Validation loop END
+
+		validation_epoch+=1
 
 		# Average losses
-		average_train_loss = total_train_loss / train_batch_count
-		average_val_loss = total_val_loss / val_batch_count
-		
+		average_train_losses = (train_losses_sum / train_batch_count).cpu().tolist()
+		average_val_losses = (val_losses_sum / val_batch_count).cpu().tolist()
+
+		assert fill_idx == total_val_samples
+
 		# Early stopping logic
 		auc = TU.auc_score(preds_buf, labels_buf)
 		auc_penalty = 1 / (1 + math.exp(-20*(0.9 - auc)))
-		composite_score = average_val_loss*(1 + auc_penalty)
+		composite_score = average_val_losses[0]*(1 + auc_penalty)
 		if auc > best_auc:
 			best_auc = auc
 			best_auc_epoch = epoch + 1
 		if best_composite_score > composite_score:
 			best_composite_score = composite_score
-			val_loss_at_best_score = average_val_loss
-			train_loss_at_best_score = average_train_loss
+			val_loss_at_best_score = average_val_losses[0]
+			train_loss_at_best_score = average_train_losses[0]
 			epochs_without_improvement = 0
 			best_score_epoch = epoch + 1
 			auc_at_best_score = auc
@@ -177,8 +206,9 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max
 			
 		yield {
 		"epoch": epoch + 1,
-		"average_train_loss": average_train_loss,
-		"average_val_loss": average_val_loss,
+		"validation_epoch": validation_epoch,
+		"average_train_loss": average_train_losses,
+		"average_val_loss": average_val_losses,
 		"val_loss_at_best_score": val_loss_at_best_score,
 		"train_loss_at_best_score": train_loss_at_best_score,
 		"best_score_epoch": best_score_epoch,
@@ -190,9 +220,8 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max
 		"best_composite_score": best_composite_score
 		}
 
-		# Step the schedulers
-		scheduler.step(average_val_loss)
-		kl_warmup.step()
+		# Step the scheduler
+		scheduler.step(average_val_losses[0])
 		
 		if epochs_without_improvement >= patience:
 			print(f"Early stopping triggered after {epoch + 1} epochs.")
@@ -293,8 +322,8 @@ if __name__ == "__main__":
 			"mse_coefficient": trial.suggest_float("mse_coefficient", 0.01, 1.0, log=True)
 		}
 		try:
-			for result in run_training(params, args.num_batches, args.batch_size, dataset, threads=args.threads):
-				epoch = result["epoch"]
+			for result in run_training(params, args.num_batches, args.batch_size, dataset):
+				validation_epoch = result["validation_epoch"]
 				composite_score = result["composite_score"]
 				val_loss_at_best_score = result["val_loss_at_best_score"]
 				train_loss_at_best_score = result["train_loss_at_best_score"]
@@ -303,7 +332,7 @@ if __name__ == "__main__":
 				best_auc = result["best_auc"]
 				best_auc_epoch = result["best_auc_epoch"]
 				best_composite_score = result["best_composite_score"]
-				trial.report(composite_score, step=epoch)
+				trial.report(composite_score, step=validation_epoch)
 				if trial.should_prune():
 					raise optuna.TrialPruned()
 				

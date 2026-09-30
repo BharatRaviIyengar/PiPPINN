@@ -395,28 +395,28 @@ def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimize
 	else:
 		conditional_backward = lambda loss: None  # No-op for validation
 
-	output = model(
+	model_prediction = model(
     data.node_features,
     data.supervision_edges,
     data.neighborhood_matrix,
     data.neighborhood_weights,
 	)
-	edge_prob_logits, edge_strengths, node_mu, node_logvar = output[0:4]
+	edge_prob_logits, edge_strengths, node_mu, node_logvar = model_prediction[0:4]
 	
 	# Compute losses
 
 	bce_edge_classification_loss = bce_logits_loss(edge_prob_logits, data.supervision_labels)
 	
 	mse_edge_strength_loss = F.mse_loss(
-    edge_strengths[:data.num_negative_edges:],
+    edge_strengths[data.num_negative_edges:],
     data.supervision_edgewts,
-)
-	
+	)
+	KLD = KL_loss(node_mu, node_logvar)
 
 	loss = (
 		bce_edge_classification_loss +
 		training_parameters.mse_coefficient * mse_edge_strength_loss +
-		training_parameters.kld_coefficient * KL_loss(node_mu, node_logvar)
+		training_parameters.kld_coefficient * KLD
 	)
 
 	# loss = calculate_loss(model_output, data, head_weights)
@@ -425,11 +425,18 @@ def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimize
 	if model.training:
 		optimizer.step()
 
+	output = {}
+
+	output["loss_values"] = torch.stack([
+		loss,
+		bce_edge_classification_loss,
+		mse_edge_strength_loss,
+		KLD
+	]).detach()
+
 	if return_output:
+		output["edge_prediction_logits"] = edge_prob_logits.detach().cpu()
+		output["edge_labels"] = data.supervision_labels.detach().cpu()
 		if model.decoder.return_individual_contributions:
-			return loss.item(), edge_prob_logits.detach().cpu(), data.supervision_labels.detach().cpu(), output[-1]
-		else:
-			return loss.item(), edge_prob_logits.detach().cpu(), data.supervision_labels.detach().cpu()
-		 
-	else:
-		return loss.item()
+			output["edge_prediction_contributions"] = model_prediction[-1]
+	return output
