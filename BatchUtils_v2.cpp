@@ -607,6 +607,8 @@ std::tuple<torch::Tensor, torch::Tensor> BatchGenerator::generate_neighborhood()
 	auto* grouped_ptr = grouped_edges.data_ptr<int64_t>();
 	auto* cursor_ptr = cursor.data_ptr<int64_t>();
 
+	const bool adjust_weight_intensity = neighborhood_intensity_ != 1.0;
+
 	// Fill grouped edges //
 
 	for (int64_t e=0; e < num_edges; ++e) {
@@ -648,7 +650,9 @@ std::tuple<torch::Tensor, torch::Tensor> BatchGenerator::generate_neighborhood()
 			weight *= edge_str_ptr[e];
 
 			// Control the weight intensity.
-			weight = std::pow(weight, neighborhood_intensity_);
+			if (adjust_weight_intensity){
+				weight = std::pow(weight, neighborhood_intensity_);
+			}
 
 			TORCH_CHECK(std::isfinite(weight) && weight > 0.0, "Edge weight must be positive and finite");
 
@@ -707,7 +711,6 @@ std::tuple<
 	torch::Tensor,
 	torch::Tensor,
 	torch::Tensor,
-	int64_t,
 	torch::Tensor,
 	torch::Tensor
 	> BatchGenerator::next_batch() {

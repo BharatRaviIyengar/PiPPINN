@@ -92,10 +92,20 @@ class Decoder(nn.Module):
 		self.in_channels = in_channels
 		self.hidden_channels = [in_channels] * num_decoder_layers
 		self.dropout = dropout
-		self.dims = [2*self.in_channels] + self.hidden_channels
-		self.edge_embedder = build_MLP(dims=self.dims, dropout=self.dropout, use_layernorm=True, normalize_input=False)
-		self.edge_wt_head = nn.Linear(self.dims[-1], 1)
-		self.edge_prob_head = nn.Linear(self.dims[-1],1)
+		self.projector_dims = [in_channels] + self.hidden_channels
+		self.edge_projector = build_MLP(
+			dims=self.projector_dims,
+			activation = lambda: nn.LeakyReLU(negative_slope=0.1), # type: ignore
+			dropout=self.dropout,
+			use_layernorm=True,
+			normalize_input=False,
+			activate_final=True
+		)
+		self.EP_existence_weights = nn.Parameter(torch.randn(self.in_channels))
+		self.EP_strength_weights = nn.Parameter(torch.randn(self.in_channels))
+		self.EP_existence_bias = nn.Parameter(torch.tensor(0.0))
+		self.EP_strength_bias = nn.Parameter(torch.tensor(0.0))
+
 		self.similarity_block_size = similarity_block_size
 		self.edge_chunk_size = edge_chunk_size
 		self.return_individual_contributions = return_individual_contributions
@@ -243,7 +253,8 @@ class Decoder(nn.Module):
 			congruence_impossible, 0.0
 		)
 
-		StrengthByCongruence = F.softplus(self.monomap_EdgeStrength_Congruence(congruence_strength.unsqueeze(-1)).squeeze(-1))
+		StrengthByCongruence = self.monomap_EdgeStrength_Congruence(congruence_strength.unsqueeze(-1)).squeeze(-1)
+
 		StrengthByCongruence = StrengthByCongruence.masked_fill(
 			congruence_impossible, 0.0
 		)
@@ -270,7 +281,7 @@ class Decoder(nn.Module):
 					neighborhood_matrix,
 					neighborhood_strength_matrix,
 					use_reentrant=False
-				)
+				) # type: ignore
 			else:
 				ET, EC, SC = self.Transitivity_and_Congruence(
 					normalized_latents,
@@ -289,20 +300,32 @@ class Decoder(nn.Module):
 	def forward(self, nodes_latent, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix):
 
 		u, v  = supervision_edges
-		additive = nodes_latent[u] + nodes_latent[v]
-		multiplicative = nodes_latent[u] * nodes_latent[v]
-		combined = torch.cat([additive, multiplicative], dim=-1)
-		edge_features = self.edge_embedder(combined)
+		# additive = nodes_latent[u] + nodes_latent[v]
+		# multiplicative = nodes_latent[u] * nodes_latent[v]
+		# combined = torch.cat([additive, multiplicative], dim=-1)
+		# edge_features = self.edge_embedder(combined)
 
-		ExistenceByTransitivity, ExistenceByCongruence, StrengthByCongruence = self.chunked_Transitivity_and_Congruence(nodes_latent, supervision_edges, neighborhood_matrix, neighborhood_strength_matrix)
+		(
+			ExistenceByTransitivity,
+			ExistenceByCongruence,
+			StrengthByCongruence
+		) = self.chunked_Transitivity_and_Congruence(
+			nodes_latent,
+			supervision_edges,
+			neighborhood_matrix,
+			neighborhood_strength_matrix
+		)
 
-		ExistenceViaDecoder = self.edge_prob_head(edge_features).squeeze(-1)
+		projected_nodes = self.edge_projector(nodes_latent)
+		hu = projected_nodes[u]
+		hv = projected_nodes[v]
+
+		ExistenceViaDecoder = (hu * self.EP_existence_weights * hv).sum(dim=-1) + self.EP_existence_bias
+		StrengthViaDecoder = (hu * self.EP_strength_weights * hv).sum(dim=-1) + self.EP_strength_bias
 
 		edge_prob_logits =  ExistenceByCongruence + ExistenceByTransitivity  + ExistenceViaDecoder
 
-		StrengthViaDecoder = F.relu(self.edge_wt_head(edge_features).squeeze(-1))
-
-		edge_strengths = StrengthViaDecoder + StrengthByCongruence
+		edge_strengths = F.softplus(StrengthViaDecoder + StrengthByCongruence)
 
 		if not self.return_individual_contributions:
 			return edge_prob_logits, edge_strengths
@@ -339,7 +362,7 @@ class GVAE_Model(nn.Module):
 			in_channels = latent_dimension,
 			num_decoder_layers = num_decoder_layers,
 			dropout=dropout,
-			similarity_block_size = 90,
+			similarity_block_size = 45,
 			edge_chunk_size = 12000 
 			)
 

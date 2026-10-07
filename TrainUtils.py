@@ -18,7 +18,7 @@ def generate_hidden_dims(input_dim, num_layers, output_dim):
 
 	return hidden_dims
 
-def build_MLP(dims, activation=nn.ReLU, dropout=0.0, use_layernorm=True, normalize_input=False):
+def build_MLP(dims, activation=nn.ReLU, dropout=0.0, use_layernorm=True, normalize_input=False, activate_final=False):
 	layers = []
 	if normalize_input:
 		layers.append(nn.LayerNorm(dims[0]))
@@ -30,6 +30,8 @@ def build_MLP(dims, activation=nn.ReLU, dropout=0.0, use_layernorm=True, normali
 			layers.append(activation())
 			if dropout > 0:
 				layers.append(nn.Dropout(dropout))
+	if activate_final:
+		layers.append(activation())
 	return nn.Sequential(*layers)
 
 class BatchStream:
@@ -809,7 +811,7 @@ def generate_batch(data, num_batches, batch_size, batch_parameters):
 		node_centrality = data["Train"].node_degree,
 		negative_edges=data["Train_Neg"],
 		batch_size=batch_size,
-		negative_batch_size = int(2*batch_size),
+		negative_batch_size = int(2*batch_size * batch_parameters["supervision_fraction"]),
 		**batch_parameters
 	)
 
@@ -831,7 +833,7 @@ def generate_batch(data, num_batches, batch_size, batch_parameters):
 			node_centrality = data["Val"].node_degree,
 			negative_edges=data["Val_Neg"],
 			batch_size=val_batch_size,
-			negative_batch_size = int(2*val_batch_size),
+			negative_batch_size = int(2*val_batch_size * val_parameters["supervision_fraction"]),
 			**val_parameters
 	)
 
