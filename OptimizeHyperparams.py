@@ -312,7 +312,6 @@ if __name__ == "__main__":
 			"weight_decay": trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True),
 			"uniform_message_fraction": trial.suggest_float("uniform_message_fraction", 0.2, 0.8),
 			"global_reference_centrality_weight": trial.suggest_float("global_reference_centrality_weight", 0.0, 1.0),
-			"negative_label_hardness": trial.suggest_float("negative_label_hardness", 0.1, 3.0, log=True),
 			"latent_dimension": trial.suggest_categorical("latent_dimension", [64, 128, 256, 512]),
 			"num_encoder_layers": trial.suggest_int("num_encoder_layers", 2, 4),
 			"num_decoder_layers": trial.suggest_int("num_decoder_layers", 1, 3),

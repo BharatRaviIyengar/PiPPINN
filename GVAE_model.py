@@ -409,7 +409,7 @@ def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimize
 		float: Loss value for the batch.
 	"""
 	# Check if data is in correct device
-	assert data.device == next(model.parameters()).device
+	assert data.supervision_edges.device == next(model.parameters()).device
 
 	# Set model mode and optimizer behavior
 	if model.training:
@@ -432,7 +432,7 @@ def process_data_GVAE(data:Data, model:nn.Module, optimizer:torch.optim.Optimize
 	
 	mse_edge_strength_loss = F.mse_loss(
     edge_strengths[data.num_negative_edges:],
-    data.supervision_edgewts,
+    data.positive_supervision_weights,
 	)
 	KLD = KL_loss(node_mu, node_logvar)
 
