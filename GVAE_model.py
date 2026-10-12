@@ -172,7 +172,8 @@ class Decoder(nn.Module):
 			block_mask = nbrs_u_mask.unsqueeze(2) & nbrs_v_mask[:, start:end].unsqueeze(1) # shape: (num_edges, max_neighbors, block_size)
 
 			block_sim.mul_(self.transitivity_sharpness)
-			block_sim.masked_fill_(~block_mask, torch.finfo(torch.float32).min) # set invalid pairs to a low number
+			block_sim = block_sim.float()
+			block_sim.masked_fill_(~block_mask, torch.finfo(block_sim.dtype).min) # set invalid pairs to a low number
 
 			if start == 0:
 				Nu_to_Nv = torch.logsumexp(block_sim, dim=2)
@@ -254,7 +255,9 @@ class Decoder(nn.Module):
 			congruence_impossible, 0.0
 		)
 
-		StrengthByCongruence = self.monomap_EdgeStrength_Congruence(congruence_strength.unsqueeze(-1)).squeeze(-1)
+		StrengthByCongruence = F.softplus(
+			self.monomap_EdgeStrength_Congruence(congruence_strength.unsqueeze(-1)).squeeze(-1)
+		)
 
 		StrengthByCongruence = StrengthByCongruence.masked_fill(
 			congruence_impossible, 0.0
