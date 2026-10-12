@@ -113,9 +113,9 @@ class Decoder(nn.Module):
 		# Initialize learnable monotonic non-linear functions that can translate similarity scores to edge probabilities and edge strengths.
 		# This ensures that the higher scores always mean higher edge probabilities and strengths, while allowing the model to learn the optimal nonlinear mapping from similarity to edge properties.
 
-		self.monomap_EdgeStrength_Congruence = MonotoneMap()
-		self.monomap_EdgeExistence_Congruence = MonotoneMap()
-		self.monomap_EdgeExistence_NbrSimilarity = MonotoneMap()
+		self.monomap_EdgeStrength_Congruence = MonotoneMap(activation=nn.Sigmoid)
+		self.monomap_EdgeExistence_Congruence = MonotoneMap(activation=nn.Sigmoid)
+		self.monomap_EdgeExistence_NbrSimilarity = MonotoneMap(activation=nn.Sigmoid)
 
 		self.transitivity_sharpness = 1.0
 		self.congruence_sharpness = 1.0
@@ -162,9 +162,7 @@ class Decoder(nn.Module):
 		# LogSumExp is used to aggregate the similarity scores such that higher similarity scores dominate the aggregation, while still allowing for contributions from lower scores.
 		# This is biologically reasonable as it allows for the possibility that even if most neighbors are dissimilar, a few highly similar neighbors can still indicate a strong relationship. At the same time, more similar neighbors will increase the score, reflecting the idea that having more similar neighbors strengthens the evidence for a connection.
 
-		Nu_to_Nv = torch.full((num_edges, max_neighbors), -torch.inf, device=normalized_latents.device, dtype=torch.float32) 
-
-		Nv_to_Nu = torch.full((num_edges, max_neighbors), -torch.inf, device=normalized_latents.device, dtype=torch.float32)
+		Nv_to_Nu = torch.empty((num_edges, max_neighbors), device=normalized_latents.device, dtype=torch.float32)
 
 		for start in range(0, max_neighbors, self.similarity_block_size):
 			end = min(start + self.similarity_block_size, max_neighbors)
@@ -173,21 +171,25 @@ class Decoder(nn.Module):
 
 			block_mask = nbrs_u_mask.unsqueeze(2) & nbrs_v_mask[:, start:end].unsqueeze(1) # shape: (num_edges, max_neighbors, block_size)
 
-			block_sim.masked_fill_(~block_mask, -torch.inf)
 			block_sim.mul_(self.transitivity_sharpness)
+			block_sim.masked_fill_(~block_mask, torch.finfo(torch.float32).min) # set invalid pairs to a low number
 
-			Nu_to_Nv = torch.logaddexp(Nu_to_Nv, torch.logsumexp(block_sim, dim = 2))
+			if start == 0:
+				Nu_to_Nv = torch.logsumexp(block_sim, dim=2)
+			else:
+				Nu_to_Nv = torch.logaddexp(Nu_to_Nv, torch.logsumexp(block_sim, dim = 2))
+
 			Nv_to_Nu[:,start:end] = torch.logsumexp(block_sim, dim=1)
 
+		
+		Nu_to_Nv = Nu_to_Nv.masked_fill(~nbrs_u_mask | transitivity_impossible.unsqueeze(1), 0.0)
+		Nv_to_Nu = Nv_to_Nu.masked_fill(~nbrs_v_mask | transitivity_impossible.unsqueeze(1), 0.0)
 		
 		Nu_to_Nv.div_(self.transitivity_sharpness)
 		Nv_to_Nu.div_(self.transitivity_sharpness)
 		
 		num_Nu = nbrs_u_mask.sum(dim=-1).clamp_min(1)
 		num_Nv = nbrs_v_mask.sum(dim=-1).clamp_min(1)
-
-		Nu_to_Nv.masked_fill_(~nbrs_u_mask, 0.0)
-		Nv_to_Nu.masked_fill_(~nbrs_v_mask, 0.0)
 
 		score_u = Nu_to_Nv.sum(dim=1) / num_Nu
 		score_v = Nv_to_Nu.sum(dim=1) / num_Nv
@@ -218,17 +220,14 @@ class Decoder(nn.Module):
 
 		combined_edge_strengths = torch.cat([neighborhood_strength_matrix[u], neighborhood_strength_matrix[v]], dim=1) # shape: (num_edges, 2*max_neighbors)
 
-		# Mask invalid neighbors before softmax. An all-masked row would otherwise
-		# produce NaNs, so use finite zero logits for edges with no neighborhood
-		# evidence and explicitly zero their final congruence contributions below.
-		attention_logits = combined_sim.masked_fill(~combined_mask, float('-inf'))
-		attention_logits = attention_logits.masked_fill(
-			congruence_impossible.unsqueeze(1), 0.0
-		)
+		# Mask invalid neighbors before softmax.
+
+		attention_logits = combined_sim * self.congruence_sharpness
+		attention_logits.masked_fill_(~combined_mask, torch.finfo(torch.float32).min) # set invalid pairs to a low number
 
 		# Compute attention weights using softmax over the combined similarity scores. This allows the model to focus on the most relevant neighbor pairs when aggregating information for edge existence and strength predictions. A softmax is better choice than logsumexp here because we just want to find one good evidence of a congruent neighbor pair, rather than aggregating all the evidence. The softmax will assign higher weights to the most similar pairs, while still allowing for contributions from less similar pairs.
 
-		attention = torch.softmax(attention_logits * self.congruence_sharpness, dim=1)
+		attention = torch.softmax(attention_logits, dim=1)
 
 		combined_sim = combined_sim.masked_fill(~combined_mask, 0.0) # set invalid pairs to 0 for aggregation
 
@@ -243,12 +242,14 @@ class Decoder(nn.Module):
 		congruence_strength = congruence_strength.masked_fill(congruence_impossible, 0.0)
 
 		# Translate the neighborhood similarity and congruence scores into edge existence probabilities and edge strengths using the learnable monotonic mappings. This ensures that higher similarity scores always correspond to higher probabilities and strengths, while allowing the model to learn the optimal nonlinear mapping from similarity to edge properties.
-		ExistenceByTransitivity = self.monomap_EdgeExistence_NbrSimilarity(neighborhood_score.unsqueeze(-1)).squeeze(-1)
+		ExistenceByTransitivity = F.softplus(
+			self.monomap_EdgeExistence_NbrSimilarity(neighborhood_score.unsqueeze(-1)).squeeze(-1)
+		)
+		ExistenceByTransitivity = ExistenceByTransitivity.masked_fill(transitivity_impossible, 0.0) # if transitivity is not possible (i.e., one of the nodes has no neighbors), we explicitly set the existence probability to 0.0, as we have no evidence to support the existence of an edge based on transitivity.
 
-		ExistenceByTransitivity = ExistenceByTransitivity.masked_fill(
-    transitivity_impossible, 0.0) # if transitivity is not possible (i.e., one of the nodes has no neighbors), we explicitly set the existence probability to 0.0, as we have no evidence to support the existence of an edge based on transitivity.
-
-		ExistenceByCongruence = self.monomap_EdgeExistence_Congruence(congruence_score.unsqueeze(-1)).squeeze(-1)
+		ExistenceByCongruence = F.softplus(
+			self.monomap_EdgeExistence_Congruence(congruence_score.unsqueeze(-1)).squeeze(-1)
+		)
 		ExistenceByCongruence = ExistenceByCongruence.masked_fill(
 			congruence_impossible, 0.0
 		)
