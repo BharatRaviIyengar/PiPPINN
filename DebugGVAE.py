@@ -8,7 +8,7 @@ validation batch.
 Example:
     python DebugGVAE.py \
         --training-data Data_For_Training.pt \
-        --batch-size 5000 \
+        --batch-size 40000 \
         --steps 10
 """
 
@@ -29,6 +29,12 @@ LOSS_NAMES = ("total", "bce", "mse", "kld")
 
 class NonFiniteError(RuntimeError):
 	"""Raised as soon as a non-finite tensor is encountered."""
+
+
+def print_settings(title: str, settings: dict) -> None:
+	print(title, flush=True)
+	for name, value in sorted(settings.items()):
+		print(f"  {name}: {value}", flush=True)
 
 
 def tensor_summary(tensor: torch.Tensor) -> str:
@@ -110,11 +116,13 @@ def gradient_summary(model: torch.nn.Module) -> tuple[float, str, float]:
 
 def memory_summary(device: torch.device) -> str:
 	gib = 1024 ** 3
+	free, total = torch.cuda.mem_get_info(device)
 	return (
 		f"allocated={torch.cuda.memory_allocated(device) / gib:.2f} GiB, "
 		f"reserved={torch.cuda.memory_reserved(device) / gib:.2f} GiB, "
 		f"peak_allocated={torch.cuda.max_memory_allocated(device) / gib:.2f} GiB, "
-		f"peak_reserved={torch.cuda.max_memory_reserved(device) / gib:.2f} GiB"
+		f"peak_reserved={torch.cuda.max_memory_reserved(device) / gib:.2f} GiB, "
+		f"device_free={free / gib:.2f} GiB, device_total={total / gib:.2f} GiB"
 	)
 
 
@@ -192,7 +200,11 @@ def run_training_step(
 		for name, value in zip(LOSS_NAMES, losses.detach().cpu().tolist())
 	)
 	print(
-		f"train step {step}: {loss_values}; grad_norm={gradient_norm:.6g}; "
+		f"train step {step}: nodes={batch.node_features.size(0)}, "
+		f"supervision_edges={batch.supervision_edges.size(1)}, "
+		f"positive_supervision_edges={batch.positive_supervision_weights.size(0)}, "
+		f"negative_supervision_edges={batch.num_negative_edges}; {loss_values}; "
+		f"grad_norm={gradient_norm:.6g}; "
 		f"max_abs_grad={largest_gradient:.6g} ({largest_name}); "
 		f"{memory_summary(device)}",
 		flush=True,
@@ -216,7 +228,11 @@ def run_validation_step(
 		for name, value in zip(LOSS_NAMES, losses.detach().cpu().tolist())
 	)
 	print(
-		f"validation step: {loss_values}; {memory_summary(device)}",
+		f"validation step: nodes={batch.node_features.size(0)}, "
+		f"supervision_edges={batch.supervision_edges.size(1)}, "
+		f"positive_supervision_edges={batch.positive_supervision_weights.size(0)}, "
+		f"negative_supervision_edges={batch.num_negative_edges}; {loss_values}; "
+		f"{memory_summary(device)}",
 		flush=True,
 	)
 
@@ -227,7 +243,7 @@ def parse_args():
 	)
 	parser.add_argument("--training-data", required=True)
 	parser.add_argument("--dataset-index", type=int, default=0)
-	parser.add_argument("--batch-size", type=int, default=5000)
+	parser.add_argument("--batch-size", type=int, default=40000)
 	parser.add_argument("--steps", type=int, default=10)
 	parser.add_argument("--threads", type=int, default=1)
 	parser.add_argument("--seed", type=int, default=48149)
@@ -238,16 +254,16 @@ def parse_args():
 	parser.add_argument("--latent-dimension", type=int, default=512)
 	parser.add_argument("--num-encoder-layers", type=int, default=4)
 	parser.add_argument("--num-decoder-layers", type=int, default=3)
+	parser.add_argument("--edge-chunk-size", type=int, default=12000)
 	parser.add_argument("--kld-coefficient", type=float, default=1.0)
 	parser.add_argument("--mse-coefficient", type=float, default=1.0)
 	parser.add_argument("--uniform-message-fraction", type=float, default=0.2)
 	parser.add_argument("--global-reference-centrality-weight", type=float, default=0.5)
 
 	parser.add_argument(
-		"--detect-anomaly",
-		action=argparse.BooleanOptionalAction,
-		default=True,
-		help="Enable PyTorch autograd anomaly detection (default: enabled)",
+	"--detect-anomaly",
+	action="store_true",
+	help="Enable PyTorch autograd anomaly detection",
 	)
 	parser.add_argument(
 		"--validation",
@@ -264,6 +280,8 @@ def main() -> int:
 		raise ValueError("--steps must be positive")
 	if args.batch_size <= 0:
 		raise ValueError("--batch-size must be positive")
+	if args.edge_chunk_size <= 0:
+		raise ValueError("--edge-chunk-size must be positive")
 	if not torch.cuda.is_available():
 		raise RuntimeError("This debugger requires a CUDA GPU")
 
@@ -272,6 +290,7 @@ def main() -> int:
 	torch.manual_seed(args.seed)
 	torch.cuda.manual_seed_all(args.seed)
 	device = torch.device("cuda")
+	print_settings("Command-line configuration", vars(args))
 
 	print(f"Loading {args.training_data}", flush=True)
 	dataset = torch.load(args.training_data, map_location="cpu", weights_only=False)
@@ -298,6 +317,7 @@ def main() -> int:
 		"negative_label_hardness": 1.0,
 		"track_coverage_multiple": True,
 	}
+	print_settings("Effective batch-sampler parameters", batch_parameters)
 	loaders = TU.generate_batch(
 		data=selected_data,
 		num_batches=args.steps,
@@ -312,6 +332,7 @@ def main() -> int:
 		num_decoder_layers=args.num_decoder_layers,
 		dropout=args.dropout,
 	).to(device)
+	model.decoder.edge_chunk_size = args.edge_chunk_size
 	optimizer = torch.optim.Adam(
 		model.parameters(),
 		lr=args.learning_rate,
@@ -323,6 +344,19 @@ def main() -> int:
 	)
 
 	parameter_count = sum(parameter.numel() for parameter in model.parameters())
+	print_settings(
+		"Effective model parameters",
+		{
+			"input_dimension": loaders["input_channels"],
+			"latent_dimension": args.latent_dimension,
+			"num_encoder_layers": args.num_encoder_layers,
+			"num_decoder_layers": args.num_decoder_layers,
+			"dropout": args.dropout,
+			"edge_chunk_size": model.decoder.edge_chunk_size,
+			"similarity_block_size": model.decoder.similarity_block_size,
+			"parameter_count": parameter_count,
+		},
+	)
 	print(
 		f"Testing {data_name!r} with {parameter_count:,} parameters on "
 		f"{torch.cuda.get_device_name(device)}",
