@@ -40,8 +40,11 @@ class BatchStream:
 		self.num_batches = num_batches
 		(
 			self.num_supervision_edges,
-			self.num_negative_edges
+			self.num_negative_edges,
+			self.num_message_edges,
 		) = cpp_generator.edge_counts()
+		# C++ reports message edges before expanding them in both directions.
+		self.num_neighbor_candidates = 2 * self.num_message_edges
 
 		if not torch.cuda.is_available():
 			raise RuntimeError("EdgeSampler requires an available CUDA GPU.")
@@ -49,29 +52,39 @@ class BatchStream:
 	def __len__(self):
 		return self.num_batches
 
+	def generate_batch(self):
+		with torch.no_grad():
+			(
+				node_features,
+				supervision_edges,
+				supervision_labels,
+				positive_supervision_weights,
+				neighborhood_matrix,
+				neighborhood_weights,
+			) = self.cpp_generator.next_batch()
+		
+		batch = Data(
+			node_features=node_features,
+			supervision_edges=supervision_edges,
+			supervision_labels=supervision_labels,
+			positive_supervision_weights=positive_supervision_weights,
+			neighborhood_matrix=neighborhood_matrix,
+			neighborhood_weights=neighborhood_weights,
+			num_negative_edges=self.num_negative_edges,
+			num_neighbor_candidates=self.num_neighbor_candidates,
+		)
+
+		yield batch.to('cuda')
+
 	def __iter__(self):
-		for _ in range(self.num_batches):
-			with torch.no_grad():
-				(
-					node_features,
-					supervision_edges,
-					supervision_labels,
-					positive_supervision_weights,
-					neighborhood_matrix,
-					neighborhood_weights,
-				) = self.cpp_generator.next_batch()
-
-			batch = Data(
-				node_features=node_features,
-				supervision_edges=supervision_edges,
-				supervision_labels=supervision_labels,
-				positive_supervision_weights=positive_supervision_weights,
-				neighborhood_matrix=neighborhood_matrix,
-				neighborhood_weights=neighborhood_weights,
-				num_negative_edges=self.num_negative_edges
-			)
-
-			yield batch.to('cuda')
+		if self.num_batches is None or self.num_batches == 0:
+			while True:
+				yield from self.generate_batch()
+				if self.cpp_generator.all_edges_supervised():
+					return
+		else:
+			for _ in range(self.num_batches):
+				yield from self.generate_batch()
 
 
 def subgraph_with_relabel(original_graph: Data, edge_mask: torch.Tensor) -> Data:
@@ -394,11 +407,13 @@ def generate_batch(data, num_batches, batch_size, batch_parameters):
 
 	# Create minibatch sampler for validation set
 	val_batch_size = data["Val"].edge_index.size(1) // 10
-	num_val_batches = data["Val"].edge_index.size(1) // val_batch_size + 1
+	# num_val_batches = data["Val"].edge_index.size(1) // val_batch_size + 10
+	num_val_batches = 0
 
 	val_parameters = {
     **batch_parameters,
-    "fraction_from_unsupervised": 0.0,
+    "fraction_from_unsupervised": 1.0,
+    "track_coverage_multiple": True
 	}
 
 	val_data_sampler = BatchGenerator(

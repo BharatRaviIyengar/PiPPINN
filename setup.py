@@ -13,7 +13,7 @@ setup(
 	ext_modules=[
 		CppExtension(
     name="BatchUtils",
-    sources=[str(ROOT / "BatchUtils_v2.cpp")],
+    sources=[str(ROOT / "BatchUtils.cpp")],
     extra_compile_args=["-O3", "-std=c++17"],
 		)
 	],

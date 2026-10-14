@@ -5,6 +5,9 @@ the batch where they occur. It uses the same sampler settings as
 OptimizeHyperparams.py and, by default, also runs one production-sized
 validation batch.
 
+Each batch reports neighbor entries retained and rejected by the per-node cap.
+Counts include both directions of each message edge.
+
 Example:
     python DebugGVAE.py \
         --training-data Data_For_Training.pt \
@@ -126,6 +129,24 @@ def memory_summary(device: torch.device) -> str:
 	)
 
 
+def neighborhood_summary(batch) -> str:
+	"""Count directed neighbor entries discarded by the sampler's per-node cap."""
+	neighbor_counts = (batch.neighborhood_matrix >= 0).sum(dim=1)
+	neighbor_cap = batch.neighborhood_matrix.size(1)
+	candidates = batch.num_neighbor_candidates
+	kept = neighbor_counts.sum().item()
+	rejected = candidates - kept
+	rejection_fraction = rejected / candidates if candidates else 0.0
+	nodes_at_cap = (neighbor_counts == neighbor_cap).sum().item()
+	nodes_without_neighbors = (neighbor_counts == 0).sum().item()
+	return (
+		f"neighbor_candidates={candidates}, neighbors_kept={kept}, "
+		f"neighbors_rejected={rejected} ({rejection_fraction:.1%}), "
+		f"neighbor_cap={neighbor_cap}, nodes_at_neighbor_cap={nodes_at_cap}, "
+		f"nodes_without_neighbors={nodes_without_neighbors}"
+	)
+
+
 def compute_losses(
 	batch,
 	model: GVAE_Model,
@@ -179,6 +200,7 @@ def run_training_step(
 	device: torch.device,
 ) -> None:
 	check_batch(batch)
+	print(f"train step {step} neighborhoods: {neighborhood_summary(batch)}", flush=True)
 	check_model_parameters(model, "before forward")
 	optimizer.zero_grad(set_to_none=True)
 
@@ -218,6 +240,7 @@ def run_validation_step(
 	device: torch.device,
 ) -> None:
 	check_batch(batch)
+	print(f"validation neighborhoods: {neighborhood_summary(batch)}", flush=True)
 	check_model_parameters(model, "before validation")
 	model.eval()
 	with torch.no_grad():
