@@ -302,7 +302,13 @@ def auc_score(preds: torch.Tensor, labels: torch.Tensor):
 	fpr /= total_neg  # FPR
 	
 	# Compute AUC using trapezoid rule
-	auc = torch.trapz(tpr, fpr).item()
+	group_end = torch.ones_like(sorted_preds, dtype=torch.bool)
+	group_end[:-1] = sorted_preds[:-1] != sorted_preds[1:]
+
+	# Keep the initial (0, 0) and each group's final ROC point.
+	keep = torch.cat((group_end.new_ones(1), group_end))
+
+	auc = torch.trapz(tpr[keep], fpr[keep]).item()
 	return auc
 
 def load_data(input_graphs_filenames, val_fraction, save_graphs_to=None, device=None):
