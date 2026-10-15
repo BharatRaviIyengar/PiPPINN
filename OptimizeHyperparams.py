@@ -13,8 +13,14 @@ import math
 
 import gc
 
+BATCH_CHUNK_ESTIMATES = {
+    256: {"batch_size": 210000, "edge_chunk_size": 94500},
+    512: {"batch_size": 130000, "edge_chunk_size": 58500},
+    768: {"batch_size":  85000, "edge_chunk_size": 38250},
+}
 
-def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max_epochs = 200):
+
+def run_training(dataset:list, params:dict, num_batches:int, batch_size:int = None, max_epochs = 200):
 	""" Run training for a single trial with the given parameters."""
 
 	learning_rate = params['learning_rate']
@@ -49,6 +55,12 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max
 		"track_coverage_multiple": True
 	}
 
+	if batch_size is None:
+		batch_size = BATCH_CHUNK_ESTIMATES[latent_dimension]["batch_size"]
+		edge_chunk_size = BATCH_CHUNK_ESTIMATES[latent_dimension]["edge_chunk_size"]
+	else:
+		edge_chunk_size = int(batch_size * 0.45)
+
 	data_for_training = [
 		TU.generate_batch(
 			data=data,
@@ -70,6 +82,8 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max
 		num_decoder_layers = num_decoder_layers,
 		dropout = dropout,
 	).cuda()
+
+	model.decoder.edge_chunk_size = edge_chunk_size
 
 	optimizer = torch.optim.Adam(
 		model.parameters(),
@@ -184,6 +198,7 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max
 		# Average losses
 		average_train_losses = (train_losses_sum / train_batch_count).cpu().tolist()
 		average_val_losses = (val_losses_sum / val_batch_count).cpu().tolist()
+		average_val_losses[0] = sum(average_val_losses[1:])
 
 		assert fill_idx == total_val_samples
 
@@ -196,8 +211,8 @@ def run_training(params:dict, num_batches:int, batch_size:int, dataset:list, max
 			best_auc_epoch = epoch + 1
 		if best_composite_score > composite_score:
 			best_composite_score = composite_score
-			val_loss_at_best_score = average_val_losses[0]
-			train_loss_at_best_score = average_train_losses[0]
+			val_loss_at_best_score = average_val_losses
+			train_loss_at_best_score = average_train_losses
 			epochs_without_improvement = 0
 			best_score_epoch = epoch + 1
 			auc_at_best_score = auc
@@ -239,7 +254,7 @@ if __name__ == "__main__":
 	parser.add_argument("--batch_size", "-b",
 		type=int,
 		help="Minibatch size for training",
-		default=5000
+		default=None
 	)
 	parser.add_argument("--num_batches",
 		type=int,
@@ -319,7 +334,7 @@ if __name__ == "__main__":
 			"mse_coefficient": trial.suggest_float("mse_coefficient", 0.01, 1.0, log=True)
 		}
 		try:
-			for result in run_training(params, args.num_batches, args.batch_size, dataset):
+			for result in run_training(dataset, params, args.num_batches, args.batch_size):
 				validation_epoch = result["validation_epoch"]
 				composite_score = result["composite_score"]
 				val_loss_at_best_score = result["val_loss_at_best_score"]

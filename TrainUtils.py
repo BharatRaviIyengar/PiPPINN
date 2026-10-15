@@ -407,8 +407,7 @@ def generate_batch(data, num_batches, batch_size, batch_parameters):
 
 	# Create minibatch sampler for validation set
 	val_batch_size = data["Val"].edge_index.size(1) // 10
-	# num_val_batches = data["Val"].edge_index.size(1) // val_batch_size + 10
-	num_val_batches = 0
+	num_val_batches = data["Val"].edge_index.size(1) // val_batch_size + 15
 
 	val_parameters = {
     **batch_parameters,
